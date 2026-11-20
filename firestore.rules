@@ -1,0 +1,307 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'facilityMode', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'uid',
+          'email',
+          'displayName',
+          'defaultTeacherEmail',
+          'linkedCourseId',
+          'linkedCourseName',
+          'facilityMode',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.uid is string
+        && data.uid == userId
+        && data.uid == request.auth.uid
+        && isValidId(data.uid)
+        && data.email is string
+        && data.email.size() >= 3
+        && data.email.size() <= 254
+        && (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 120))
+        && (!('defaultTeacherEmail' in data) || (data.defaultTeacherEmail is string && data.defaultTeacherEmail.size() <= 254))
+        && (!('linkedCourseId' in data) || (data.linkedCourseId is string && data.linkedCourseId.size() <= 128))
+        && (!('linkedCourseName' in data) || (data.linkedCourseName is string && data.linkedCourseName.size() <= 160))
+        && data.facilityMode in ['all', 'bank', 'school']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidMonitoredZone(data, userId, zoneId) {
+      return data.keys().hasAll([
+          'id',
+          'ownerUid',
+          'cameraCode',
+          'classroomName',
+          'bluetoothDeviceName',
+          'bluetoothAddress',
+          'sourceKind',
+          'hasVideo',
+          'hasVoice',
+          'voiceListeningEnabled',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id',
+          'ownerUid',
+          'cameraCode',
+          'classroomName',
+          'bluetoothDeviceName',
+          'bluetoothAddress',
+          'sourceKind',
+          'hasVideo',
+          'hasVoice',
+          'voiceListeningEnabled',
+          'streamUrl',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.id is string
+        && data.id == zoneId
+        && isValidId(data.id)
+        && data.ownerUid is string
+        && data.ownerUid == userId
+        && data.ownerUid == request.auth.uid
+        && isValidId(data.ownerUid)
+        && data.cameraCode is string
+        && data.cameraCode.size() >= 1
+        && data.cameraCode.size() <= 32
+        && data.classroomName is string
+        && data.classroomName.size() >= 1
+        && data.classroomName.size() <= 140
+        && data.bluetoothDeviceName is string
+        && data.bluetoothDeviceName.size() >= 1
+        && data.bluetoothDeviceName.size() <= 140
+        && data.bluetoothAddress is string
+        && data.bluetoothAddress.size() >= 1
+        && data.bluetoothAddress.size() <= 128
+        && data.sourceKind in ['bluetooth-cctv', 'device-camera', 'stream-url', 'uploaded-media']
+        && data.hasVideo is bool
+        && data.hasVoice is bool
+        && data.voiceListeningEnabled is bool
+        && (!('streamUrl' in data) || (data.streamUrl is string && data.streamUrl.size() <= 1000))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSafetyIncident(data, userId, incidentId) {
+      return data.keys().hasAll([
+          'id',
+          'ownerUid',
+          'cameraId',
+          'cameraCode',
+          'classroomName',
+          'alertType',
+          'severity',
+          'studentCount',
+          'headline',
+          'voiceCue',
+          'details',
+          'teacherNotified',
+          'acknowledged',
+          'timestamp',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id',
+          'ownerUid',
+          'cameraId',
+          'cameraCode',
+          'classroomName',
+          'alertType',
+          'severity',
+          'threatCategory',
+          'modelUsed',
+          'studentCount',
+          'measuredDb',
+          'headline',
+          'voiceCue',
+          'details',
+          'teacherMessage',
+          'teacherNotified',
+          'acknowledged',
+          'timestamp',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.id is string
+        && data.id == incidentId
+        && isValidId(data.id)
+        && data.ownerUid is string
+        && data.ownerUid == userId
+        && data.ownerUid == request.auth.uid
+        && isValidId(data.ownerUid)
+        && data.cameraId is string
+        && data.cameraId.size() >= 1
+        && data.cameraId.size() <= 128
+        && data.cameraCode is string
+        && data.cameraCode.size() >= 1
+        && data.cameraCode.size() <= 32
+        && data.classroomName is string
+        && data.classroomName.size() >= 1
+        && data.classroomName.size() <= 140
+        && data.alertType in ['ai-vision', 'sound-threshold', 'attendance']
+        && data.severity in ['warning', 'critical']
+        && (!('threatCategory' in data) || data.threatCategory in ['none', 'fight', 'beating', 'bullying', 'robbery_or_weapon', 'intrusion', 'disturbance'])
+        && (!('modelUsed' in data) || (data.modelUsed is string && data.modelUsed.size() <= 64))
+        && data.studentCount is number
+        && data.studentCount >= 0
+        && data.studentCount <= 10000
+        && (!('measuredDb' in data) || (data.measuredDb is number && data.measuredDb >= 0 && data.measuredDb <= 200))
+        && data.headline is string
+        && data.headline.size() >= 1
+        && data.headline.size() <= 240
+        && data.voiceCue is string
+        && data.voiceCue.size() <= 500
+        && data.details is string
+        && data.details.size() <= 1000
+        && (!('teacherMessage' in data) || (data.teacherMessage is string && data.teacherMessage.size() <= 2000))
+        && data.teacherNotified is bool
+        && data.acknowledged is bool
+        && data.timestamp is string
+        && data.timestamp.size() >= 1
+        && data.timestamp.size() <= 64
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if isOwner(userId) && existing().uid == request.auth.uid;
+
+      allow create: if isVerifiedUser()
+        && isOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'email',
+          'displayName',
+          'defaultTeacherEmail',
+          'linkedCourseId',
+          'linkedCourseName',
+          'facilityMode',
+          'updatedAt'
+        ]);
+
+      allow delete: if false;
+
+      match /zones/{zoneId} {
+        allow get: if isValidId(userId) && isValidId(zoneId) && isOwner(userId);
+        allow list: if isOwner(userId) && existing().ownerUid == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(zoneId)
+          && isValidMonitoredZone(incoming(), userId, zoneId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId));
+
+        allow update: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(zoneId)
+          && isValidMonitoredZone(incoming(), userId, zoneId)
+          && incoming().id == existing().id
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'classroomName',
+            'voiceListeningEnabled',
+            'streamUrl',
+            'updatedAt'
+          ]);
+
+        allow delete: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(zoneId)
+          && exists(/databases/$(database)/documents/users/$(userId));
+      }
+
+      match /incidents/{incidentId} {
+        allow get: if isValidId(userId) && isValidId(incidentId) && isOwner(userId);
+        allow list: if isOwner(userId) && existing().ownerUid == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(incidentId)
+          && isValidSafetyIncident(incoming(), userId, incidentId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId));
+
+        allow update: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(incidentId)
+          && isValidSafetyIncident(incoming(), userId, incidentId)
+          && incoming().id == existing().id
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().cameraId == existing().cameraId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'acknowledged',
+            'teacherNotified',
+            'updatedAt'
+          ]);
+
+        allow delete: if isVerifiedUser()
+          && isOwner(userId)
+          && isValidId(userId)
+          && isValidId(incidentId)
+          && exists(/databases/$(database)/documents/users/$(userId));
+      }
+    }
+  }
+}

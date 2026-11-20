@@ -1,0 +1,6 @@
+{
+  "name": "CampusGuard CCTV",
+  "description": "Bluetooth CCTV classroom discovery with AI video and voice fight detection, instant notifications, and student headcount.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

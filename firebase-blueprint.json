@@ -1,0 +1,253 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Private operator profile and notification settings strictly isolated to the owning Firebase UID.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "displayName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "defaultTeacherEmail": {
+          "type": "string",
+          "maxLength": 254
+        },
+        "linkedCourseId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "linkedCourseName": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "facilityMode": {
+          "type": "string",
+          "enum": ["all", "bank", "school"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "facilityMode", "createdAt", "updatedAt"]
+    },
+    "MonitoredZone": {
+      "title": "MonitoredZone",
+      "description": "Connected CCTV camera or Bluetooth AV monitor zone belonging to an operator.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "cameraCode": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "classroomName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 140
+        },
+        "bluetoothDeviceName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 140
+        },
+        "bluetoothAddress": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "sourceKind": {
+          "type": "string",
+          "enum": ["bluetooth-cctv", "device-camera", "stream-url", "uploaded-media"]
+        },
+        "hasVideo": {
+          "type": "boolean"
+        },
+        "hasVoice": {
+          "type": "boolean"
+        },
+        "voiceListeningEnabled": {
+          "type": "boolean"
+        },
+        "streamUrl": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerUid",
+        "cameraCode",
+        "classroomName",
+        "bluetoothDeviceName",
+        "bluetoothAddress",
+        "sourceKind",
+        "hasVideo",
+        "hasVoice",
+        "voiceListeningEnabled",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SafetyIncident": {
+      "title": "SafetyIncident",
+      "description": "Safety incident, AI vision alert, or >81.1 dB sound threshold teacher alert.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "cameraId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "cameraCode": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "classroomName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 140
+        },
+        "alertType": {
+          "type": "string",
+          "enum": ["ai-vision", "sound-threshold"]
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["warning", "critical"]
+        },
+        "threatCategory": {
+          "type": "string",
+          "enum": ["none", "fight", "robbery_or_weapon", "intrusion", "disturbance"]
+        },
+        "modelUsed": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "studentCount": {
+          "type": "number"
+        },
+        "measuredDb": {
+          "type": "number"
+        },
+        "headline": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "voiceCue": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "details": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "teacherMessage": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "teacherNotified": {
+          "type": "boolean"
+        },
+        "acknowledged": {
+          "type": "boolean"
+        },
+        "timestamp": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerUid",
+        "cameraId",
+        "cameraCode",
+        "classroomName",
+        "alertType",
+        "severity",
+        "studentCount",
+        "headline",
+        "voiceCue",
+        "details",
+        "teacherNotified",
+        "acknowledged",
+        "timestamp",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Owner-isolated operator profile and teacher notification preferences."
+    },
+    "/users/{userId}/zones/{zoneId}": {
+      "schema": { "$ref": "#/entities/MonitoredZone" },
+      "description": "CCTV camera and Bluetooth zone configurations belonging to the operator."
+    },
+    "/users/{userId}/incidents/{incidentId}": {
+      "schema": { "$ref": "#/entities/SafetyIncident" },
+      "description": "Incident and >81.1 dB teacher sound alert log entries owned by the operator."
+    }
+  }
+}
