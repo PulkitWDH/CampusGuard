@@ -2,12 +2,14 @@ interface GoogleSignInButtonProps {
   onClick: () => void;
   loading?: boolean;
   label?: string;
+  compact?: boolean;
 }
 
 export function GoogleSignInButton({
   onClick,
   loading = false,
   label = 'Sign in with Google',
+  compact = false,
 }: GoogleSignInButtonProps) {
   return (
     <button
@@ -15,7 +17,9 @@ export function GoogleSignInButton({
       onClick={onClick}
       disabled={loading}
       data-testid="google-signin-button"
-      className="gsi-material-button inline-flex items-center gap-2.5 h-9 px-3.5 rounded-lg bg-white border border-slate-300 text-slate-800 text-xs sm:text-sm font-medium hover:bg-slate-50 active:bg-slate-100 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-blue-600"
+      className={`gsi-material-button inline-flex items-center justify-center gap-2 rounded-lg bg-[#182130] border border-slate-700 text-slate-100 hover:bg-slate-800 hover:border-slate-600 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-blue-500 ${
+        compact ? 'w-full h-8 px-3 text-xs font-medium' : 'h-9 px-3.5 text-xs sm:text-sm font-medium'
+      }`}
     >
       <div className="gsi-material-button-state" />
       <div className="gsi-material-button-content-wrapper flex items-center gap-2">
@@ -41,7 +45,7 @@ export function GoogleSignInButton({
             />
             <path
               fill="#34A853"
-              d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
+              d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l7.98 6.19C6.51 42.62 14.62 48 24 48z"
             />
             <path fill="none" d="M0 0h48v48H0z" />
           </svg>

@@ -1,14 +1,20 @@
 @import "tailwindcss";
 
 @theme {
-  --font-display: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
-  --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Outfit", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 @layer base {
+  :root {
+    color-scheme: dark;
+  }
+
   html {
     font-family: var(--font-sans);
+    background-color: #09090b;
+    color: #f4f4f5;
   }
 
   h1, h2, h3, h4, .font-display {
@@ -23,44 +29,29 @@
 @keyframes alert-slide-in {
   0% {
     opacity: 0;
-    transform: translateY(-8px) scale(0.99);
+    transform: translateY(-6px);
   }
   100% {
     opacity: 1;
-    transform: translateY(0) scale(1);
+    transform: translateY(0);
   }
 }
 
 @keyframes alert-border-pulse {
   0%, 100% {
-    box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.35);
-    border-color: rgb(248 113 113);
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.32);
+    border-color: rgba(239, 68, 68, 0.85);
   }
   50% {
-    box-shadow: 0 0 0 6px rgba(220, 38, 38, 0.14);
-    border-color: rgb(220 38 38);
-  }
-}
-
-@keyframes alert-beacon-ping {
-  0% {
-    transform: scale(0.9);
-    opacity: 0.85;
-  }
-  75%, 100% {
-    transform: scale(1.75);
-    opacity: 0;
+    box-shadow: 0 0 0 5px rgba(239, 68, 68, 0.14);
+    border-color: rgb(239 68 68);
   }
 }
 
 @keyframes alert-pop-in {
   0% {
     opacity: 0;
-    transform: translate3d(24px, -10px, 0) scale(0.95);
-  }
-  70% {
-    opacity: 1;
-    transform: translate3d(-2px, 1px, 0) scale(1.01);
+    transform: translate3d(20px, -8px, 0) scale(0.97);
   }
   100% {
     opacity: 1;
@@ -69,19 +60,15 @@
 }
 
 .animate-alert-slide-in {
-  animation: alert-slide-in 0.28s cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation: alert-slide-in 0.24s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 .animate-alert-pop-in {
-  animation: alert-pop-in 0.32s cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation: alert-pop-in 0.26s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 .animate-alert-critical-pulse {
   animation: alert-border-pulse 1.6s ease-in-out infinite;
-}
-
-.animate-alert-beacon {
-  animation: alert-beacon-ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;
 }
 
 @media (prefers-reduced-motion: reduce) {

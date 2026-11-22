@@ -108,7 +108,7 @@ service cloud.firestore {
         && data.bluetoothAddress is string
         && data.bluetoothAddress.size() >= 1
         && data.bluetoothAddress.size() <= 128
-        && data.sourceKind in ['bluetooth-cctv', 'device-camera', 'stream-url', 'uploaded-media']
+        && data.sourceKind in ['wifi-cctv', 'bluetooth-cctv', 'device-camera', 'stream-url', 'uploaded-media']
         && data.hasVideo is bool
         && data.hasVoice is bool
         && data.voiceListeningEnabled is bool

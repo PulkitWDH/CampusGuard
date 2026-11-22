@@ -1,12 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BluetoothSearching, LayoutGrid, Plus, ShieldAlert } from 'lucide-react';
+import {
+  Bluetooth,
+  Camera,
+  Columns2,
+  Grid3X3,
+  LayoutGrid,
+  Square,
+  Upload,
+  Wifi,
+} from 'lucide-react';
 import type { User } from 'firebase/auth';
 import { AlertPopupOverlay } from './components/AlertPopupOverlay';
 import { AlertsPanel } from './components/AlertsPanel';
 import { BluetoothDirectoryView } from './components/BluetoothDirectoryView';
-import { BluetoothScannerModal } from './components/BluetoothScannerModal';
-import { CameraFeedCard, type CameraFramePayload } from './components/CameraFeedCard';
+import { BluetoothScannerModal, type ScannerModalTab } from './components/BluetoothScannerModal';
+import {
+  CameraFeedCard,
+  type CameraFramePayload,
+  type RealtimeThreatEvent,
+} from './components/CameraFeedCard';
 import { DedicatedCameraPanel } from './components/DedicatedCameraPanel';
+import { LiveIncidentRail } from './components/LiveIncidentRail';
 import { NotificationBanner } from './components/NotificationBanner';
 import { Sidebar } from './components/Sidebar';
 import { TeacherAlertDispatchModal } from './components/TeacherAlertDispatchModal';
@@ -38,9 +52,11 @@ import type {
   BluetoothDeviceCandidate,
   ClassroomAnalysis,
   ClassroomCamera,
+  DetectedObjectBox,
   DetectedPersonBox,
   FacilityMode,
   IncidentAlert,
+  ThreatSensitivity,
   WorkspaceCourse,
   WorkspaceGmailMessage,
   WorkspaceTeacher,
@@ -48,6 +64,7 @@ import type {
 import { openRawMediaStream, playAlertChime, sendBrowserNotification } from './utils/mediaCapture';
 import {
   DEFAULT_DB_CALIBRATION_OFFSET,
+  SOUND_ALERT_SUSTAINED_MS,
   SOUND_ALERT_THRESHOLD_DB,
   computeCampusSummary,
   computeClassAttendance,
@@ -56,6 +73,7 @@ import {
   evaluateFightNotification,
   evaluateLocalSafetyAnalysis,
   evaluateSoundThresholdAlert,
+  evaluateSustainedSoundDuration,
   evaluateVoiceCueThreatAlert,
   formatFacilityLabels,
   getLocalDateKey,
@@ -69,6 +87,17 @@ const STORAGE_ALERTS_KEY = 'campusguard_alerts_v2';
 const STORAGE_FACILITY_KEY = 'campusguard_facility_mode_v1';
 const STORAGE_TEACHER_EMAIL_KEY = 'campusguard_teacher_email_v1';
 const STORAGE_DB_OFFSET_KEY = 'campusguard_db_offset_v1';
+const STORAGE_SENSITIVITY_KEY = 'campusguard_threat_sensitivity_v1';
+
+function loadSavedThreatSensitivity(): ThreatSensitivity {
+  if (typeof window === 'undefined') return 'standard';
+  try {
+    const raw = localStorage.getItem(STORAGE_SENSITIVITY_KEY);
+    return raw === 'high' ? 'high' : 'standard';
+  } catch {
+    return 'standard';
+  }
+}
 
 function loadSavedCameras(): ClassroomCamera[] {
   if (typeof window === 'undefined') return [];
@@ -143,13 +172,24 @@ export default function App() {
   const [alerts, setAlerts] = useState<IncidentAlert[]>(loadSavedAlerts);
   const [popupAlerts, setPopupAlerts] = useState<IncidentAlert[]>([]);
   const [facilityMode, setFacilityMode] = useState<FacilityMode>(loadSavedFacilityMode);
+  const [threatSensitivity, setThreatSensitivity] = useState<ThreatSensitivity>(
+    loadSavedThreatSensitivity
+  );
   const [discoveredBluetooth, setDiscoveredBluetooth] = useState<BluetoothDeviceCandidate[]>([]);
   const lastVoiceCueAlertAtRef = useRef<Record<string, number>>({});
+  const loudHoldStartByCamRef = useRef<Record<string, number | null>>({});
   const [activeView, setActiveView] = useState<ActiveWorkspaceView>('grid');
   const [focusedCameraId, setFocusedCameraId] = useState<string | null>(null);
   const [isScannerOpen, setIsScannerOpen] = useState(false);
+  const [scannerInitialTab, setScannerInitialTab] = useState<ScannerModalTab>('wifi');
+  const [wallLayout, setWallLayout] = useState<'1x1' | '2x2' | '3x3'>('2x2');
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
+
+  const openScannerOnTab = useCallback((tab: ScannerModalTab) => {
+    setScannerInitialTab(tab);
+    setIsScannerOpen(true);
+  }, []);
 
   const [soundAlertsEnabled, setSoundAlertsEnabled] = useState(true);
   const [audioSpikeAutoScan, setAudioSpikeAutoScan] = useState(true);
@@ -540,6 +580,14 @@ export default function App() {
     }
   }, [dbCalibrationOffset]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_SENSITIVITY_KEY, threatSensitivity);
+    } catch {
+      // ignore storage errors
+    }
+  }, [threatSensitivity]);
+
   const labels = useMemo(() => formatFacilityLabels(facilityMode), [facilityMode]);
 
   const summary = useMemo(
@@ -584,28 +632,37 @@ export default function App() {
       const transcriptToSend = target.voiceListeningEnabled ? target.liveTranscript : '';
       const audioLevelToSend = target.voiceListeningEnabled ? target.audioLevel : 0;
 
+      const capturePayload = frameCapturersRef.current[cameraId]?.() ?? null;
+
       // Helper: run 100% on-device local safety analysis when cloud API quota (HTTP 429) is exhausted
       const applyLocalEdgeSafetyFallback = (
         previewDataUrl?: string,
         quotaMessage?: string
       ) => {
         const currentPeople = target.lastAnalysis?.detectedPeople ?? [];
+        const currentObjects =
+          capturePayload?.detectedObjects ?? target.lastAnalysis?.detectedObjects ?? [];
         const localResult = evaluateLocalSafetyAnalysis({
           detectedPeople: currentPeople,
+          detectedObjects: currentObjects,
+          frameDeltaPercent: capturePayload?.liveMotionPercent ?? 0,
           voiceTranscript: transcriptToSend,
           audioLevel: audioLevelToSend,
           facilityMode,
           audioSpikeDetected: options?.audioSpikeDetected,
+          sensitivity: threatSensitivity,
         });
         const nextStatus = deriveSafetyStatus(localResult);
         setCameras((prev) =>
           prev.map((cam) => {
             if (cam.id !== cameraId) return cam;
             const livePeople = cam.lastAnalysis?.detectedPeople ?? currentPeople;
+            const liveObjects = cam.lastAnalysis?.detectedObjects ?? currentObjects;
             const merged: ClassroomAnalysis = {
               ...localResult,
               studentCount: livePeople.length,
               detectedPeople: livePeople,
+              detectedObjects: liveObjects,
             };
             return {
               ...cam,
@@ -639,11 +696,10 @@ export default function App() {
 
       // If cloud API quota was already reached, stay cleanly on unlimited local Edge AI during background scans
       if (isAutoTrigger && cloudQuotaExhaustedRef.current) {
-        applyLocalEdgeSafetyFallback();
+        applyLocalEdgeSafetyFallback(capturePayload?.previewDataUrl);
         return;
       }
 
-      const capturePayload = frameCapturersRef.current[cameraId]?.() ?? null;
       const frameBase64 = capturePayload?.frameBase64;
       const previousFrameBase64 = capturePayload?.previousFrameBase64;
 
@@ -815,11 +871,16 @@ export default function App() {
       persistZoneAsync,
       selectedAiModel,
       soundAlertsEnabled,
+      threatSensitivity,
     ]
   );
 
   const handleLocalPersonDetections = useCallback(
-    (cameraId: string, detectedPeople: DetectedPersonBox[]) => {
+    (
+      cameraId: string,
+      detectedPeople: DetectedPersonBox[],
+      detectedObjects: DetectedObjectBox[]
+    ) => {
       localEdgeActiveCamerasRef.current.add(cameraId);
       setCameras((prev) =>
         prev.map((cam) => {
@@ -831,6 +892,7 @@ export default function App() {
                 ...prevAnalysis,
                 studentCount: count,
                 detectedPeople,
+                detectedObjects,
                 analyzedAt: new Date().toISOString(),
                 summary:
                   count === 0 && !prevAnalysis.isFighting
@@ -840,6 +902,7 @@ export default function App() {
             : {
                 studentCount: count,
                 detectedPeople,
+                detectedObjects,
                 isFighting: false,
                 severity: 'none',
                 threatCategory: 'none',
@@ -864,6 +927,94 @@ export default function App() {
       );
     },
     []
+  );
+
+  const handleRealtimeEdgeThreat = useCallback(
+    (cameraId: string, event: RealtimeThreatEvent) => {
+      const target = camerasRef.current.find((c) => c.id === cameraId);
+      if (!target) return;
+
+      if (event.shouldClearThreat) {
+        setCameras((prev) =>
+          prev.map((cam) => {
+            if (cam.id !== cameraId || cam.status === 'normal') return cam;
+            const livePeople = cam.lastAnalysis?.detectedPeople ?? [];
+            const liveObjects = cam.lastAnalysis?.detectedObjects ?? [];
+            return {
+              ...cam,
+              status: 'normal',
+              lastAnalysis: cam.lastAnalysis
+                ? {
+                    ...cam.lastAnalysis,
+                    isFighting: false,
+                    severity: 'none',
+                    threatCategory: 'none',
+                    threatScore: 0,
+                    detectedBehaviors: [],
+                    fightReason: '',
+                    recommendedAction: 'No action needed; zone has returned to calm.',
+                    summary:
+                      livePeople.length === 0
+                        ? 'No people detected in live frame (empty room · Edge AI).'
+                        : `${livePeople.length} ${livePeople.length === 1 ? 'person' : 'people'} detected — zone nominal.`,
+                    detectedPeople: livePeople,
+                    detectedObjects: liveObjects,
+                    analyzedAt: new Date().toISOString(),
+                  }
+                : null,
+            };
+          })
+        );
+        return;
+      }
+
+      if (!event.analysis) return;
+
+      const threatAnalysis = event.analysis;
+      const nextStatus = deriveSafetyStatus(threatAnalysis);
+
+      setCameras((prev) =>
+        prev.map((cam) => {
+          if (cam.id !== cameraId) return cam;
+          const livePeople =
+            threatAnalysis.detectedPeople ?? cam.lastAnalysis?.detectedPeople ?? [];
+          const liveObjects =
+            threatAnalysis.detectedObjects ?? cam.lastAnalysis?.detectedObjects ?? [];
+          return {
+            ...cam,
+            status: nextStatus,
+            studentCount: livePeople.length,
+            lastAnalysis: {
+              ...threatAnalysis,
+              studentCount: livePeople.length,
+              detectedPeople: livePeople,
+              detectedObjects: liveObjects,
+            },
+          };
+        })
+      );
+
+      if (event.shouldEmitAlert) {
+        const alert = evaluateFightNotification(target, threatAnalysis, facilityMode);
+        if (alert) {
+          const enriched: IncidentAlert = event.previewDataUrl
+            ? { ...alert, evidenceSnapshotUrl: event.previewDataUrl }
+            : alert;
+          setAlerts((prev) => [enriched, ...prev]);
+          setPopupAlerts((prev) =>
+            [enriched, ...prev.filter((item) => item.id !== enriched.id)].slice(0, 6)
+          );
+          void persistIncidentAsync(enriched);
+          if (soundAlertsEnabled) {
+            playAlertChime();
+          }
+          if (desktopNotifications) {
+            sendBrowserNotification(enriched);
+          }
+        }
+      }
+    },
+    [desktopNotifications, facilityMode, persistIncidentAsync, soundAlertsEnabled]
   );
 
   const handleUpdateCameraSettings = useCallback(
@@ -1046,30 +1197,43 @@ export default function App() {
       }
 
       if (typeof audioLevel === 'number') {
-        // Trigger immediate alert message to the teacher whenever sound strictly exceeds 81.1 dB
-        if (target && target.voiceListeningEnabled && audioLevel > SOUND_ALERT_THRESHOLD_DB) {
-          const lastDbMs = lastDbAlertAtRef.current[cameraId] ?? 0;
-          const primaryTeacher = courseTeachersRef.current[0];
-          const dbAlert = evaluateSoundThresholdAlert(target, audioLevel, {
-            thresholdDb: SOUND_ALERT_THRESHOLD_DB,
-            teacherEmail:
-              target.teacherEmail || teacherEmailRef.current || primaryTeacher?.email || undefined,
-            teacherName: primaryTeacher?.name,
-            courseName: target.linkedCourseName || courseNameRef.current || undefined,
-            lastAlertAtMs: lastDbMs,
+        // Trigger urgent teacher sound alert ONLY when sound stays strictly > 90.1 dB for > 3 seconds
+        if (target && target.voiceListeningEnabled) {
+          const sustained = evaluateSustainedSoundDuration(
+            loudHoldStartByCamRef.current[cameraId] ?? null,
+            audioLevel,
             nowMs,
-            liveTranscript: transcript,
-          });
-          if (dbAlert) {
-            lastDbAlertAtRef.current[cameraId] = nowMs;
-            setAlerts((prev) => [dbAlert, ...prev]);
-            setPopupAlerts((prev) => [dbAlert, ...prev.filter((item) => item.id !== dbAlert.id)].slice(0, 6));
-            void persistIncidentAsync(dbAlert);
-            if (soundAlertsEnabled) {
-              playAlertChime();
-            }
-            if (desktopNotifications) {
-              sendBrowserNotification(dbAlert);
+            SOUND_ALERT_THRESHOLD_DB,
+            SOUND_ALERT_SUSTAINED_MS
+          );
+          loudHoldStartByCamRef.current[cameraId] = sustained.nextStartMs;
+
+          if (sustained.triggered) {
+            const lastDbMs = lastDbAlertAtRef.current[cameraId] ?? 0;
+            const primaryTeacher = courseTeachersRef.current[0];
+            const dbAlert = evaluateSoundThresholdAlert(target, audioLevel, {
+              thresholdDb: SOUND_ALERT_THRESHOLD_DB,
+              sustainedSeconds: sustained.sustainedMs / 1000,
+              teacherEmail:
+                target.teacherEmail || teacherEmailRef.current || primaryTeacher?.email || undefined,
+              teacherName: primaryTeacher?.name,
+              courseName: target.linkedCourseName || courseNameRef.current || undefined,
+              lastAlertAtMs: lastDbMs,
+              nowMs,
+              liveTranscript: transcript,
+            });
+            if (dbAlert) {
+              lastDbAlertAtRef.current[cameraId] = nowMs;
+              loudHoldStartByCamRef.current[cameraId] = null;
+              setAlerts((prev) => [dbAlert, ...prev]);
+              setPopupAlerts((prev) => [dbAlert, ...prev.filter((item) => item.id !== dbAlert.id)].slice(0, 6));
+              void persistIncidentAsync(dbAlert);
+              if (soundAlertsEnabled) {
+                playAlertChime();
+              }
+              if (desktopNotifications) {
+                sendBrowserNotification(dbAlert);
+              }
             }
           }
         }
@@ -1190,6 +1354,56 @@ export default function App() {
       setCameras((prev) => [...prev, newCamera]);
       void persistZoneAsync(newCamera);
       setActiveView('grid');
+    },
+    [persistZoneAsync, selectedAiModel]
+  );
+
+  const handleAddWifiCamera = useCallback(
+    (params: {
+      classroomName: string;
+      streamUrl: string;
+      wifiBrand: string;
+      wifiDirectMode: boolean;
+    }) => {
+      const newCamId = `cam-wifi-${Date.now()}`;
+      let hostAddress = 'WIFI-CCTV';
+      try {
+        hostAddress = new URL(params.streamUrl).hostname || 'WIFI-CCTV';
+      } catch {
+        hostAddress = 'WIFI-CCTV';
+      }
+
+      const newCamera: ClassroomCamera = {
+        id: newCamId,
+        cameraCode: `CAM-${camerasRef.current.length + 1}`,
+        classroomName: params.classroomName,
+        bluetoothDeviceName: params.wifiBrand || 'Wi-Fi CCTV',
+        bluetoothAddress: hostAddress,
+        sourceKind: 'wifi-cctv',
+        wifiBrand: params.wifiBrand,
+        wifiDirectMode: params.wifiDirectMode,
+        hasVideo: true,
+        hasVoice: true,
+        voiceListeningEnabled: true,
+        autoAiEnabled: true,
+        aiModel: selectedAiModel,
+        streamUrl: params.streamUrl,
+        liveTranscript: '',
+        audioLevel: 0,
+        status: 'normal',
+        studentCount: 0,
+        lastAnalysis: null,
+        isAnalyzing: false,
+      };
+
+      setCameras((prev) => [...prev, newCamera]);
+      void persistZoneAsync(newCamera);
+      setActiveView('grid');
+      setStatusNotice(
+        `Wi-Fi CCTV camera "${params.classroomName}" (${params.wifiBrand}) connected${
+          params.wifiDirectMode ? ' in Direct Local Wi-Fi Mode' : ''
+        }.`
+      );
     },
     [persistZoneAsync, selectedAiModel]
   );
@@ -1475,34 +1689,53 @@ export default function App() {
     [cameras, focusedCamera]
   );
 
+  const hasCriticalCameraOrAlert =
+    cameras.some((c) => c.status === 'fighting') ||
+    summary.fightingRoomsCount > 0 ||
+    alerts.some((a) => !a.acknowledged && a.severity === 'critical');
+  const hasWarningCameraOrAlert =
+    cameras.some((c) => c.status === 'warning') ||
+    alerts.some((a) => !a.acknowledged && a.severity === 'warning');
+
+  const threatStatusLabel = hasCriticalCameraOrAlert
+    ? 'CRITICAL'
+    : hasWarningCameraOrAlert
+      ? 'WARNING'
+      : 'NOMINAL';
+  const threatStatusTone = hasCriticalCameraOrAlert
+    ? 'text-red-400'
+    : hasWarningCameraOrAlert
+      ? 'text-amber-400'
+      : 'text-emerald-400';
+
+  const wallGridClass =
+    wallLayout === '1x1' || (cameras.length === 1 && wallLayout === '2x2')
+      ? 'grid-cols-1'
+      : wallLayout === '3x3'
+        ? 'grid-cols-1 md:grid-cols-2 2xl:grid-cols-3'
+        : 'grid-cols-1 md:grid-cols-2';
+
   return (
-    <div id="top" className="min-h-screen bg-slate-50 text-slate-900 flex flex-col">
+    <div id="top" className="min-h-screen bg-[#09090B] text-zinc-100 flex flex-col">
       <TopBar
         activeView={activeView}
         onSelectView={setActiveView}
         unreadAlertsCount={summary.activeAlertsCount}
-        onOpenScanner={() => setIsScannerOpen(true)}
-        userEmail={currentUser?.email ?? null}
-        userDisplayName={currentUser?.displayName ?? null}
-        isSigningIn={isSigningIn}
-        onGoogleSignIn={() => {
-          void handleGoogleSignIn();
-        }}
-        onSignOut={() => {
-          void handleSignOut();
-        }}
+        onOpenScanner={() => openScannerOnTab('wifi')}
       />
 
-      <div className="flex flex-1">
+      <div className="flex flex-1 min-w-0">
         <Sidebar
           cameras={cameras}
           summary={summary}
           facilityMode={facilityMode}
           onChangeFacilityMode={setFacilityMode}
+          threatSensitivity={threatSensitivity}
+          onChangeThreatSensitivity={setThreatSensitivity}
           focusedCameraId={focusedCameraId}
           onFocusCamera={(id) => {
             setActiveView('grid');
-            setFocusedCameraId((prev) => (prev === id ? null : id));
+            setFocusedCameraId(id);
           }}
           desktopNotifications={desktopNotifications}
           notificationPermission={notificationPermission}
@@ -1517,341 +1750,293 @@ export default function App() {
           onChangeAiModel={setSelectedAiModel}
           dbCalibrationOffset={dbCalibrationOffset}
           onChangeDbCalibrationOffset={setDbCalibrationOffset}
+          userEmail={currentUser?.email ?? null}
+          userDisplayName={currentUser?.displayName ?? null}
+          isSigningIn={isSigningIn}
+          onGoogleSignIn={() => {
+            void handleGoogleSignIn();
+          }}
+          onSignOut={() => {
+            void handleSignOut();
+          }}
         />
 
-        <main className="flex-1 min-w-0 p-4 sm:p-6 space-y-5 max-w-[1440px]">
-          <NotificationBanner
-            alert={latestUnacknowledgedAlert}
-            onInspectCamera={handleFocusFromAlert}
-            onNotifyTeacher={(alert) => setDispatchAlert(alert)}
-            onAcknowledge={handleAcknowledgeAlert}
-          />
-
-          {statusNotice ? (
-            <div
-              role="status"
-              className="bg-emerald-50 border border-emerald-200 text-emerald-950 rounded-xl px-4 py-3 text-sm flex items-center justify-between gap-4"
-            >
-              <span>{statusNotice}</span>
-              <button
-                type="button"
-                onClick={() => setStatusNotice(null)}
-                className="text-xs font-semibold underline cursor-pointer shrink-0"
+        {activeView === 'grid' ? (
+          <div className="flex-1 min-w-0 flex flex-col xl:flex-row">
+            {/* Center Surveillance Stage */}
+            <main className="flex-1 min-w-0 flex flex-col">
+              {/* Operational Telemetry Ribbon */}
+              <div
+                data-testid="telemetry-ribbon"
+                className="bg-[#101114] border-b border-zinc-800/90 px-4 sm:px-5 py-2.5 flex flex-wrap items-center justify-between gap-3"
               >
-                Dismiss
-              </button>
-            </div>
-          ) : null}
-
-          {globalError ? (
-            <div
-              role="alert"
-              className="bg-amber-50 border border-amber-300 text-amber-950 rounded-xl px-4 py-3 text-sm flex items-center justify-between gap-4"
-            >
-              <span>{globalError}</span>
-              <button
-                type="button"
-                onClick={() => setGlobalError(null)}
-                className="text-xs font-semibold underline cursor-pointer shrink-0"
-              >
-                Dismiss
-              </button>
-            </div>
-          ) : null}
-
-          {activeView === 'grid' ? (
-            <>
-              <div className="grid grid-cols-3 gap-3 lg:hidden bg-white border border-slate-200 rounded-xl p-3.5">
-                <div>
-                  <div className="text-xs text-slate-500 capitalize">
-                    All {labels.zonePlural.toLowerCase()} live
+                <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5">
+                  <div className="flex items-baseline gap-2">
+                    <span className="text-[11px] text-zinc-500">Occupancy</span>
+                    <span
+                      className="text-sm font-mono font-semibold tabular-nums text-zinc-100"
+                      data-testid="telemetry-occupancy"
+                    >
+                      {summary.totalKidsCount}
+                    </span>
                   </div>
-                  <div className="text-lg font-semibold font-mono tabular-nums text-slate-900">
-                    {summary.totalKidsCount}
+                  <span className="hidden sm:inline-block h-3.5 w-px bg-zinc-800" aria-hidden="true" />
+                  <div className="flex items-baseline gap-2">
+                    <span className="text-[11px] text-zinc-500">Active Feeds</span>
+                    <span className="text-sm font-mono font-semibold tabular-nums text-zinc-100">
+                      {summary.totalCameras}
+                    </span>
                   </div>
-                </div>
-                <div>
-                  <div className="text-xs text-slate-500">{labels.zonePlural}</div>
-                  <div className="text-lg font-semibold font-mono tabular-nums text-slate-900">
-                    {summary.totalCameras}
+                  <span className="hidden sm:inline-block h-3.5 w-px bg-zinc-800" aria-hidden="true" />
+                  <div className="flex items-baseline gap-2">
+                    <span className="text-[11px] text-zinc-500">Status</span>
+                    <span className={`text-xs font-mono font-semibold tracking-wider ${threatStatusTone}`}>
+                      {threatStatusLabel}
+                    </span>
+                  </div>
+                  <span className="hidden sm:inline-block h-3.5 w-px bg-zinc-800" aria-hidden="true" />
+                  <div className="flex items-baseline gap-2">
+                    <span className="text-[11px] text-zinc-500">Open Alerts</span>
+                    <span
+                      className={`text-sm font-mono font-semibold tabular-nums ${
+                        summary.activeAlertsCount > 0 ? 'text-red-400' : 'text-zinc-300'
+                      }`}
+                    >
+                      {summary.activeAlertsCount}
+                    </span>
                   </div>
                 </div>
-                <div>
-                  <div className="text-xs text-slate-500">Unread alerts</div>
-                  <div
-                    className={`text-lg font-semibold font-mono tabular-nums ${
-                      summary.activeAlertsCount > 0 ? 'text-red-600' : 'text-slate-900'
-                    }`}
-                  >
-                    {summary.activeAlertsCount}
-                  </div>
-                </div>
-              </div>
 
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <div>
-                  <h1 className="text-2xl font-bold tracking-tight text-slate-900">
-                    {focusedCamera ? `${focusedCamera.classroomName} · Dedicated Place` : labels.monitorTitle}
-                  </h1>
-                  <p className="text-sm text-slate-600 mt-0.5">
-                    <span className="tabular-nums">{summary.totalCameras} independent {summary.totalCameras === 1 ? 'camera' : 'cameras'}</span>
-                    <span aria-hidden="true"> · </span>
-                    <span>Instant continuous AI (zero wait · real-time change detection)</span>
-                    <span aria-hidden="true"> · </span>
-                    <span>Teacher alert &gt; {SOUND_ALERT_THRESHOLD_DB.toFixed(1)} dB</span>
-                  </p>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                {/* Right Controls: Mobile selectors + Wall Layout Switcher */}
+                <div className="flex items-center gap-2 shrink-0">
                   <select
                     aria-label="Select facility mode"
                     value={facilityMode}
                     onChange={(e) => setFacilityMode(e.target.value as FacilityMode)}
-                    className="lg:hidden text-xs bg-white border border-slate-300 rounded-lg px-2.5 py-2 text-slate-800"
+                    className="lg:hidden text-xs bg-[#09090B] border border-zinc-800 rounded-md px-2 py-1 text-zinc-200"
                   >
-                    <option value="all">Bank, School &amp; General</option>
+                    <option value="all">All Sectors</option>
                     <option value="bank">Bank &amp; Vault</option>
-                    <option value="school">School &amp; Classroom</option>
+                    <option value="school">School &amp; Class</option>
                   </select>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setThreatSensitivity((prev) => (prev === 'standard' ? 'high' : 'standard'))
+                    }
+                    className="lg:hidden text-xs bg-[#09090B] border border-zinc-800 rounded-md px-2 py-1 text-zinc-300 cursor-pointer"
+                  >
+                    AI: {threatSensitivity === 'high' ? 'High' : 'Std'}
+                  </button>
+
                   {focusedCamera ? (
                     <button
                       type="button"
                       onClick={() => setFocusedCameraId(null)}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-lg border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 transition-colors whitespace-nowrap cursor-pointer"
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md border border-zinc-800 bg-[#16181D] text-zinc-200 hover:bg-zinc-800 transition-colors whitespace-nowrap cursor-pointer"
                     >
-                      <LayoutGrid className="w-4 h-4" aria-hidden="true" />
-                      <span>All {labels.zonePlural} ({cameras.length})</span>
+                      <LayoutGrid className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>All Feeds ({cameras.length})</span>
                     </button>
-                  ) : null}
-
-                  <button
-                    type="button"
-                    onClick={() => setIsScannerOpen(true)}
-                    className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 transition-colors whitespace-nowrap cursor-pointer"
-                  >
-                    <BluetoothSearching className="w-4 h-4" aria-hidden="true" />
-                    <span>Connect Camera</span>
-                  </button>
+                  ) : (
+                    <div
+                      role="group"
+                      aria-label="Monitor wall layout"
+                      className="inline-flex items-center bg-[#09090B] border border-zinc-800 rounded-md p-0.5"
+                    >
+                      {(
+                        [
+                          { id: '1x1', label: '1x1', icon: Square },
+                          { id: '2x2', label: '2x2', icon: Columns2 },
+                          { id: '3x3', label: '3x3', icon: Grid3X3 },
+                        ] as const
+                      ).map((opt) => {
+                        const Icon = opt.icon;
+                        const active = wallLayout === opt.id;
+                        return (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            aria-pressed={active}
+                            aria-label={`${opt.label} grid layout`}
+                            onClick={() => setWallLayout(opt.id)}
+                            className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-mono rounded transition-colors cursor-pointer ${
+                              active
+                                ? 'bg-zinc-800 text-zinc-100 font-semibold'
+                                : 'text-zinc-500 hover:text-zinc-300'
+                            }`}
+                          >
+                            <Icon className="w-3 h-3" aria-hidden="true" />
+                            <span className="hidden sm:inline">{opt.label}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               </div>
 
-              {/* Per-Class Dedicated Places Switcher Strip (supports 2, 3, 5, 10+ classes) */}
-              {cameras.length > 0 ? (
-                <div
-                  data-testid="per-class-places-bar"
-                  className="bg-white border border-slate-200 rounded-xl p-2.5 flex items-center gap-2 overflow-x-auto"
-                >
-                  <button
-                    type="button"
-                    onClick={() => setFocusedCameraId(null)}
-                    className={`px-3 py-2 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
-                      !focusedCameraId
-                        ? 'bg-slate-900 text-white'
-                        : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
-                    }`}
-                  >
-                    All {labels.zonePlural} ({cameras.length})
-                  </button>
-                  {cameras.map((cam) => {
-                    const isActivePlace = focusedCameraId === cam.id;
-                    return (
-                      <button
-                        key={cam.id}
-                        type="button"
-                        onClick={() => setFocusedCameraId(cam.id)}
-                        className={`px-3 py-1.5 rounded-lg text-left whitespace-nowrap shrink-0 border transition-colors cursor-pointer flex items-center gap-2.5 ${
-                          isActivePlace
-                            ? 'bg-blue-600 text-white border-blue-600'
-                            : 'bg-white text-slate-800 border-slate-200 hover:bg-slate-50'
-                        }`}
-                      >
-                        <span className="text-xs font-semibold">{cam.classroomName}</span>
-                        <span
-                          className={`text-[11px] font-mono tabular-nums px-1.5 py-0.5 rounded ${
-                            isActivePlace
-                              ? 'bg-blue-700 text-white'
-                              : 'bg-slate-100 text-slate-700'
-                          }`}
-                        >
-                          {cam.studentCount} live
-                          {typeof cam.expectedTotalCount === 'number' && cam.expectedTotalCount > 0
-                            ? ` / ${cam.expectedTotalCount}`
-                            : ''}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-              ) : null}
+              {/* Center Stage Workspace */}
+              <div className="flex-1 p-4 sm:p-5 space-y-4 min-w-0">
+                <NotificationBanner
+                  alert={latestUnacknowledgedAlert}
+                  onInspectCamera={handleFocusFromAlert}
+                  onNotifyTeacher={(alert) => setDispatchAlert(alert)}
+                  onAcknowledge={handleAcknowledgeAlert}
+                />
 
-              {/* Per-Class Separate Counts Overview (every camera gets its own live + class total card) */}
-              {cameras.length > 0 && !focusedCamera ? (
-                <section aria-label="Individual class and zone counts" data-testid="per-class-counts-strip">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                    {cameras.map((cam) => {
-                      const att = computeClassAttendance(cam.studentCount, cam.expectedTotalCount);
-                      return (
+                {statusNotice ? (
+                  <div
+                    role="status"
+                    className="bg-emerald-950/50 border border-emerald-800/70 text-emerald-100 rounded-lg px-4 py-2.5 text-xs flex items-center justify-between gap-4"
+                  >
+                    <span>{statusNotice}</span>
+                    <button
+                      type="button"
+                      onClick={() => setStatusNotice(null)}
+                      className="text-xs font-semibold text-emerald-300 hover:underline cursor-pointer shrink-0"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                ) : null}
+
+                {globalError ? (
+                  <div
+                    role="alert"
+                    className="bg-amber-950/50 border border-amber-800/70 text-amber-100 rounded-lg px-4 py-2.5 text-xs flex items-center justify-between gap-4"
+                  >
+                    <span>{globalError}</span>
+                    <button
+                      type="button"
+                      onClick={() => setGlobalError(null)}
+                      className="text-xs font-semibold text-amber-300 hover:underline cursor-pointer shrink-0"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                ) : null}
+
+                {cameras.length === 0 ? (
+                  <section
+                    aria-label="Standby surveillance wall"
+                    data-testid="empty-cameras-state"
+                    className="relative bg-[#0E0F12] border border-zinc-800/90 rounded-lg overflow-hidden p-6 sm:p-8 flex flex-col justify-between min-h-[440px]"
+                  >
+                    {/* Viewfinder corner reticles */}
+                    <span
+                      aria-hidden="true"
+                      className="pointer-events-none absolute top-3 left-3 w-4 h-4 border-t border-l border-zinc-700"
+                    />
+                    <span
+                      aria-hidden="true"
+                      className="pointer-events-none absolute top-3 right-3 w-4 h-4 border-t border-r border-zinc-700"
+                    />
+                    <span
+                      aria-hidden="true"
+                      className="pointer-events-none absolute bottom-3 left-3 w-4 h-4 border-b border-l border-zinc-700"
+                    />
+                    <span
+                      aria-hidden="true"
+                      className="pointer-events-none absolute bottom-3 right-3 w-4 h-4 border-b border-r border-zinc-700"
+                    />
+
+                    <div className="flex items-center justify-between gap-2 text-[11px] font-mono text-zinc-500">
+                      <span>CH-00 · STANDBY</span>
+                      <span>
+                        EDGE AI ARMED · {threatSensitivity === 'high' ? 'HIGH' : 'STANDARD'} · &gt;
+                        {SOUND_ALERT_THRESHOLD_DB.toFixed(1)} dB
+                      </span>
+                    </div>
+
+                    <div className="my-auto py-8 max-w-2xl mx-auto text-center space-y-3">
+                      <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-zinc-100">
+                        {labels.monitorTitle}
+                      </h1>
+                      <p className="text-sm text-zinc-400 leading-relaxed max-w-xl mx-auto">
+                        Select a camera source to bring the surveillance wall online. Real-time on-device vision tracks people through face occlusion while filtering normal movement to prevent false fight alarms.
+                      </p>
+
+                      {/* 4 Direct Quick-Connect Source Tiles */}
+                      <div className="pt-5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5 text-left">
                         <button
-                          key={cam.id}
                           type="button"
-                          onClick={() => setFocusedCameraId(cam.id)}
-                          className="text-left bg-white border border-slate-200 hover:border-blue-400 rounded-xl p-3.5 transition-colors cursor-pointer flex items-center justify-between gap-3"
+                          onClick={() => openScannerOnTab('wifi')}
+                          className="group bg-[#14161B] hover:bg-[#1A1D24] border border-zinc-800 hover:border-zinc-600 rounded-lg p-3.5 transition-colors cursor-pointer flex flex-col gap-2"
                         >
-                          <div className="min-w-0">
-                            <div className="text-xs font-mono text-slate-500">{cam.cameraCode}</div>
-                            <div className="text-sm font-semibold text-slate-900 truncate">
-                              {cam.classroomName}
-                            </div>
-                            <div className="text-xs text-slate-500 mt-0.5 tabular-nums">
-                              {cam.audioLevel.toFixed(1)} dB ·{' '}
-                              {cam.attendanceCheckEnabled && cam.attendanceCheckTime
-                                ? `Roll call ${cam.attendanceCheckTime}`
-                                : cam.autoAiEnabled !== false
-                                  ? 'Instant AI'
-                                  : 'Manual AI'}
-                            </div>
-                          </div>
-                          <div className="text-right shrink-0">
-                            <div className="text-lg font-bold font-mono tabular-nums text-slate-900">
-                              {att.presentCount} <span className="text-xs font-normal text-slate-500">live</span>
-                            </div>
-                            <div className="text-xs font-mono text-slate-600 tabular-nums">
-                              {att.customTotal > 0
-                                ? `${att.absentCount} absent / ${att.customTotal}`
-                                : 'Total: —'}
+                          <Wifi className="w-4 h-4 text-zinc-100" aria-hidden="true" />
+                          <div>
+                            <div className="text-xs font-semibold text-zinc-100">Wi-Fi CCTV</div>
+                            <div className="text-[11px] text-zinc-500 mt-0.5 leading-snug">
+                              IP Webcam, ESP32-CAM, Hikvision, ONVIF
                             </div>
                           </div>
                         </button>
-                      );
-                    })}
-                  </div>
-                </section>
-              ) : null}
 
-              {cameras.length === 0 ? (
-                <div className="bg-white border border-slate-200 rounded-xl p-10 text-center" data-testid="empty-cameras-state">
-                  <ShieldAlert className="w-9 h-9 text-slate-400 mx-auto mb-3" aria-hidden="true" />
-                  <h2 className="text-base font-semibold text-slate-900">
-                    No security cameras connected
-                  </h2>
-                  <p className="text-sm text-slate-600 mt-1 max-w-md mx-auto">
-                    {labels.sectorDescription} Each connected camera gets its own dedicated place, its own live count &amp; class total, and continuous zero-wait instant AI with automatic failover.
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => setIsScannerOpen(true)}
-                    className="mt-4 inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors cursor-pointer"
-                  >
-                    <Plus className="w-4 h-4" aria-hidden="true" />
-                    <span>Connect First Zone Camera</span>
-                  </button>
-                </div>
-              ) : focusedCamera ? (
-                <div className="space-y-6" data-testid="dedicated-camera-space">
-                  <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 items-start">
-                    <div className="xl:col-span-7">
-                      <CameraFeedCard
-                        key={focusedCamera.id}
-                        camera={focusedCamera}
-                        facilityMode={facilityMode}
-                        defaultAiModel={selectedAiModel}
-                        dbCalibrationOffset={dbCalibrationOffset}
-                        cloudQuotaExhausted={cloudQuotaExhausted}
-                        isFocused
-                        liveMediaStream={mediaStreamsRef.current[focusedCamera.id] ?? null}
-                        onRegisterCapture={registerCapture}
-                        onLocalPersonDetections={handleLocalPersonDetections}
-                        onReconnectStream={(id) => {
-                          void handleReconnectStream(id);
-                        }}
-                        onAnalyzeCamera={(id, isAutoTrigger) => {
-                          void analyzeCamera(id, { isAutoTrigger });
-                        }}
-                        onToggleVoiceListening={handleToggleVoiceListening}
-                        onUpdateTranscript={handleUpdateTranscript}
-                        onUpdateCameraSettings={handleUpdateCameraSettings}
-                        onToggleFocus={(id) => {
-                          setFocusedCameraId((prev) => (prev === id ? null : id));
-                          window.scrollTo({ top: 0, behavior: 'smooth' });
-                        }}
-                        onRemoveCamera={handleRemoveCamera}
-                      />
-                    </div>
-                    <div className="xl:col-span-5">
-                      <DedicatedCameraPanel
-                        key={focusedCamera.id}
-                        camera={focusedCamera}
-                        allCameras={cameras}
-                        facilityMode={facilityMode}
-                        defaultAiModel={selectedAiModel}
-                        defaultTeacherEmail={defaultTeacherEmail}
-                        courses={courses}
-                        cameraAlerts={alerts.filter((a) => a.cameraId === focusedCamera.id)}
-                        onBackToAll={() => setFocusedCameraId(null)}
-                        onSelectCameraPlace={(id) => setFocusedCameraId(id)}
-                        onUpdateCameraSettings={handleUpdateCameraSettings}
-                        onRunAttendanceCheck={(id) => handleRunAttendanceCheck(id, false)}
-                        onAcknowledgeAlert={handleAcknowledgeAlert}
-                        onNotifyTeacher={(alert) => setDispatchAlert(alert)}
-                      />
-                    </div>
-                  </div>
+                        <button
+                          type="button"
+                          onClick={() => openScannerOnTab('hardware')}
+                          className="group bg-[#14161B] hover:bg-[#1A1D24] border border-zinc-800 hover:border-zinc-600 rounded-lg p-3.5 transition-colors cursor-pointer flex flex-col gap-2"
+                        >
+                          <Camera className="w-4 h-4 text-zinc-100" aria-hidden="true" />
+                          <div>
+                            <div className="text-xs font-semibold text-zinc-100">USB / Webcam</div>
+                            <div className="text-[11px] text-zinc-500 mt-0.5 leading-snug">
+                              Local laptop webcam or USB security cam
+                            </div>
+                          </div>
+                        </button>
 
-                  {otherCameras.length > 0 ? (
-                    <section aria-label="Other classes live feeds" className="space-y-3">
-                      <h2 className="text-sm font-semibold text-slate-700">
-                        Other {labels.zonePlural} Running Independently ({otherCameras.length})
-                      </h2>
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                        {otherCameras.map((cam) => (
-                          <CameraFeedCard
-                            key={cam.id}
-                            camera={cam}
-                            facilityMode={facilityMode}
-                            defaultAiModel={selectedAiModel}
-                            dbCalibrationOffset={dbCalibrationOffset}
-                            cloudQuotaExhausted={cloudQuotaExhausted}
-                            isFocused={false}
-                            liveMediaStream={mediaStreamsRef.current[cam.id] ?? null}
-                            onRegisterCapture={registerCapture}
-                            onLocalPersonDetections={handleLocalPersonDetections}
-                            onReconnectStream={(id) => {
-                              void handleReconnectStream(id);
-                            }}
-                            onAnalyzeCamera={(id, isAutoTrigger) => {
-                              void analyzeCamera(id, { isAutoTrigger });
-                            }}
-                            onToggleVoiceListening={handleToggleVoiceListening}
-                            onUpdateTranscript={handleUpdateTranscript}
-                            onUpdateCameraSettings={handleUpdateCameraSettings}
-                            onToggleFocus={(id) => {
-                              setFocusedCameraId((prev) => (prev === id ? null : id));
-                              window.scrollTo({ top: 0, behavior: 'smooth' });
-                            }}
-                            onRemoveCamera={handleRemoveCamera}
-                          />
-                        ))}
+                        <button
+                          type="button"
+                          onClick={() => openScannerOnTab('bluetooth')}
+                          className="group bg-[#14161B] hover:bg-[#1A1D24] border border-zinc-800 hover:border-zinc-600 rounded-lg p-3.5 transition-colors cursor-pointer flex flex-col gap-2"
+                        >
+                          <Bluetooth className="w-4 h-4 text-zinc-100" aria-hidden="true" />
+                          <div>
+                            <div className="text-xs font-semibold text-zinc-100">Bluetooth CCTV</div>
+                            <div className="text-[11px] text-zinc-500 mt-0.5 leading-snug">
+                              Pair Bluetooth camera or mic hardware
+                            </div>
+                          </div>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => openScannerOnTab('upload')}
+                          className="group bg-[#14161B] hover:bg-[#1A1D24] border border-zinc-800 hover:border-zinc-600 rounded-lg p-3.5 transition-colors cursor-pointer flex flex-col gap-2"
+                        >
+                          <Upload className="w-4 h-4 text-zinc-100" aria-hidden="true" />
+                          <div>
+                            <div className="text-xs font-semibold text-zinc-100">Upload Clip</div>
+                            <div className="text-[11px] text-zinc-500 mt-0.5 leading-snug">
+                              Test recorded CCTV video or photo frame
+                            </div>
+                          </div>
+                        </button>
                       </div>
-                    </section>
-                  ) : null}
-                </div>
-              ) : (
-                <div
-                  data-testid="camera-grid"
-                  className="grid grid-cols-1 md:grid-cols-2 gap-5"
-                >
-                  {cameras.map((cam) => (
+                    </div>
+
+                    <div className="flex items-center justify-between gap-4 text-[11px] font-mono text-zinc-600 min-w-0">
+                      <span className="truncate">{labels.sectorDescription}</span>
+                      <span className="shrink-0">READY</span>
+                    </div>
+                  </section>
+                ) : focusedCamera ? (
+                  <div className="space-y-4" data-testid="dedicated-camera-space">
                     <CameraFeedCard
-                      key={cam.id}
-                      camera={cam}
+                      key={focusedCamera.id}
+                      camera={focusedCamera}
                       facilityMode={facilityMode}
+                      threatSensitivity={threatSensitivity}
                       defaultAiModel={selectedAiModel}
                       dbCalibrationOffset={dbCalibrationOffset}
                       cloudQuotaExhausted={cloudQuotaExhausted}
-                      isFocused={false}
-                      liveMediaStream={mediaStreamsRef.current[cam.id] ?? null}
+                      isFocused
+                      liveMediaStream={mediaStreamsRef.current[focusedCamera.id] ?? null}
                       onRegisterCapture={registerCapture}
                       onLocalPersonDetections={handleLocalPersonDetections}
+                      onRealtimeEdgeThreat={handleRealtimeEdgeThreat}
                       onReconnectStream={(id) => {
                         void handleReconnectStream(id);
                       }}
@@ -1867,88 +2052,224 @@ export default function App() {
                       }}
                       onRemoveCamera={handleRemoveCamera}
                     />
-                  ))}
-                </div>
-              )}
 
-              <AlertsPanel
-                alerts={alerts}
-                cameras={cameras}
-                facilityMode={facilityMode}
-                onAcknowledgeAlert={handleAcknowledgeAlert}
-                onAcknowledgeAll={handleAcknowledgeAll}
-                onClearAcknowledged={handleClearAcknowledged}
-                onFocusCamera={handleFocusFromAlert}
-                onNotifyTeacher={(alert) => setDispatchAlert(alert)}
-              />
-            </>
-          ) : null}
-
-          {activeView === 'bluetooth' ? (
-            <BluetoothDirectoryView
-              connectedCameras={cameras}
-              discoveredDevices={discoveredBluetooth}
-              onDeviceDiscovered={handleDeviceDiscovered}
-              onAddBluetoothCamera={handleAddBluetoothCamera}
-              onOpenModal={() => setIsScannerOpen(true)}
-            />
-          ) : null}
-
-          {activeView === 'alerts' ? (
-            <div className="space-y-4">
-              <div>
-                <h1 className="text-2xl font-bold tracking-tight text-slate-900">
-                  Safety Notifications &amp; Threat Audit Log
-                </h1>
-                <p className="text-sm text-slate-600 mt-0.5">
-                  Review critical fight, robbery, weapon, breach, and &gt;81.1 dB teacher sound alerts alongside exact headcounts and voice cues.
-                </p>
+                    {otherCameras.length > 0 ? (
+                      <section aria-label="Other active camera feeds" className="space-y-2.5">
+                        <h2 className="text-xs font-medium text-zinc-400">
+                          Other Active {labels.zonePlural} ({otherCameras.length})
+                        </h2>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          {otherCameras.map((cam) => (
+                            <CameraFeedCard
+                              key={cam.id}
+                              camera={cam}
+                              facilityMode={facilityMode}
+                              threatSensitivity={threatSensitivity}
+                              defaultAiModel={selectedAiModel}
+                              dbCalibrationOffset={dbCalibrationOffset}
+                              cloudQuotaExhausted={cloudQuotaExhausted}
+                              isFocused={false}
+                              liveMediaStream={mediaStreamsRef.current[cam.id] ?? null}
+                              onRegisterCapture={registerCapture}
+                              onLocalPersonDetections={handleLocalPersonDetections}
+                              onRealtimeEdgeThreat={handleRealtimeEdgeThreat}
+                              onReconnectStream={(id) => {
+                                void handleReconnectStream(id);
+                              }}
+                              onAnalyzeCamera={(id, isAutoTrigger) => {
+                                void analyzeCamera(id, { isAutoTrigger });
+                              }}
+                              onToggleVoiceListening={handleToggleVoiceListening}
+                              onUpdateTranscript={handleUpdateTranscript}
+                              onUpdateCameraSettings={handleUpdateCameraSettings}
+                              onToggleFocus={(id) => {
+                                setFocusedCameraId((prev) => (prev === id ? null : id));
+                                window.scrollTo({ top: 0, behavior: 'smooth' });
+                              }}
+                              onRemoveCamera={handleRemoveCamera}
+                            />
+                          ))}
+                        </div>
+                      </section>
+                    ) : null}
+                  </div>
+                ) : (
+                  <div
+                    data-testid="camera-grid"
+                    className={`grid ${wallGridClass} gap-4`}
+                  >
+                    {cameras.map((cam) => (
+                      <CameraFeedCard
+                        key={cam.id}
+                        camera={cam}
+                        facilityMode={facilityMode}
+                        threatSensitivity={threatSensitivity}
+                        defaultAiModel={selectedAiModel}
+                        dbCalibrationOffset={dbCalibrationOffset}
+                        cloudQuotaExhausted={cloudQuotaExhausted}
+                        isFocused={false}
+                        liveMediaStream={mediaStreamsRef.current[cam.id] ?? null}
+                        onRegisterCapture={registerCapture}
+                        onLocalPersonDetections={handleLocalPersonDetections}
+                        onRealtimeEdgeThreat={handleRealtimeEdgeThreat}
+                        onReconnectStream={(id) => {
+                          void handleReconnectStream(id);
+                        }}
+                        onAnalyzeCamera={(id, isAutoTrigger) => {
+                          void analyzeCamera(id, { isAutoTrigger });
+                        }}
+                        onToggleVoiceListening={handleToggleVoiceListening}
+                        onUpdateTranscript={handleUpdateTranscript}
+                        onUpdateCameraSettings={handleUpdateCameraSettings}
+                        onToggleFocus={(id) => {
+                          setFocusedCameraId((prev) => (prev === id ? null : id));
+                          window.scrollTo({ top: 0, behavior: 'smooth' });
+                        }}
+                        onRemoveCamera={handleRemoveCamera}
+                      />
+                    ))}
+                  </div>
+                )}
               </div>
-              <AlertsPanel
+            </main>
+
+            {/* Right Docked Command Rail: Zone Inspector when focused, otherwise Live Incident Stream */}
+            {focusedCamera ? (
+              <DedicatedCameraPanel
+                key={focusedCamera.id}
+                camera={focusedCamera}
+                allCameras={cameras}
+                facilityMode={facilityMode}
+                defaultAiModel={selectedAiModel}
+                defaultTeacherEmail={defaultTeacherEmail}
+                courses={courses}
+                cameraAlerts={alerts.filter((a) => a.cameraId === focusedCamera.id)}
+                onBackToAll={() => setFocusedCameraId(null)}
+                onSelectCameraPlace={(id) => setFocusedCameraId(id)}
+                onUpdateCameraSettings={handleUpdateCameraSettings}
+                onRunAttendanceCheck={(id) => handleRunAttendanceCheck(id, false)}
+                onAcknowledgeAlert={handleAcknowledgeAlert}
+                onNotifyTeacher={(alert) => setDispatchAlert(alert)}
+              />
+            ) : (
+              <LiveIncidentRail
                 alerts={alerts}
-                cameras={cameras}
                 facilityMode={facilityMode}
                 onAcknowledgeAlert={handleAcknowledgeAlert}
                 onAcknowledgeAll={handleAcknowledgeAll}
-                onClearAcknowledged={handleClearAcknowledged}
                 onFocusCamera={handleFocusFromAlert}
                 onNotifyTeacher={(alert) => setDispatchAlert(alert)}
+                onViewAllIncidents={() => setActiveView('alerts')}
               />
-            </div>
-          ) : null}
-
-          {activeView === 'workspace' ? (
-            <WorkspaceTeacherHub
-              userEmail={currentUser?.email ?? null}
-              userName={currentUser?.displayName ?? null}
-              hasAccessToken={hasAccessToken}
-              isSigningIn={isSigningIn}
-              onGoogleSignIn={handleGoogleSignIn}
-              onSignOut={handleSignOut}
-              defaultTeacherEmail={defaultTeacherEmail}
-              onSaveTeacherEmail={handleSaveTeacherEmail}
-              courses={courses}
-              linkedCourseId={linkedCourseId}
-              onSelectCourse={(c) => {
-                void handleSelectCourse(c);
-              }}
-              courseTeachers={courseTeachers}
-              courseStudentCount={courseStudentCount}
-              gmailMessages={gmailMessages}
-              loadingWorkspace={loadingWorkspace}
-              workspaceError={workspaceError}
-              onRefreshWorkspace={async () => {
-                const token = await getAccessToken();
-                await syncWorkspaceFromGoogle(token);
-              }}
-              cameras={cameras}
-              soundAlerts={soundThresholdAlerts}
-              dbCalibrationOffset={dbCalibrationOffset}
-              onChangeDbCalibrationOffset={setDbCalibrationOffset}
-              onOpenDispatchModal={(alert) => setDispatchAlert(alert)}
+            )}
+          </div>
+        ) : (
+          <main className="flex-1 min-w-0 p-4 sm:p-6 space-y-5 max-w-[1360px]">
+            <NotificationBanner
+              alert={latestUnacknowledgedAlert}
+              onInspectCamera={handleFocusFromAlert}
+              onNotifyTeacher={(alert) => setDispatchAlert(alert)}
+              onAcknowledge={handleAcknowledgeAlert}
             />
-          ) : null}
-        </main>
+
+            {statusNotice ? (
+              <div
+                role="status"
+                className="bg-emerald-950/50 border border-emerald-800/70 text-emerald-100 rounded-lg px-4 py-2.5 text-xs flex items-center justify-between gap-4"
+              >
+                <span>{statusNotice}</span>
+                <button
+                  type="button"
+                  onClick={() => setStatusNotice(null)}
+                  className="text-xs font-semibold text-emerald-300 hover:underline cursor-pointer shrink-0"
+                >
+                  Dismiss
+                </button>
+              </div>
+            ) : null}
+
+            {globalError ? (
+              <div
+                role="alert"
+                className="bg-amber-950/50 border border-amber-800/70 text-amber-100 rounded-lg px-4 py-2.5 text-xs flex items-center justify-between gap-4"
+              >
+                <span>{globalError}</span>
+                <button
+                  type="button"
+                  onClick={() => setGlobalError(null)}
+                  className="text-xs font-semibold text-amber-300 hover:underline cursor-pointer shrink-0"
+                >
+                  Dismiss
+                </button>
+              </div>
+            ) : null}
+
+            {activeView === 'bluetooth' ? (
+              <BluetoothDirectoryView
+                connectedCameras={cameras}
+                discoveredDevices={discoveredBluetooth}
+                onDeviceDiscovered={handleDeviceDiscovered}
+                onAddBluetoothCamera={handleAddBluetoothCamera}
+                onOpenModal={() => openScannerOnTab('wifi')}
+              />
+            ) : null}
+
+            {activeView === 'alerts' ? (
+              <div className="space-y-4">
+                <div>
+                  <h1 className="text-xl font-semibold tracking-tight text-zinc-100">
+                    Incident &amp; Threat Audit Log
+                  </h1>
+                  <p className="text-xs text-zinc-400 mt-0.5">
+                    Review verified fighting, beating, bullying, weapon, breach, and &gt;{SOUND_ALERT_THRESHOLD_DB.toFixed(1)} dB (3s) acoustic alerts with occupancy counts and evidence frames.
+                  </p>
+                </div>
+                <AlertsPanel
+                  alerts={alerts}
+                  cameras={cameras}
+                  facilityMode={facilityMode}
+                  onAcknowledgeAlert={handleAcknowledgeAlert}
+                  onAcknowledgeAll={handleAcknowledgeAll}
+                  onClearAcknowledged={handleClearAcknowledged}
+                  onFocusCamera={handleFocusFromAlert}
+                  onNotifyTeacher={(alert) => setDispatchAlert(alert)}
+                />
+              </div>
+            ) : null}
+
+            {activeView === 'workspace' ? (
+              <WorkspaceTeacherHub
+                userEmail={currentUser?.email ?? null}
+                userName={currentUser?.displayName ?? null}
+                hasAccessToken={hasAccessToken}
+                isSigningIn={isSigningIn}
+                onGoogleSignIn={handleGoogleSignIn}
+                onSignOut={handleSignOut}
+                defaultTeacherEmail={defaultTeacherEmail}
+                onSaveTeacherEmail={handleSaveTeacherEmail}
+                courses={courses}
+                linkedCourseId={linkedCourseId}
+                onSelectCourse={(c) => {
+                  void handleSelectCourse(c);
+                }}
+                courseTeachers={courseTeachers}
+                courseStudentCount={courseStudentCount}
+                gmailMessages={gmailMessages}
+                loadingWorkspace={loadingWorkspace}
+                workspaceError={workspaceError}
+                onRefreshWorkspace={async () => {
+                  const token = await getAccessToken();
+                  await syncWorkspaceFromGoogle(token);
+                }}
+                cameras={cameras}
+                soundAlerts={soundThresholdAlerts}
+                dbCalibrationOffset={dbCalibrationOffset}
+                onChangeDbCalibrationOffset={setDbCalibrationOffset}
+                onOpenDispatchModal={(alert) => setDispatchAlert(alert)}
+              />
+            ) : null}
+          </main>
+        )}
       </div>
 
       <AlertPopupOverlay
@@ -1964,10 +2285,12 @@ export default function App() {
 
       <BluetoothScannerModal
         isOpen={isScannerOpen}
+        initialTab={scannerInitialTab}
         existingCameras={cameras}
         discoveredBluetooth={discoveredBluetooth}
         onDeviceDiscovered={handleDeviceDiscovered}
         onClose={() => setIsScannerOpen(false)}
+        onAddWifiCamera={handleAddWifiCamera}
         onAddBluetoothCamera={handleAddBluetoothCamera}
         onAddHardwareCamera={handleAddHardwareCamera}
         onAddStreamUrlCamera={handleAddStreamUrlCamera}

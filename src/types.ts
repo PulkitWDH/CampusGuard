@@ -1,4 +1,5 @@
 export type CameraSourceKind =
+  | 'wifi-cctv'
   | 'bluetooth-cctv'
   | 'device-camera'
   | 'stream-url'
@@ -25,8 +26,19 @@ export type ThreatCategory =
   | 'intrusion'
   | 'disturbance';
 
+export type ThreatSensitivity = 'standard' | 'high';
+
 export interface DetectedPersonBox {
   label: string;
+  box_2d: [number, number, number, number];
+  confidence: number;
+  faceOccluded?: boolean;
+  occludedBy?: string;
+}
+
+export interface DetectedObjectBox {
+  label: string;
+  category: 'weapon' | 'occluder' | 'object';
   box_2d: [number, number, number, number];
   confidence: number;
 }
@@ -34,6 +46,7 @@ export interface DetectedPersonBox {
 export interface ClassroomAnalysis {
   studentCount: number;
   detectedPeople?: DetectedPersonBox[];
+  detectedObjects?: DetectedObjectBox[];
   isFighting: boolean;
   severity: AlertSeverity;
   threatCategory?: ThreatCategory;
@@ -80,6 +93,8 @@ export interface ClassroomCamera {
   videoDeviceId?: string;
   audioDeviceId?: string;
   streamUrl?: string;
+  wifiBrand?: string;
+  wifiDirectMode?: boolean;
   customMediaUrl?: string;
   customMediaType?: 'image' | 'video';
   liveTranscript: string;

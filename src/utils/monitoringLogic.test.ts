@@ -11,14 +11,18 @@ import {
   computeClassAttendance,
   computeFrameDeltaPercent,
   computeSplDecibels,
+  computeTorsoPatchSimilarity,
+  createInitialEdgeThreatState,
   deriveSafetyStatus,
   evaluateAttendanceReportAlert,
   evaluateFightNotification,
   evaluateLocalSafetyAnalysis,
+  evaluateRealtimeEdgeThreat,
   evaluateSoundThresholdAlert,
   evaluateVoiceCueThreatAlert,
   filterIncidentAlerts,
   filterVerifiedPersonDetections,
+  findFaceOccluderForPerson,
   formatAiModelLabel,
   formatAlertCategoryBadge,
   formatCameraAttendanceLabel,
@@ -31,6 +35,7 @@ import {
   stepPersonTracker,
 } from './monitoringLogic';
 import type { ClassroomAnalysis, ClassroomCamera, IncidentAlert } from '../types';
+import { buildWifiCameraUrl, isPrivateLanHost } from './wifiCameraPresets';
 
 test('classifyBluetoothCamera detects CCTV camera with video and voice recognition', () => {
   const result = classifyBluetoothCamera({
@@ -230,13 +235,13 @@ test('evaluateFightNotification escalates robbery_or_weapon threats in bank mode
 
 test('shouldTriggerAudioSpikeScan enforces decibel threshold and cooldown', () => {
   assert.equal(shouldTriggerAudioSpikeScan(65, 0, 20000, false), false);
-  assert.equal(shouldTriggerAudioSpikeScan(82, 0, 20000, false), true);
-  assert.equal(shouldTriggerAudioSpikeScan(85, 15000, 20000, false), false);
-  assert.equal(shouldTriggerAudioSpikeScan(85, 0, 20000, true), false);
+  assert.equal(shouldTriggerAudioSpikeScan(92, 0, 20000, false), true);
+  assert.equal(shouldTriggerAudioSpikeScan(95, 15000, 20000, false), false);
+  assert.equal(shouldTriggerAudioSpikeScan(95, 0, 20000, true), false);
 });
 
-test('evaluateSoundThresholdAlert triggers strictly above 81.1 dB with teacher alert message and cooldown', () => {
-  assert.equal(SOUND_ALERT_THRESHOLD_DB, 81.1);
+test('evaluateSoundThresholdAlert triggers strictly above 90.1 dB with teacher alert message and cooldown', () => {
+  assert.equal(SOUND_ALERT_THRESHOLD_DB, 90.1);
   const cam = {
     id: 'cam-room-4',
     cameraCode: 'CAM-4',
@@ -244,11 +249,11 @@ test('evaluateSoundThresholdAlert triggers strictly above 81.1 dB with teacher a
     studentCount: 14,
   };
 
-  // Exactly 81.1 dB does NOT exceed 81.1 dB
-  assert.equal(evaluateSoundThresholdAlert(cam, 81.1, { nowMs: 30000 }), null);
+  // Exactly 90.1 dB does NOT exceed 90.1 dB
+  assert.equal(evaluateSoundThresholdAlert(cam, 90.1, { nowMs: 30000 }), null);
 
-  // 81.2 dB strictly exceeds 81.1 dB -> generates teacher alert message
-  const alert = evaluateSoundThresholdAlert(cam, 81.2, {
+  // 91.2 dB strictly exceeds 90.1 dB -> generates teacher alert message
+  const alert = evaluateSoundThresholdAlert(cam, 91.2, {
     nowMs: 30000,
     teacherEmail: 'teacher@school.edu',
     teacherName: 'Ms. Rivera',
@@ -257,16 +262,16 @@ test('evaluateSoundThresholdAlert triggers strictly above 81.1 dB with teacher a
   });
   assert.ok(alert);
   assert.equal(alert.alertType, 'sound-threshold');
-  assert.equal(alert.measuredDb, 81.2);
+  assert.equal(alert.measuredDb, 91.2);
   assert.equal(alert.severity, 'critical');
-  assert.match(alert.headline, /81\.2 dB/);
-  assert.ok(alert.teacherMessageSubject?.includes('81.1 dB'));
+  assert.match(alert.headline, /91\.2 dB/);
+  assert.ok(alert.teacherMessageSubject?.includes('90.1 dB'));
   assert.ok(alert.teacherMessageBody?.includes('Hello Ms. Rivera'));
   assert.ok(alert.teacherMessageBody?.includes('Chemistry 101'));
 
   // Cooldown suppresses duplicate alert within 15s
   assert.equal(
-    evaluateSoundThresholdAlert(cam, 88.4, { lastAlertAtMs: 30000, nowMs: 35000 }),
+    evaluateSoundThresholdAlert(cam, 96.4, { lastAlertAtMs: 30000, nowMs: 35000 }),
     null
   );
 });
@@ -274,7 +279,7 @@ test('evaluateSoundThresholdAlert triggers strictly above 81.1 dB with teacher a
 test('computeSplDecibels maps quiet, normal speech, and shouting RMS accurately', () => {
   const quiet = new Float32Array(256).fill(0.0008);
   const speech = new Float32Array(256).fill(0.02);
-  const shout = new Float32Array(256).fill(0.12);
+  const shout = new Float32Array(256).fill(0.3);
 
   const quietDb = computeSplDecibels(quiet, DEFAULT_DB_CALIBRATION_OFFSET);
   const speechDb = computeSplDecibels(speech, DEFAULT_DB_CALIBRATION_OFFSET);
@@ -282,7 +287,7 @@ test('computeSplDecibels maps quiet, normal speech, and shouting RMS accurately'
 
   assert.ok(quietDb >= 35 && quietDb <= 48, `Expected quiet ~40 dB, got ${quietDb}`);
   assert.ok(speechDb >= 62 && speechDb <= 74, `Expected speech ~68 dB, got ${speechDb}`);
-  assert.ok(shoutDb > SOUND_ALERT_THRESHOLD_DB, `Expected shout > 81.1 dB, got ${shoutDb}`);
+  assert.ok(shoutDb > SOUND_ALERT_THRESHOLD_DB, `Expected shout > 90.1 dB, got ${shoutDb}`);
 });
 
 test('formatFacilityLabels adapts terminology for bank, school, and all-sector modes', () => {
@@ -557,9 +562,9 @@ test('mergeTiledPersonDetections preserves multi-person groups across tiles with
 
 test('stepPersonTracker locks onto 2nd occluded person, prevents 2->1->2 flicker, and clears empty room to 0', () => {
   const p1 = { label: 'Person (left)', box_2d: [150, 120, 820, 420] as [number, number, number, number], confidence: 86 };
-  const p2Occluded = { label: 'Person (right)', box_2d: [220, 520, 780, 790] as [number, number, number, number], confidence: 44 };
+  const p2Occluded = { label: 'Person (right)', box_2d: [220, 520, 780, 790] as [number, number, number, number], confidence: 54 };
 
-  // Frame 1: p1 instant (>=52%), p2 pending (44%)
+  // Frame 1: p1 instant (>=62%), p2 pending (54%)
   const f1 = stepPersonTracker({ confirmed: [], pending: [] }, [p1, p2Occluded]);
   assert.equal(f1.people.length, 1);
 
@@ -686,11 +691,359 @@ test('parseSafeJsonText safely catches HTML <!doctype> fallback pages instead of
   assert.equal(empty.ok, false);
 });
 
+test('evaluateRealtimeEdgeThreat ignores normal movement and reliably detects genuine multi-person fights, beatings, bullying, and weapons', () => {
+  const calmPeople = [
+    { label: 'Person (left)', box_2d: [150, 80, 820, 320] as [number, number, number, number], confidence: 90 },
+    { label: 'Person (right)', box_2d: [160, 620, 830, 880] as [number, number, number, number], confidence: 88 },
+  ];
 
+  // 1a. Single person moving rapidly across webcam MUST NEVER trigger fighting or beating
+  let soloState = createInitialEdgeThreatState();
+  for (let i = 0; i < 6; i += 1) {
+    const shiftedBox: [number, number, number, number] = [140, 120 + i * 90, 900, 520 + i * 90];
+    const res = evaluateRealtimeEdgeThreat(soloState, {
+      people: [{ label: 'Person (center)', box_2d: shiftedBox, confidence: 88 }],
+      dangerousObjects: [],
+      frameDeltaPercent: 28.0,
+      voiceTranscript: '',
+      audioLevel: 76,
+      facilityMode: 'school',
+      nowMs: 1000 + i * 300,
+    });
+    soloState = res.nextState;
+    assert.equal(res.analysis, null);
+    assert.equal(res.shouldEmitAlert, false);
+  }
 
+  // 1b. Two people sitting closely side-by-side moving arms (no box collision) -> ZERO false fight alert
+  const sideBySidePeople = [
+    { label: 'Person (left)', box_2d: [150, 140, 820, 440] as [number, number, number, number], confidence: 90 },
+    { label: 'Person (right)', box_2d: [160, 455, 830, 760] as [number, number, number, number], confidence: 88 },
+  ];
+  let calmState = createInitialEdgeThreatState();
+  for (let i = 0; i < 6; i += 1) {
+    const res = evaluateRealtimeEdgeThreat(calmState, {
+      people: sideBySidePeople,
+      dangerousObjects: [],
+      frameDeltaPercent: 10.5,
+      voiceTranscript: '',
+      audioLevel: 65,
+      facilityMode: 'school',
+      nowMs: 5000 + i * 300,
+    });
+    calmState = res.nextState;
+    assert.equal(res.analysis, null);
+    assert.equal(res.shouldEmitAlert, false);
+  }
 
+  // 2. Genuine silent visual fight (1 initial frame + 4 consecutive overlapping clash frames with high velocity)
+  let fightState = createInitialEdgeThreatState();
+  let fightResult = null as ReturnType<typeof evaluateRealtimeEdgeThreat> | null;
+  for (let i = 0; i < 5; i += 1) {
+    const shift = i % 2 === 0 ? 0 : 75;
+    const clashingPeople = [
+      { label: 'Person (center)', box_2d: [160, 280 + shift, 820, 560 + shift] as [number, number, number, number], confidence: 91 },
+      { label: 'Person (center)', box_2d: [170, 410 + shift, 830, 690 + shift] as [number, number, number, number], confidence: 87 },
+    ];
+    fightResult = evaluateRealtimeEdgeThreat(fightState, {
+      people: clashingPeople,
+      dangerousObjects: [],
+      frameDeltaPercent: 18.5,
+      voiceTranscript: '',
+      audioLevel: 0,
+      facilityMode: 'school',
+      nowMs: 10000 + i * 300,
+    });
+    fightState = fightResult.nextState;
+    if (i < 4) {
+      assert.equal(fightResult.shouldEmitAlert, false);
+    }
+  }
+  assert.equal(fightResult?.shouldEmitAlert, true);
+  assert.equal(fightResult?.analysis?.threatCategory, 'fight');
+  assert.equal(fightResult?.analysis?.severity, 'critical');
 
+  // 3. Genuine silent visual beating (victim collapsed horizontally under overlapping contact + motion over 4 frames)
+  const beatingPeople = [
+    { label: 'Person (center)', box_2d: [160, 310, 820, 580] as [number, number, number, number], confidence: 92 },
+    // Horizontal fallen victim box (width 440 / height 240 = 1.83 >= 1.35, ymin 540 >= 340) overlapping attacker
+    { label: 'Person (center)', box_2d: [540, 340, 780, 780] as [number, number, number, number], confidence: 84 },
+  ];
+  let beatState = createInitialEdgeThreatState();
+  let beatResult = null as ReturnType<typeof evaluateRealtimeEdgeThreat> | null;
+  for (let i = 0; i < 4; i += 1) {
+    beatResult = evaluateRealtimeEdgeThreat(beatState, {
+      people: beatingPeople,
+      dangerousObjects: [],
+      frameDeltaPercent: 16.5,
+      voiceTranscript: '',
+      audioLevel: 0,
+      facilityMode: 'school',
+      nowMs: 20000 + i * 300,
+    });
+    beatState = beatResult.nextState;
+  }
+  assert.equal(beatResult?.shouldEmitAlert, true);
+  assert.equal(beatResult?.analysis?.threatCategory, 'beating');
 
+  // 4. Genuine silent visual bullying (3 distinct people tightly surrounding 1 target across 5 frames with motion)
+  const crowdingPeople = [
+    { label: 'Person (left)', box_2d: [180, 180, 820, 420] as [number, number, number, number], confidence: 88 },
+    { label: 'Person (center)', box_2d: [220, 410, 820, 610] as [number, number, number, number], confidence: 85 },
+    { label: 'Person (right)', box_2d: [180, 600, 820, 840] as [number, number, number, number], confidence: 87 },
+  ];
+  let bullyState = createInitialEdgeThreatState();
+  let bullyResult = null as ReturnType<typeof evaluateRealtimeEdgeThreat> | null;
+  for (let i = 0; i < 5; i += 1) {
+    bullyResult = evaluateRealtimeEdgeThreat(bullyState, {
+      people: crowdingPeople,
+      dangerousObjects: [],
+      frameDeltaPercent: 7.5,
+      voiceTranscript: '',
+      audioLevel: 0,
+      facilityMode: 'school',
+      nowMs: 30000 + i * 300,
+    });
+    bullyState = bullyResult.nextState;
+  }
+  assert.equal(bullyResult?.shouldEmitAlert, true);
+  assert.equal(bullyResult?.analysis?.threatCategory, 'bullying');
 
+  // 5. On-device weapon object detection requires multi-frame confirmation (no 1-frame fluke)
+  const weaponObj = {
+    label: 'Knife / Blade',
+    category: 'weapon' as const,
+    box_2d: [380, 260, 490, 350] as [number, number, number, number],
+    confidence: 86,
+  };
+  const w1 = evaluateRealtimeEdgeThreat(createInitialEdgeThreatState(), {
+    people: [calmPeople[0]],
+    dangerousObjects: [weaponObj],
+    frameDeltaPercent: 2.0,
+    voiceTranscript: '',
+    audioLevel: 0,
+    facilityMode: 'all',
+    nowMs: 40000,
+  });
+  assert.equal(w1.shouldEmitAlert, false);
+  const weaponRes = evaluateRealtimeEdgeThreat(w1.nextState, {
+    people: [calmPeople[0]],
+    dangerousObjects: [weaponObj],
+    frameDeltaPercent: 2.0,
+    voiceTranscript: '',
+    audioLevel: 0,
+    facilityMode: 'all',
+    nowMs: 40300,
+  });
+  assert.equal(weaponRes.shouldEmitAlert, true);
+  assert.equal(weaponRes.analysis?.threatCategory, 'robbery_or_weapon');
 
+  // 6. Auto-recovers cleanly to calm after 12 consecutive calm frames
+  let recoveryState = weaponRes.nextState;
+  let cleared = false;
+  for (let i = 0; i < 12; i += 1) {
+    const r = evaluateRealtimeEdgeThreat(recoveryState, {
+      people: calmPeople,
+      dangerousObjects: [],
+      frameDeltaPercent: 1.0,
+      voiceTranscript: '',
+      audioLevel: 0,
+      facilityMode: 'all',
+      nowMs: 41000 + i * 300,
+    });
+    recoveryState = r.nextState;
+    if (r.shouldClearThreat) cleared = true;
+  }
+  assert.equal(cleared, true);
+  assert.equal(recoveryState.activeThreatCategory, 'none');
+});
+
+test('wifiCameraPresets builds valid HTTP URLs, embeds auth, detects private LAN, and rejects raw RTSP', () => {
+  assert.equal(isPrivateLanHost('192.168.1.42'), true);
+  assert.equal(isPrivateLanHost('10.0.0.15'), true);
+  assert.equal(isPrivateLanHost('172.16.5.9'), true);
+  assert.equal(isPrivateLanHost('camera.example.com'), false);
+
+  const androidCam = buildWifiCameraUrl({
+    brandId: 'ip-webcam',
+    hostOrUrl: '192.168.1.50',
+  });
+  assert.equal(androidCam.ok, true);
+  if (androidCam.ok) {
+    assert.equal(androidCam.url, 'http://192.168.1.50:8080/shot.jpg');
+    assert.equal(androidCam.isPrivateLan, true);
+  }
+
+  const hikvisionCam = buildWifiCameraUrl({
+    brandId: 'hikvision',
+    hostOrUrl: '192.168.1.64',
+    username: 'admin',
+    password: 'secret',
+  });
+  assert.equal(hikvisionCam.ok, true);
+  if (hikvisionCam.ok) {
+    assert.equal(
+      hikvisionCam.url,
+      'http://admin:secret@192.168.1.64/ISAPI/Streaming/channels/101/picture'
+    );
+  }
+
+  const reolinkCam = buildWifiCameraUrl({
+    brandId: 'reolink',
+    hostOrUrl: 'cam.school.org',
+    username: 'admin',
+    password: 'pw',
+  });
+  assert.equal(reolinkCam.ok, true);
+  if (reolinkCam.ok) {
+    assert.equal(
+      reolinkCam.url,
+      'http://cam.school.org/cgi-bin/api.cgi?cmd=Snap&channel=0&user=admin&password=pw'
+    );
+    assert.equal(reolinkCam.isPrivateLan, false);
+  }
+
+  const rtspRejected = buildWifiCameraUrl({
+    brandId: 'custom-url',
+    hostOrUrl: 'rtsp://192.168.1.90:554/stream1',
+  });
+  assert.equal(rtspRejected.ok, false);
+  if (!rtspRejected.ok) {
+    assert.match(rtspRejected.error, /rtsp/i);
+  }
+});
+
+test('stepPersonTracker stays locked when a person covers their face with a tennis racket or hand, and drops cleanly to 0 when they leave', () => {
+  const personTorso = [
+    68, 72, 70, 65, 69, 71,
+    80, 84, 82, 79, 81, 83,
+    92, 95, 90, 88, 91, 94,
+    75, 78, 74, 72, 76, 77,
+  ];
+  const emptyChair = [
+    185, 190, 188, 192, 186, 189,
+    180, 182, 184, 179, 181, 183,
+    176, 178, 175, 177, 174, 179,
+    170, 172, 171, 169, 173, 171,
+  ];
+
+  assert.ok(computeTorsoPatchSimilarity(personTorso, personTorso.map((v) => v + 4)) >= 0.85);
+  assert.ok(computeTorsoPatchSimilarity(personTorso, emptyChair) < 0.45);
+
+  const personBox: [number, number, number, number] = [140, 260, 920, 740];
+  const racketOverFace = {
+    label: 'Tennis Racket',
+    category: 'occluder' as const,
+    box_2d: [120, 320, 490, 660] as [number, number, number, number],
+    confidence: 64,
+  };
+  assert.equal(findFaceOccluderForPerson(personBox, [racketOverFace])?.label, 'Tennis Racket');
+
+  // Frames 1-2: Person sits normally in front of camera (builds solid track + torso signature)
+  let state = { confirmed: [], pending: [] } as ReturnType<typeof stepPersonTracker>['nextState'];
+  const f1 = stepPersonTracker(
+    state,
+    [{ label: 'Person (center)', box_2d: personBox, confidence: 82 }],
+    { sampleTorsoSignature: () => personTorso }
+  );
+  state = f1.nextState;
+  const f2 = stepPersonTracker(
+    state,
+    [{ label: 'Person (center)', box_2d: personBox, confidence: 84 }],
+    { sampleTorsoSignature: () => personTorso }
+  );
+  state = f2.nextState;
+  assert.equal(f2.people.length, 1);
+
+  // Frames 3-12: Person holds a Tennis Racket directly over their face -> COCO-SSD drops person to 0%!
+  // Smart occlusion tracker MUST keep counting 1 person & label them "Face Covered · Tennis Racket"!
+  let lastPeople = f2.people;
+  for (let i = 0; i < 10; i += 1) {
+    const res = stepPersonTracker(state, [], {
+      occluderObjects: [racketOverFace],
+      sampleTorsoSignature: () => personTorso.map((v) => v + (i % 3)),
+    });
+    state = res.nextState;
+    lastPeople = res.people;
+  }
+  assert.equal(lastPeople.length, 1);
+  assert.equal(lastPeople[0].faceOccluded, true);
+  assert.match(lastPeople[0].label, /Tennis Racket/i);
+
+  // Frames 13-16: Person puts racket down and covers face with bare hands (no COCO occluder object,
+  // but shoulders/torso signature still matches!) -> MUST stay locked at 1!
+  for (let i = 0; i < 4; i += 1) {
+    const res = stepPersonTracker(state, [], {
+      occluderObjects: [],
+      sampleTorsoSignature: () => personTorso.map((v) => v - 2),
+    });
+    state = res.nextState;
+    lastPeople = res.people;
+  }
+  assert.equal(lastPeople.length, 1);
+  assert.equal(lastPeople[0].faceOccluded, true);
+
+  // Frames 17-19: Person stands up and walks away (no racket + torso pixels change to empty background)
+  // -> MUST drop cleanly to 0 with zero ghost boxes!
+  for (let i = 0; i < 3; i += 1) {
+    const res = stepPersonTracker(state, [], {
+      occluderObjects: [],
+      sampleTorsoSignature: () => emptyChair,
+    });
+    state = res.nextState;
+    lastPeople = res.people;
+  }
+  assert.equal(lastPeople.length, 0);
+});
+
+test('mergeTiledPersonDetections and stepPersonTracker never hallucinate a phantom 2nd person when 1 user sits close-up or shifts position', () => {
+  // 1. Single centered close-up person sliced by left/right 60% tiles -> MUST stay strictly 1 person
+  const fullFrame = [
+    { label: 'Person (center)', box_2d: [120, 180, 980, 820] as [number, number, number, number], confidence: 89 },
+  ];
+  const leftTileHalf = [
+    // Right edge at 575 (inside full person)
+    { label: 'Person (center)', box_2d: [180, 310, 980, 958] as [number, number, number, number], confidence: 76 },
+  ];
+  const rightTileHalf = [
+    // Left edge at 430 (inside full person, shifted vertically)
+    { label: 'Person (right)', box_2d: [250, 50, 980, 680] as [number, number, number, number], confidence: 74 },
+  ];
+  const merged = mergeTiledPersonDetections(fullFrame, leftTileHalf, rightTileHalf, 48);
+  assert.equal(merged.length, 1);
+
+  // 2. Single person shifts from left-center to right-center while holding a racket -> MUST stay 1 person (no ghost clone!)
+  const torso = [
+    60, 75, 90, 65, 80, 95,
+    70, 85, 100, 72, 88, 92,
+    68, 82, 96, 70, 84, 90,
+    64, 78, 91, 66, 80, 86,
+  ];
+  let tracker = { confirmed: [], pending: [] } as ReturnType<typeof stepPersonTracker>['nextState'];
+  const s1 = stepPersonTracker(
+    tracker,
+    [{ label: 'Person (center)', box_2d: [120, 180, 950, 560], confidence: 86 }],
+    { sampleTorsoSignature: () => torso }
+  );
+  tracker = s1.nextState;
+  const s2 = stepPersonTracker(
+    tracker,
+    [{ label: 'Person (center)', box_2d: [120, 180, 950, 560], confidence: 88 }],
+    { sampleTorsoSignature: () => torso }
+  );
+  tracker = s2.nextState;
+
+  // User shifts right to [120, 360, 950, 760] while an occluder sits near old box
+  const s3 = stepPersonTracker(
+    tracker,
+    [{ label: 'Person (center)', box_2d: [120, 360, 950, 760], confidence: 87 }],
+    {
+      occluderObjects: [
+        { label: 'Tennis Racket', category: 'occluder', box_2d: [150, 220, 480, 500], confidence: 65 },
+      ],
+      sampleTorsoSignature: () => torso,
+    }
+  );
+  assert.equal(s3.people.length, 1);
+});
 

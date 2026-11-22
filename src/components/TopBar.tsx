@@ -1,17 +1,11 @@
-import { BluetoothSearching } from 'lucide-react';
+import { Plus } from 'lucide-react';
 import type { ActiveWorkspaceView } from '../types';
-import { GoogleSignInButton } from './GoogleSignInButton';
 
 interface TopBarProps {
   activeView: ActiveWorkspaceView;
   onSelectView: (view: ActiveWorkspaceView) => void;
   unreadAlertsCount: number;
   onOpenScanner: () => void;
-  userEmail: string | null;
-  userDisplayName: string | null;
-  isSigningIn: boolean;
-  onGoogleSignIn: () => void;
-  onSignOut: () => void;
 }
 
 export function TopBar({
@@ -19,101 +13,117 @@ export function TopBar({
   onSelectView,
   unreadAlertsCount,
   onOpenScanner,
-  userEmail,
-  userDisplayName,
-  isSigningIn,
-  onGoogleSignIn,
-  onSignOut,
 }: TopBarProps) {
+  const navItems: Array<{
+    id: ActiveWorkspaceView;
+    label: string;
+    count?: number;
+  }> = [
+    { id: 'grid', label: 'Command Wall' },
+    {
+      id: 'alerts',
+      label: 'Incidents',
+      count: unreadAlertsCount > 0 ? unreadAlertsCount : undefined,
+    },
+    { id: 'bluetooth', label: 'Devices' },
+    { id: 'workspace', label: 'Teacher Hub' },
+  ];
+
   return (
-    <header className="sticky top-0 z-30 bg-white border-b border-slate-200 px-3 sm:px-6 h-16 flex items-center justify-between gap-3 sm:gap-6">
-      <a
-        href="#top"
-        onClick={(e) => {
-          e.preventDefault();
-          onSelectView('grid');
-        }}
-        className="text-sm sm:text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-blue-600 rounded-sm"
-      >
-        CampusGuard
-      </a>
+    <header className="sticky top-0 z-30 bg-[#09090B]/95 backdrop-blur-md border-b border-zinc-800/90">
+      <div className="h-13 px-4 lg:px-5 flex items-center justify-between gap-4 md:gap-8">
+        {/* Zone 1: Single-line Brand Wordmark */}
+        <a
+          href="#top"
+          onClick={(e) => {
+            e.preventDefault();
+            onSelectView('grid');
+          }}
+          className="font-display font-semibold text-base tracking-tight text-zinc-100 hover:text-white transition-colors whitespace-nowrap shrink-0"
+        >
+          CampusGuard
+        </a>
 
-      <nav aria-label="Primary" className="flex items-center gap-2 sm:gap-5 text-xs sm:text-sm font-medium min-w-0">
-        <button
-          type="button"
-          onClick={() => onSelectView('grid')}
-          className={`py-1.5 border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-blue-600 ${
-            activeView === 'grid'
-              ? 'border-blue-600 text-slate-900'
-              : 'border-transparent text-slate-600 hover:text-slate-900'
-          }`}
+        {/* Zone 2 (Desktop): Clean typographic nav links with subtle bottom active rule */}
+        <nav
+          aria-label="Primary navigation"
+          className="hidden md:flex items-center gap-6 lg:gap-7 h-full"
         >
-          <span className="hidden sm:inline">Live Grid</span>
-          <span className="sm:hidden">Grid</span>
-        </button>
-        <button
-          type="button"
-          onClick={() => onSelectView('bluetooth')}
-          className={`py-1.5 border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-blue-600 ${
-            activeView === 'bluetooth'
-              ? 'border-blue-600 text-slate-900'
-              : 'border-transparent text-slate-600 hover:text-slate-900'
-          }`}
-        >
-          <span className="hidden sm:inline">Bluetooth</span>
-          <span className="sm:hidden">BT</span>
-        </button>
-        <button
-          type="button"
-          onClick={() => onSelectView('alerts')}
-          className={`py-1.5 border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-blue-600 tabular-nums ${
-            activeView === 'alerts'
-              ? 'border-blue-600 text-slate-900'
-              : 'border-transparent text-slate-600 hover:text-slate-900'
-          }`}
-        >
-          Alerts{unreadAlertsCount > 0 ? ` (${unreadAlertsCount})` : ''}
-        </button>
-        <button
-          type="button"
-          onClick={() => onSelectView('workspace')}
-          className={`py-1.5 border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-blue-600 ${
-            activeView === 'workspace'
-              ? 'border-blue-600 text-slate-900'
-              : 'border-transparent text-slate-600 hover:text-slate-900'
-          }`}
-        >
-          <span className="hidden sm:inline">Teacher Hub</span>
-          <span className="sm:hidden">Teacher</span>
-        </button>
-      </nav>
+          {navItems.map((item) => {
+            const isActive = activeView === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => onSelectView(item.id)}
+                aria-current={isActive ? 'page' : undefined}
+                className={`relative h-full inline-flex items-center gap-1.5 text-sm font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  isActive ? 'text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                <span>{item.label}</span>
+                {typeof item.count === 'number' ? (
+                  <span className="font-mono text-[11px] font-semibold text-red-400 tabular-nums">
+                    {item.count}
+                  </span>
+                ) : null}
+                {isActive ? (
+                  <span
+                    aria-hidden="true"
+                    className="absolute inset-x-0 bottom-0 h-[2px] bg-zinc-100"
+                  />
+                ) : null}
+              </button>
+            );
+          })}
+        </nav>
 
-      <div className="flex items-center gap-2 shrink-0">
-        {userEmail ? (
+        {/* Zone 3: Single Primary Action */}
+        <div className="flex items-center shrink-0">
           <button
             type="button"
-            onClick={onSignOut}
-            title={`Signed in as ${userEmail}. Click to sign out.`}
-            className="hidden md:inline-flex items-center h-9 px-3 text-xs font-medium rounded-lg border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 cursor-pointer whitespace-nowrap"
+            onClick={onOpenScanner}
+            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            {userDisplayName || userEmail} · Sign out
+            <Plus className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+            <span>Add Camera</span>
           </button>
-        ) : (
-          <div className="hidden md:block">
-            <GoogleSignInButton loading={isSigningIn} onClick={onGoogleSignIn} />
-          </div>
-        )}
-
-        <button
-          type="button"
-          onClick={onOpenScanner}
-          className="inline-flex items-center gap-1.5 px-2.5 sm:px-4 h-9 text-xs sm:text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
-        >
-          <BluetoothSearching className="w-4 h-4" aria-hidden="true" />
-          <span className="hidden sm:inline">Add Camera</span>
-          <span className="sm:hidden">Add</span>
-        </button>
+        </div>
       </div>
+
+      {/* Mobile Navigation Row (zero clipping on 390px viewports) */}
+      <nav
+        aria-label="Mobile navigation"
+        className="flex md:hidden items-center justify-between border-t border-zinc-800/80 px-3 h-10 overflow-x-auto gap-2"
+      >
+        {navItems.map((item) => {
+          const isActive = activeView === item.id;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => onSelectView(item.id)}
+              aria-current={isActive ? 'page' : undefined}
+              className={`relative h-full inline-flex items-center gap-1 px-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                isActive ? 'text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              <span>{item.label}</span>
+              {typeof item.count === 'number' ? (
+                <span className="font-mono text-[10px] font-semibold text-red-400 tabular-nums">
+                  {item.count}
+                </span>
+              ) : null}
+              {isActive ? (
+                <span
+                  aria-hidden="true"
+                  className="absolute inset-x-0 bottom-0 h-[2px] bg-zinc-100"
+                />
+              ) : null}
+            </button>
+          );
+        })}
+      </nav>
     </header>
   );
 }

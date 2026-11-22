@@ -114,8 +114,8 @@ function buildSafetyPrompt(
 
   const countInstruction =
     facilityMode === 'school'
-      ? '1. GROUNDED PERSON LOCALIZATION (STRICT): Locate ONLY unmistakable whole living humans actively visible in the SINGLE CURRENT LIVE FRAME. ONE whole person = ONE single tight bounding box [ymin, xmin, ymax, xmax] (0-1000 scale). NEVER split one person into two boxes (never box head and body separately, or left leg and right leg separately). NEVER count hanging clothes, coats, jackets, bags/backpacks on wall hooks, empty chairs, desks, pillows, blankets, curtains, shadows, posters, screens, or reflections. Only include a person if certainty >= 80%. If no real human is unmistakably visible, return detectedPeople: [] and studentCount: 0.'
-      : '1. GROUNDED PERSON LOCALIZATION (STRICT): Locate ONLY unmistakable whole living humans actively visible in the SINGLE CURRENT LIVE FRAME. ONE whole person = ONE single tight bounding box [ymin, xmin, ymax, xmax] (0-1000 scale). NEVER split one person into two boxes (never box head and torso separately, or separate limbs of one person). NEVER count hanging jackets/clothes/bags on walls, empty chairs, furniture, pillows, curtains, reflections, posters, or shadows. Only include a person if certainty >= 80%. If no real human is unmistakably visible, return detectedPeople: [] and studentCount: 0.';
+      ? '1. GROUNDED PERSON LOCALIZATION (STRICT & OCCLUSION-AWARE): Locate EVERY living human actively visible in the SINGLE CURRENT LIVE FRAME — INCLUDING anyone whose face/head is intentionally or partially covered by a racket, book, hand, bag, mask, hat, hood, or furniture (identify them by shoulders, torso, arms, hands, clothing, and posture, and label them e.g. "Person (face covered by racket)"). ONE whole person = ONE single tight bounding box [ymin, xmin, ymax, xmax] (0-1000 scale). NEVER split one person into two boxes. NEVER count hanging coats/clothes on hooks, empty chairs, desks, pillows, curtains, shadows, posters, or reflections. If no real human is visible, return detectedPeople: [] and studentCount: 0.'
+      : '1. GROUNDED PERSON LOCALIZATION (STRICT & OCCLUSION-AWARE): Locate EVERY living human actively visible in the SINGLE CURRENT LIVE FRAME — INCLUDING anyone whose face/head is covered or obscured by a racket, object, mask, helmet, hood, book, bag, or hands (identify them by shoulders, torso, arms, legs, and posture, label them e.g. "Person (face concealed)", and note intentional face concealment in detectedBehaviors). ONE whole person = ONE single tight bounding box [ymin, xmin, ymax, xmax] (0-1000 scale). NEVER split one person into two boxes. NEVER count hanging coats/bags on walls, empty chairs, furniture, pillows, curtains, reflections, posters, or shadows. If no real human is visible, return detectedPeople: [] and studentCount: 0.';
 
   const threatInstruction =
     facilityMode === 'bank'
@@ -129,11 +129,11 @@ function buildSafetyPrompt(
     'Inspect the SINGLE CURRENT LIVE FRAME and any supplied audio/voice transcript carefully. Never fabricate threats or people.',
     countInstruction,
     threatInstruction,
-    '3. Set studentCount strictly equal to detectedPeople.length. Label each person clearly by location (e.g. "Person (at desk)", "Person (far right)").',
+    '3. Set studentCount strictly equal to detectedPeople.length. Label each person clearly by location and note if their face is covered (e.g. "Person (at desk)", "Person (face covered by racket)").',
     '4. Set threatCategory to one of: "none" (calm/orderly), "beating" (one-sided beating, repeated striking/kicking/slapping/stomping a victim), "bullying" (intimidation, cornering/surrounding a victim, shoving, tripping, taking belongings, verbal harassment), "fight" (mutual physical altercation/grappling), "robbery_or_weapon" (holdup, weapon, armed threat, teller intimidation), "intrusion" (forced entry/breach/tampering), or "disturbance" (loud shouting/panic without confirmed physical contact or bullying).',
     '5. Set severity to "critical" if threatCategory is "beating", "bullying", "fight", "robbery_or_weapon", or "intrusion" (or isFighting is true); "warning" if threatCategory is "disturbance"; or "none" if calm and orderly.',
     '6. Set threatScore (0 to 100 integer): 0-20 for calm, 45-70 for verbal disturbance, 78-90 for bullying/fight, 90-100 for beating/weapon/robbery/intrusion.',
-    '7. Set detectedBehaviors to a short array of specific visual/acoustic cues observed (e.g. ["Repeated striking / beating", "Student cornered by group", "Bullying distress cue"] or [] if calm).',
+    '7. Set detectedBehaviors to a short array of specific visual/acoustic cues observed (e.g. ["Repeated striking / beating", "Student cornered by group", "Face concealed by held object"] or [] if calm).',
     '8. Set recommendedAction to a concrete 1-sentence instruction for the teacher or security team (e.g. "Intervene immediately, stop the beating, and summon medical/security support." or "No action needed; zone is calm.").',
     '9. Summarize voice/audio recognition state concisely in voiceAnalysis, factual summary in summary, and reason for alert in fightReason (empty string if calm).',
     '10. Provide overall confidence from 0 to 100.',
@@ -143,7 +143,7 @@ function buildSafetyPrompt(
     lines.push(`Voice recognition transcript from zone microphone: "${voiceTranscript}"`);
   }
   if (audioLevel !== null) {
-    lines.push(`Measured zone sound level: ${audioLevel.toFixed(1)} dB SPL (teacher alert threshold 81.1 dB).`);
+    lines.push(`Measured zone sound level: ${audioLevel.toFixed(1)} dB SPL (teacher sustained sound alert threshold 90.1 dB > 3s).`);
   }
   if (audioSpikeDetected) {
     lines.push('ALERT CONTEXT: A sudden loud audio spike was just detected by the zone microphone.');
@@ -832,24 +832,26 @@ async function startServer() {
     res.json(result);
   });
 
-  app.get('/api/snapshot-proxy', async (req, res) => {
-    const rawUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
-    if (!rawUrl) {
-      res.status(400).json({ error: 'Missing url query parameter.' });
-      return;
-    }
+  const isBlockedMetadataHost = (hostname: string): boolean => {
+    const h = hostname.trim().toLowerCase();
+    return (
+      h === '169.254.169.254' ||
+      h === 'metadata.google.internal' ||
+      h === 'metadata' ||
+      h === '100.100.100.200'
+    );
+  };
 
-    let parsed: URL;
-    try {
-      parsed = new URL(rawUrl);
-    } catch {
-      res.status(400).json({ error: 'Invalid camera stream URL.' });
-      return;
-    }
-
+  const fetchCameraSnapshotBuffer = async (
+    rawUrl: string,
+    timeoutMs = 7000
+  ): Promise<{ buffer: Buffer; contentType: string; latencyMs: number }> => {
+    const parsed = new URL(rawUrl);
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      res.status(400).json({ error: 'Only HTTP/HTTPS snapshot or MJPEG URLs are supported.' });
-      return;
+      throw new Error('Only HTTP/HTTPS snapshot or MJPEG URLs are supported.');
+    }
+    if (isBlockedMetadataHost(parsed.hostname)) {
+      throw new Error('Restricted metadata address is not allowed.');
     }
 
     const headers: Record<string, string> = {};
@@ -863,7 +865,8 @@ async function startServer() {
     }
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const started = Date.now();
 
     try {
       const upstream = await fetch(parsed.toString(), {
@@ -873,8 +876,11 @@ async function startServer() {
 
       if (!upstream.ok) {
         clearTimeout(timeout);
-        res.status(upstream.status).json({ error: `Camera feed returned HTTP ${upstream.status}` });
-        return;
+        const err = new Error(`Camera feed returned HTTP ${upstream.status}`) as Error & {
+          status?: number;
+        };
+        err.status = upstream.status;
+        throw err;
       }
 
       const contentType = (upstream.headers.get('content-type') || 'image/jpeg').toLowerCase();
@@ -882,27 +888,143 @@ async function startServer() {
       if (contentType.includes('multipart/x-mixed-replace') && upstream.body) {
         const frameBuf = await extractFirstMjpegFrame(upstream.body, controller);
         clearTimeout(timeout);
-        res.setHeader('Content-Type', 'image/jpeg');
-        res.setHeader('Cache-Control', 'no-store');
-        res.send(frameBuf);
-        return;
+        return {
+          buffer: frameBuf,
+          contentType: 'image/jpeg',
+          latencyMs: Math.max(1, Date.now() - started),
+        };
       }
 
       const buf = Buffer.from(await upstream.arrayBuffer());
       clearTimeout(timeout);
-      res.setHeader('Content-Type', contentType);
-      res.setHeader('Cache-Control', 'no-store');
-      res.send(buf);
+      return {
+        buffer: buf,
+        contentType,
+        latencyMs: Math.max(1, Date.now() - started),
+      };
     } catch (err) {
       clearTimeout(timeout);
+      throw err;
+    }
+  };
+
+  app.get('/api/snapshot-proxy', async (req, res) => {
+    const rawUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+    if (!rawUrl) {
+      res.status(400).json({ error: 'Missing url query parameter.' });
+      return;
+    }
+
+    try {
+      new URL(rawUrl);
+    } catch {
+      res.status(400).json({ error: 'Invalid camera stream URL.' });
+      return;
+    }
+
+    try {
+      const { buffer, contentType } = await fetchCameraSnapshotBuffer(rawUrl, 8000);
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(buffer);
+    } catch (err) {
+      const status = (err as { status?: number } | null)?.status;
       const message =
         err instanceof Error && err.name === 'AbortError'
           ? 'Camera snapshot request timed out.'
           : err instanceof Error
             ? err.message
             : 'Unable to reach camera snapshot URL.';
-      res.status(502).json({ error: message });
+      res.status(status && status >= 400 && status < 600 ? status : 502).json({ error: message });
     }
+  });
+
+  app.post('/api/wifi-camera/test', async (req, res) => {
+    const body = (req.body || {}) as { url?: string; probeCommonPaths?: boolean };
+    const rawUrl = typeof body.url === 'string' ? body.url.trim() : '';
+    if (!rawUrl) {
+      res.status(400).json({ reachable: false, error: 'Missing Wi-Fi camera URL.' });
+      return;
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(rawUrl);
+    } catch {
+      res.status(400).json({ reachable: false, error: 'Invalid Wi-Fi camera URL.' });
+      return;
+    }
+
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      res.status(400).json({
+        reachable: false,
+        error: 'Only HTTP/HTTPS Wi-Fi snapshot or MJPEG streams are supported.',
+      });
+      return;
+    }
+
+    if (isBlockedMetadataHost(parsed.hostname)) {
+      res.status(400).json({ reachable: false, error: 'Restricted host address.' });
+      return;
+    }
+
+    const candidates: string[] = [rawUrl];
+    if (body.probeCommonPaths && (parsed.pathname === '/' || !parsed.pathname)) {
+      const commonPaths = [
+        '/shot.jpg',
+        '/capture',
+        '/snapshot.jpg',
+        '/video',
+        '/cgi-bin/snapshot.cgi?channel=1',
+        '/ISAPI/Streaming/channels/101/picture',
+      ];
+      for (const pathSuffix of commonPaths) {
+        const clone = new URL(parsed.toString());
+        const qIdx = pathSuffix.indexOf('?');
+        clone.pathname = qIdx >= 0 ? pathSuffix.slice(0, qIdx) : pathSuffix;
+        if (qIdx >= 0) clone.search = pathSuffix.slice(qIdx);
+        candidates.push(clone.toString());
+      }
+    }
+
+    let lastError = 'Unable to reach Wi-Fi camera.';
+    for (const candidateUrl of candidates) {
+      try {
+        const { buffer, contentType, latencyMs } = await fetchCameraSnapshotBuffer(
+          candidateUrl,
+          4500
+        );
+        if (!contentType.startsWith('image/') && buffer.length < 100) {
+          lastError = `Endpoint responded with non-image content (${contentType}).`;
+          continue;
+        }
+        const previewDataUrl =
+          buffer.length > 0 && buffer.length <= 2_500_000
+            ? `data:${contentType.split(';')[0]};base64,${buffer.toString('base64')}`
+            : undefined;
+        res.json({
+          reachable: true,
+          resolvedUrl: candidateUrl,
+          contentType,
+          bytes: buffer.length,
+          latencyMs,
+          previewDataUrl,
+        });
+        return;
+      } catch (err) {
+        lastError =
+          err instanceof Error && err.name === 'AbortError'
+            ? 'Connection timed out — check camera IP, port, Wi-Fi network, or enable Direct LAN Browser mode.'
+            : err instanceof Error
+              ? err.message
+              : 'Unable to reach Wi-Fi camera.';
+      }
+    }
+
+    res.status(502).json({
+      reachable: false,
+      error: lastError,
+    });
   });
 
   app.post('/api/analyze-classroom', async (req, res) => {

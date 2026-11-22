@@ -147,15 +147,15 @@ export function WorkspaceTeacherHub({
     <div className="space-y-5">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-slate-900">
+          <h1 className="text-xl font-bold tracking-tight text-slate-100">
             Teacher Alerts · Classroom &amp; Gmail
           </h1>
-          <p className="text-sm text-slate-600 mt-0.5">
-            Automatically alerts the assigned teacher whenever sound exceeds{' '}
-            <span className="font-mono font-semibold text-red-700">
+          <p className="text-xs text-slate-400 mt-0.5">
+            Automatically alerts the assigned teacher whenever sustained sound exceeds{' '}
+            <span className="font-mono font-semibold text-red-400 tabular-nums">
               {SOUND_ALERT_THRESHOLD_DB.toFixed(1)} dB
             </span>{' '}
-            or AI detects a critical threat.
+            for &gt;3s or real-time AI detects a critical threat.
           </p>
         </div>
 
@@ -168,7 +168,7 @@ export function WorkspaceTeacherHub({
                   void onRefreshWorkspace();
                 }}
                 disabled={loadingWorkspace}
-                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-slate-700 bg-[#182130] text-slate-200 hover:bg-slate-700 disabled:opacity-50 cursor-pointer"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${loadingWorkspace ? 'animate-spin' : ''}`} aria-hidden="true" />
                 <span>Sync Classroom &amp; Gmail</span>
@@ -178,13 +178,14 @@ export function WorkspaceTeacherHub({
                 onClick={() => {
                   void onSignOut();
                 }}
-                className="px-3 py-2 text-xs font-medium rounded-lg border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 cursor-pointer"
+                className="px-3 py-2 text-xs font-medium rounded-lg border border-slate-700 bg-[#111722] text-slate-300 hover:bg-slate-800 cursor-pointer"
               >
                 Sign out ({userName || userEmail})
               </button>
             </>
           ) : (
             <GoogleSignInButton
+              compact
               loading={isSigningIn}
               onClick={() => {
                 void onGoogleSignIn();
@@ -195,29 +196,29 @@ export function WorkspaceTeacherHub({
       </div>
 
       {workspaceError ? (
-        <div role="alert" className="bg-amber-50 border border-amber-300 text-amber-950 rounded-xl px-4 py-3 text-sm">
+        <div role="alert" className="bg-amber-950/60 border border-amber-700/70 text-amber-100 rounded-xl px-4 py-3 text-xs">
           {workspaceError}
         </div>
       ) : null}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
         {/* Acoustic 90.1 dB (>3s) Teacher Rule Card */}
-        <section className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
+        <section className="bg-[#111722] border border-slate-800 rounded-xl p-5 space-y-4">
           <div className="flex items-start justify-between gap-3">
             <div className="flex items-center gap-2">
-              <Volume2 className="w-5 h-5 text-red-600 shrink-0" aria-hidden="true" />
-              <h2 className="text-base font-semibold text-slate-900">
+              <Volume2 className="w-4 h-4 text-red-400 shrink-0" aria-hidden="true" />
+              <h2 className="text-sm font-semibold text-slate-100">
                 90.1 dB (&gt;3s) Teacher Sound Alert Rule
               </h2>
             </div>
-            <span className="font-mono text-xs font-semibold text-red-700 bg-red-50 border border-red-200 rounded-md px-2 py-0.5">
+            <span className="font-mono text-[11px] font-semibold text-red-300 bg-red-950/70 border border-red-800/70 rounded px-2 py-0.5 tabular-nums">
               &gt; {SOUND_ALERT_THRESHOLD_DB.toFixed(1)} dB · 3s
             </span>
           </div>
 
-          <p className="text-xs text-slate-600 leading-relaxed">
+          <p className="text-xs text-slate-400 leading-relaxed">
             Every live zone microphone is continuously measured in decibels. If any monitored feed stays above{' '}
-            <strong className="text-slate-900">90.1 dB for more than 3 seconds</strong>, an urgent alert pops up on screen and prepares a teacher message with one-click Gmail or Google Classroom dispatch.
+            <strong className="text-slate-200">90.1 dB for more than 3 seconds</strong>, an urgent alert pops up on screen and prepares a teacher message with one-click Gmail or Google Classroom dispatch.
           </p>
 
           <form
@@ -229,7 +230,7 @@ export function WorkspaceTeacherHub({
             }}
             className="space-y-2"
           >
-            <label htmlFor="default-teacher-email" className="block text-xs font-medium text-slate-700">
+            <label htmlFor="default-teacher-email" className="block text-xs font-medium text-slate-300">
               Teacher Alert Recipient Email
             </label>
             <div className="flex items-center gap-2">
@@ -239,37 +240,37 @@ export function WorkspaceTeacherHub({
                 value={emailDraft}
                 onChange={(e) => setEmailDraft(e.target.value)}
                 placeholder="teacher@school.edu"
-                className="flex-1 min-w-0 text-sm px-3 py-2 border border-slate-300 rounded-lg text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-600"
+                className="flex-1 min-w-0 text-sm px-3 py-2 border border-slate-700 bg-[#0D121B] rounded-lg text-slate-100 placeholder:text-slate-500 focus-visible:outline-2 focus-visible:outline-blue-500"
               />
               <button
                 type="submit"
-                className="px-3.5 py-2 text-xs font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 cursor-pointer shrink-0"
+                className="px-3.5 py-2 text-xs font-semibold rounded-lg bg-blue-600 text-white hover:bg-blue-500 cursor-pointer shrink-0"
               >
                 Save Email
               </button>
             </div>
             {savedNotice ? (
-              <p className="text-xs text-emerald-700 inline-flex items-center gap-1">
+              <p className="text-xs text-emerald-400 inline-flex items-center gap-1">
                 <CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" />
                 <span>Teacher email updated.</span>
               </p>
             ) : null}
           </form>
 
-          <div className="border-t border-slate-100 pt-3 space-y-2">
+          <div className="border-t border-slate-800 pt-3 space-y-2">
             <div className="flex items-center justify-between gap-2">
-              <label htmlFor="hub-db-offset" className="text-xs font-medium text-slate-700">
+              <label htmlFor="hub-db-offset" className="text-xs font-medium text-slate-300">
                 Mic dB Sensitivity Offset (default +{DEFAULT_DB_CALIBRATION_OFFSET} dB)
               </label>
               <div className="flex items-center gap-2">
-                <span className="text-xs font-mono font-semibold text-slate-900 tabular-nums" data-testid="hub-db-offset-value">
+                <span className="text-xs font-mono font-semibold text-slate-100 tabular-nums" data-testid="hub-db-offset-value">
                   +{dbCalibrationOffset} dB
                 </span>
                 {dbCalibrationOffset !== DEFAULT_DB_CALIBRATION_OFFSET ? (
                   <button
                     type="button"
                     onClick={() => onChangeDbCalibrationOffset(DEFAULT_DB_CALIBRATION_OFFSET)}
-                    className="text-xs text-blue-600 hover:underline cursor-pointer"
+                    className="text-xs text-blue-400 hover:underline cursor-pointer"
                   >
                     Reset
                   </button>
@@ -284,7 +285,7 @@ export function WorkspaceTeacherHub({
               step={1}
               value={dbCalibrationOffset}
               onChange={(e) => onChangeDbCalibrationOffset(Number(e.target.value))}
-              className="w-full accent-blue-600 cursor-pointer"
+              className="w-full accent-blue-500 cursor-pointer"
             />
             <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
               <button
@@ -293,45 +294,45 @@ export function WorkspaceTeacherHub({
                   void handleAutoCalibrateMic();
                 }}
                 disabled={isCalibrating}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-300 bg-slate-50 text-slate-800 hover:bg-slate-100 disabled:opacity-60 cursor-pointer"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-700 bg-[#182130] text-slate-200 hover:bg-slate-700 disabled:opacity-60 cursor-pointer"
               >
-                <Mic className="w-3.5 h-3.5 text-blue-600" aria-hidden="true" />
+                <Mic className="w-3.5 h-3.5 text-blue-400" aria-hidden="true" />
                 <span>
                   {isCalibrating
                     ? `Sampling mic (${liveCalibrationDb?.toFixed(1) ?? '--'} dB)...`
                     : 'Auto-Calibrate Room Mic (~42 dB)'}
                 </span>
               </button>
-              <span className="text-[11px] text-slate-500">
+              <span className="text-[11px] text-slate-400">
                 Keep room quiet for 1.5s while calibrating
               </span>
             </div>
             {calibrationStatus ? (
-              <p role="status" className="text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-md px-2.5 py-1.5">
+              <p role="status" className="text-xs text-slate-200 bg-[#0D121B] border border-slate-800 rounded-md px-2.5 py-1.5">
                 {calibrationStatus}
               </p>
             ) : null}
           </div>
 
-          <div className="border-t border-slate-100 pt-3">
-            <h3 className="text-xs font-semibold text-slate-700 mb-2">
+          <div className="border-t border-slate-800 pt-3">
+            <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-2">
               Live Zone Sound Levels ({cameras.length} active)
             </h3>
             {cameras.length === 0 ? (
               <p className="text-xs text-slate-500">Connect a camera microphone to monitor dB levels.</p>
             ) : (
-              <ul className="space-y-1.5">
+              <ul className="divide-y divide-slate-800/80 border border-slate-800 rounded-lg overflow-hidden bg-[#0D121B]">
                 {cameras.map((cam) => {
                   const exceeded = cam.audioLevel > SOUND_ALERT_THRESHOLD_DB;
                   return (
                     <li
                       key={cam.id}
-                      className="flex items-center justify-between text-xs py-1.5 px-2.5 rounded-lg bg-slate-50 border border-slate-200"
+                      className="flex items-center justify-between text-xs py-2 px-3"
                     >
-                      <span className="font-medium text-slate-800 truncate">{cam.classroomName}</span>
+                      <span className="font-medium text-slate-200 truncate">{cam.classroomName}</span>
                       <span
                         className={`font-mono font-semibold tabular-nums ${
-                          exceeded ? 'text-red-700' : 'text-slate-700'
+                          exceeded ? 'text-red-400' : 'text-slate-300'
                         }`}
                       >
                         {cam.audioLevel.toFixed(1)} dB
@@ -345,29 +346,30 @@ export function WorkspaceTeacherHub({
         </section>
 
         {/* Google Classroom Card */}
-        <section className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
+        <section className="bg-[#111722] border border-slate-800 rounded-xl p-5 space-y-4">
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
-              <BookOpen className="w-5 h-5 text-blue-600 shrink-0" aria-hidden="true" />
-              <h2 className="text-base font-semibold text-slate-900">
+              <BookOpen className="w-4 h-4 text-blue-400 shrink-0" aria-hidden="true" />
+              <h2 className="text-sm font-semibold text-slate-100">
                 Google Classroom Link
               </h2>
             </div>
             {courseStudentCount !== null ? (
-              <span className="inline-flex items-center gap-1 text-xs font-medium text-slate-700 bg-slate-100 rounded-md px-2 py-0.5 tabular-nums">
-                <Users className="w-3.5 h-3.5" aria-hidden="true" />
+              <span className="inline-flex items-center gap-1 text-xs font-mono font-medium text-slate-300 bg-[#0D121B] border border-slate-800 rounded px-2 py-0.5 tabular-nums">
+                <Users className="w-3.5 h-3.5 text-slate-400" aria-hidden="true" />
                 <span>{courseStudentCount} enrolled</span>
               </span>
             ) : null}
           </div>
 
           {!hasAccessToken ? (
-            <div className="border border-dashed border-slate-300 rounded-lg p-6 text-center space-y-3">
-              <p className="text-sm text-slate-600">
+            <div className="border border-dashed border-slate-700 bg-[#0D121B] rounded-lg p-6 text-center space-y-3">
+              <p className="text-xs text-slate-400">
                 Sign in with Google to load your Google Classroom classes, teachers, and student rosters.
               </p>
               <div className="flex justify-center">
                 <GoogleSignInButton
+                  compact
                   loading={isSigningIn}
                   onClick={() => {
                     void onGoogleSignIn();
@@ -376,12 +378,12 @@ export function WorkspaceTeacherHub({
               </div>
             </div>
           ) : courses.length === 0 ? (
-            <p className="text-sm text-slate-500">
+            <p className="text-xs text-slate-400">
               No active Google Classroom courses returned for this account. Click Sync Classroom &amp; Gmail to refresh.
             </p>
           ) : (
             <div className="space-y-3">
-              <ul className="divide-y divide-slate-100 border border-slate-200 rounded-lg overflow-hidden max-h-52 overflow-y-auto">
+              <ul className="divide-y divide-slate-800 border border-slate-800 rounded-lg overflow-hidden max-h-52 overflow-y-auto bg-[#0D121B]">
                 {courses.map((course) => {
                   const isLinked = course.id === linkedCourseId;
                   return (
@@ -390,16 +392,16 @@ export function WorkspaceTeacherHub({
                         type="button"
                         onClick={() => onSelectCourse(course)}
                         className={`w-full text-left px-3.5 py-2.5 flex items-center justify-between gap-2 transition-colors cursor-pointer ${
-                          isLinked ? 'bg-blue-50 text-blue-900' : 'hover:bg-slate-50 text-slate-800'
+                          isLinked ? 'bg-blue-600/20 text-blue-200' : 'hover:bg-slate-800/70 text-slate-200'
                         }`}
                       >
                         <div className="min-w-0">
-                          <div className="text-sm font-medium truncate">{course.name}</div>
-                          <div className="text-xs text-slate-500 truncate">
+                          <div className="text-xs font-semibold truncate">{course.name}</div>
+                          <div className="text-[11px] text-slate-400 truncate">
                             {[course.section, course.room].filter(Boolean).join(' · ') || 'Google Classroom'}
                           </div>
                         </div>
-                        <span className="text-xs font-medium shrink-0 text-blue-700">
+                        <span className="text-xs font-medium shrink-0 text-blue-400">
                           {isLinked ? 'Linked' : 'Select'}
                         </span>
                       </button>
@@ -409,9 +411,9 @@ export function WorkspaceTeacherHub({
               </ul>
 
               {courseTeachers.length > 0 ? (
-                <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-1.5">
-                  <div className="text-xs font-semibold text-slate-700">
-                    Course Teachers (click to use as alert email)
+                <div className="bg-[#0D121B] border border-slate-800 rounded-lg p-3 space-y-2">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                    Course Teachers (click to set alert email)
                   </div>
                   <div className="flex flex-wrap gap-2">
                     {courseTeachers.map((t) => (
@@ -425,7 +427,7 @@ export function WorkspaceTeacherHub({
                             onSaveTeacherEmail(t.email);
                           }
                         }}
-                        className="text-xs px-2.5 py-1 rounded-md border border-slate-300 bg-white text-slate-800 hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
+                        className="text-xs px-2.5 py-1 rounded border border-slate-700 bg-[#182130] text-slate-200 hover:bg-slate-700 disabled:opacity-50 cursor-pointer"
                       >
                         {t.name}{t.email ? ` (${t.email})` : ''}
                       </button>
@@ -439,34 +441,34 @@ export function WorkspaceTeacherHub({
       </div>
 
       {/* Sound Threshold Alerts Ready for Teacher */}
-      <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-        <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between gap-3">
+      <section className="bg-[#111722] border border-slate-800 rounded-xl overflow-hidden">
+        <div className="px-5 py-3.5 border-b border-slate-800 flex items-center justify-between gap-3">
           <div>
-            <h2 className="text-base font-semibold text-slate-900">
+            <h2 className="text-sm font-semibold text-slate-100">
               Recent &gt; 90.1 dB (3s) Teacher Alert Messages
             </h2>
-            <p className="text-xs text-slate-500 mt-0.5">
+            <p className="text-xs text-slate-400 mt-0.5">
               Review triggered sustained decibel alerts and dispatch them to the teacher via Gmail or Classroom.
             </p>
           </div>
         </div>
 
         {soundAlerts.length === 0 ? (
-          <div className="p-6 text-center text-sm text-slate-500">
+          <div className="p-6 text-center text-xs text-slate-500">
             No sustained sound alerts above 90.1 dB (&gt;3s) recorded yet.
           </div>
         ) : (
-          <ul className="divide-y divide-slate-200">
+          <ul className="divide-y divide-slate-800">
             {soundAlerts.slice(0, 8).map((alert) => (
               <li key={alert.id} className="px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div className="min-w-0">
-                  <div className="text-sm font-semibold text-slate-900">{alert.headline}</div>
-                  <div className="text-xs text-slate-600 mt-0.5">{alert.voiceCue}</div>
+                  <div className="text-sm font-semibold text-slate-100">{alert.headline}</div>
+                  <div className="text-xs text-slate-400 mt-0.5">{alert.voiceCue}</div>
                 </div>
                 <button
                   type="button"
                   onClick={() => onOpenDispatchModal(alert)}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-red-600 text-white hover:bg-red-700 cursor-pointer shrink-0"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-red-600 text-white hover:bg-red-500 cursor-pointer shrink-0"
                 >
                   <Mail className="w-3.5 h-3.5" aria-hidden="true" />
                   <span>{alert.teacherNotified ? 'Resend to Teacher' : 'Send to Teacher'}</span>
@@ -478,29 +480,29 @@ export function WorkspaceTeacherHub({
       </section>
 
       {/* Gmail Safety Feed */}
-      <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-        <div className="px-5 py-4 border-b border-slate-200 flex items-center gap-2">
-          <Mail className="w-5 h-5 text-blue-600 shrink-0" aria-hidden="true" />
-          <h2 className="text-base font-semibold text-slate-900">Gmail Messages</h2>
+      <section className="bg-[#111722] border border-slate-800 rounded-xl overflow-hidden">
+        <div className="px-5 py-3.5 border-b border-slate-800 flex items-center gap-2">
+          <Mail className="w-4 h-4 text-blue-400 shrink-0" aria-hidden="true" />
+          <h2 className="text-sm font-semibold text-slate-100">Gmail Messages</h2>
         </div>
 
         {!hasAccessToken ? (
-          <div className="p-6 text-center text-sm text-slate-500">
+          <div className="p-6 text-center text-xs text-slate-500">
             Sign in with Google to view recent Gmail threads and dispatch teacher alerts.
           </div>
         ) : gmailMessages.length === 0 ? (
-          <div className="p-6 text-center text-sm text-slate-500">
+          <div className="p-6 text-center text-xs text-slate-500">
             No recent Gmail messages loaded. Click Sync Classroom &amp; Gmail above to fetch.
           </div>
         ) : (
-          <ul className="divide-y divide-slate-200">
+          <ul className="divide-y divide-slate-800">
             {gmailMessages.map((msg) => (
               <li key={msg.id} className="px-5 py-3 space-y-0.5">
                 <div className="flex items-center justify-between gap-3">
-                  <span className="text-sm font-medium text-slate-900 truncate">{msg.subject}</span>
-                  <span className="text-xs text-slate-400 shrink-0">{msg.date}</span>
+                  <span className="text-sm font-medium text-slate-100 truncate">{msg.subject}</span>
+                  <span className="text-xs font-mono text-slate-500 shrink-0">{msg.date}</span>
                 </div>
-                <div className="text-xs text-slate-600 truncate">From: {msg.from}</div>
+                <div className="text-xs text-slate-400 truncate">From: {msg.from}</div>
                 {msg.snippet ? (
                   <p className="text-xs text-slate-500 line-clamp-1">{msg.snippet}</p>
                 ) : null}

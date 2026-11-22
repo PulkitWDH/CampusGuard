@@ -28,19 +28,19 @@ export function AlertPopupOverlay({
       aria-label="Live on-screen alert popups"
       aria-live="assertive"
       data-testid="alert-popup-stack"
-      className="fixed top-[68px] right-4 left-4 sm:left-auto z-[70] w-auto sm:w-[410px] max-w-[calc(100vw-2rem)] flex flex-col gap-2.5 pointer-events-none"
+      className="fixed bottom-4 right-4 left-4 sm:left-auto z-[70] w-auto sm:w-[400px] max-w-[calc(100vw-2rem)] flex flex-col-reverse gap-2.5 pointer-events-none"
     >
       {popups.length > 1 ? (
-        <div className="pointer-events-auto flex items-center justify-between px-3 py-1.5 rounded-lg bg-slate-900/95 text-white text-xs shadow-lg border border-slate-700 backdrop-blur-md">
-          <span className="font-semibold tabular-nums">
-            {popups.length} active screen alerts
+        <div className="pointer-events-auto flex items-center justify-between px-3 py-1.5 rounded-lg bg-[#101114]/95 text-zinc-200 text-xs shadow-xl border border-zinc-800 backdrop-blur-md">
+          <span className="font-mono font-semibold tabular-nums">
+            {popups.length} active alerts
           </span>
           <button
             type="button"
             onClick={onDismissAllPopups}
-            className="text-slate-300 hover:text-white font-medium underline cursor-pointer"
+            className="text-zinc-400 hover:text-white font-medium underline cursor-pointer"
           >
-            Dismiss all popups
+            Dismiss all
           </button>
         </div>
       ) : null}
@@ -52,12 +52,12 @@ export function AlertPopupOverlay({
         const isAttendance = badge.tone === 'attendance';
 
         const cardStyle = isBullying
-          ? 'bg-white border-2 border-orange-500 shadow-2xl ring-2 ring-orange-200'
+          ? 'bg-[#101114] border border-orange-500/90 shadow-2xl shadow-black/80'
           : isCritical
-            ? 'animate-alert-critical-pulse bg-white border-2 border-red-600 shadow-2xl ring-2 ring-red-200'
+            ? 'animate-alert-critical-pulse bg-[#101114] border border-red-500/90 shadow-2xl shadow-black/80'
             : isAttendance
-              ? 'bg-white border-2 border-blue-500 shadow-xl ring-1 ring-blue-100'
-              : 'bg-white border-2 border-amber-400 shadow-xl ring-1 ring-amber-100';
+              ? 'bg-[#101114] border border-zinc-600 shadow-xl shadow-black/70'
+              : 'bg-[#101114] border border-amber-500/80 shadow-xl shadow-black/70';
 
         const headerBg = isBullying
           ? 'bg-orange-600 text-white'
@@ -65,7 +65,7 @@ export function AlertPopupOverlay({
             ? 'bg-red-600 text-white'
             : isAttendance
               ? 'bg-blue-600 text-white'
-              : 'bg-amber-500 text-white';
+              : 'bg-amber-600 text-white';
 
         const IconComponent = isAttendance
           ? ClipboardCheck
@@ -90,16 +90,8 @@ export function AlertPopupOverlay({
           >
             <div className={`px-3.5 py-2 flex items-center justify-between gap-2 ${headerBg}`}>
               <div className="flex items-center gap-2 min-w-0">
-                <div className="relative flex items-center justify-center shrink-0">
-                  {isCritical ? (
-                    <span
-                      aria-hidden="true"
-                      className="animate-alert-beacon absolute -inset-1 rounded-full bg-white/40"
-                    />
-                  ) : null}
-                  <IconComponent className="relative w-4 h-4 shrink-0" aria-hidden="true" />
-                </div>
-                <span className="text-[11px] font-extrabold tracking-wider uppercase whitespace-nowrap">
+                <IconComponent className="w-4 h-4 shrink-0" aria-hidden="true" />
+                <span className="text-[11px] font-mono font-bold tracking-wider uppercase whitespace-nowrap">
                   {badge.label}
                 </span>
                 {typeof alert.threatScore === 'number' && isCritical ? (
@@ -115,56 +107,37 @@ export function AlertPopupOverlay({
                 type="button"
                 onClick={() => onDismissPopup(alert.id)}
                 aria-label={`Dismiss popup for ${alert.classroomName}`}
-                className="p-0.5 rounded hover:bg-white/20 transition-colors cursor-pointer shrink-0"
+                className="p-0.5 rounded hover:bg-black/20 transition-colors cursor-pointer shrink-0"
               >
                 <X className="w-4 h-4" aria-hidden="true" />
               </button>
             </div>
 
-            <div className="p-3.5 space-y-2.5 text-slate-900">
+            <div className="p-3.5 space-y-2.5 text-slate-100">
               <div className="flex items-start gap-3">
                 {alert.evidenceSnapshotUrl ? (
                   <img
                     src={alert.evidenceSnapshotUrl}
                     alt={`Live capture from ${alert.classroomName}`}
-                    className="w-20 h-14 object-cover rounded-lg border border-slate-200 shrink-0"
+                    className="w-20 h-14 object-cover rounded-lg border border-slate-700 shrink-0"
                   />
                 ) : null}
                 <div className="min-w-0 flex-1 space-y-1">
-                  <p className="text-sm font-bold leading-snug text-slate-950">
+                  <p className="text-sm font-semibold leading-snug text-white">
                     {cleanHeadline}
                   </p>
-                  <p className="text-xs text-slate-600 leading-relaxed">
-                    <span className="font-semibold tabular-nums">{alert.studentCount} present</span>
-                    <span aria-hidden="true"> · </span>
+                  <p className="text-xs text-slate-400 leading-relaxed">
+                    <span className="font-mono tabular-nums text-slate-200">{alert.studentCount} present</span>
+                    <span aria-hidden="true" className="mx-1.5 text-slate-600">·</span>
                     <span>{alert.voiceCue}</span>
                   </p>
                   {alert.details ? (
-                    <p className="text-xs text-slate-700 line-clamp-2">{alert.details}</p>
+                    <p className="text-xs text-slate-300 line-clamp-2">{alert.details}</p>
                   ) : null}
                 </div>
               </div>
 
-              {alert.detectedBehaviors && alert.detectedBehaviors.length > 0 ? (
-                <div className="flex flex-wrap gap-1">
-                  {alert.detectedBehaviors.slice(0, 3).map((cue, idx) => (
-                    <span
-                      key={idx}
-                      className={`text-[11px] font-medium px-2 py-0.5 rounded border ${
-                        isBullying
-                          ? 'bg-orange-50 border-orange-200 text-orange-900'
-                          : isCritical
-                            ? 'bg-red-50 border-red-200 text-red-900'
-                            : 'bg-slate-50 border-slate-200 text-slate-700'
-                      }`}
-                    >
-                      {cue}
-                    </span>
-                  ))}
-                </div>
-              ) : null}
-
-              <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-slate-100">
+              <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t border-slate-800">
                 <button
                   type="button"
                   onClick={() => {
@@ -173,27 +146,27 @@ export function AlertPopupOverlay({
                   }}
                   className={`inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-lg text-white transition-colors cursor-pointer whitespace-nowrap ${
                     isBullying
-                      ? 'bg-orange-600 hover:bg-orange-700'
+                      ? 'bg-orange-600 hover:bg-orange-500'
                       : isCritical
-                        ? 'bg-red-600 hover:bg-red-700'
-                        : 'bg-blue-600 hover:bg-blue-700'
+                        ? 'bg-red-600 hover:bg-red-500'
+                        : 'bg-blue-600 hover:bg-blue-500'
                   }`}
                 >
                   <Eye className="w-3.5 h-3.5" aria-hidden="true" />
-                  <span>Inspect Camera</span>
+                  <span>Inspect</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => onNotifyTeacher(alert)}
-                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-lg bg-slate-900 text-white hover:bg-slate-800 transition-colors cursor-pointer whitespace-nowrap"
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-lg bg-slate-800 border border-slate-700 text-slate-100 hover:bg-slate-700 transition-colors cursor-pointer whitespace-nowrap"
                 >
                   <Mail className="w-3.5 h-3.5" aria-hidden="true" />
-                  <span>{alert.teacherNotified ? 'Notified' : 'Notify Teacher'}</span>
+                  <span>{alert.teacherNotified ? 'Notified' : 'Notify'}</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => onAcknowledge(alert.id)}
-                  className="ml-auto inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-lg border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 transition-colors cursor-pointer whitespace-nowrap"
+                  className="ml-auto inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-lg border border-slate-700 bg-transparent text-slate-300 hover:bg-slate-800 hover:text-white transition-colors cursor-pointer whitespace-nowrap"
                 >
                   <Check className="w-3.5 h-3.5" aria-hidden="true" />
                   <span>Acknowledge</span>

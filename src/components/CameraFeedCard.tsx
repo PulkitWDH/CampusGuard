@@ -12,7 +12,15 @@ import {
   ShieldAlert,
   Trash2,
 } from 'lucide-react';
-import type { AiEngineModel, ClassroomCamera, DetectedPersonBox, FacilityMode } from '../types';
+import type {
+  AiEngineModel,
+  ClassroomAnalysis,
+  ClassroomCamera,
+  DetectedObjectBox,
+  DetectedPersonBox,
+  FacilityMode,
+  ThreatSensitivity,
+} from '../types';
 import { captureCanvasJpegBase64 } from '../utils/mediaCapture';
 import {
   detectPeopleLocallyOnCanvas,
@@ -21,10 +29,16 @@ import {
 import {
   DEFAULT_DB_CALIBRATION_OFFSET,
   INSTANT_CHANGE_THRESHOLD_PERCENT,
+  SOUND_ALERT_SUSTAINED_MS,
   SOUND_ALERT_THRESHOLD_DB,
+  type EdgeThreatTrackerState,
   type PersonTrackerState,
+  type SpeechResultLike,
   computeFrameDeltaPercent,
   computeSplDecibels,
+  createInitialEdgeThreatState,
+  evaluateRealtimeEdgeThreat,
+  extractLatestSpeechUtterance,
   formatAiModelLabel,
   formatFacilityLabels,
   shouldTriggerInstantContinuousScan,
@@ -35,18 +49,33 @@ export interface CameraFramePayload {
   frameBase64: string;
   previousFrameBase64?: string;
   previewDataUrl?: string;
+  liveMotionPercent?: number;
+  detectedObjects?: DetectedObjectBox[];
+}
+
+export interface RealtimeThreatEvent {
+  analysis: ClassroomAnalysis | null;
+  shouldEmitAlert: boolean;
+  shouldClearThreat: boolean;
+  previewDataUrl?: string;
 }
 
 interface CameraFeedCardProps {
   camera: ClassroomCamera;
   facilityMode: FacilityMode;
+  threatSensitivity: ThreatSensitivity;
   defaultAiModel: AiEngineModel;
   dbCalibrationOffset?: number;
   cloudQuotaExhausted?: boolean;
   isFocused: boolean;
   liveMediaStream?: MediaStream | null;
   onRegisterCapture: (cameraId: string, captureFn: (() => CameraFramePayload | null) | null) => void;
-  onLocalPersonDetections: (cameraId: string, detectedPeople: DetectedPersonBox[]) => void;
+  onLocalPersonDetections: (
+    cameraId: string,
+    detectedPeople: DetectedPersonBox[],
+    detectedObjects: DetectedObjectBox[]
+  ) => void;
+  onRealtimeEdgeThreat: (cameraId: string, event: RealtimeThreatEvent) => void;
   onReconnectStream: (cameraId: string) => void;
   onAnalyzeCamera: (cameraId: string, isAutoTrigger?: boolean) => void;
   onToggleVoiceListening: (cameraId: string) => void;
@@ -83,6 +112,7 @@ interface SpeechRecognitionInstance {
 export function CameraFeedCard({
   camera,
   facilityMode,
+  threatSensitivity,
   defaultAiModel,
   dbCalibrationOffset = DEFAULT_DB_CALIBRATION_OFFSET,
   cloudQuotaExhausted = false,
@@ -90,6 +120,7 @@ export function CameraFeedCard({
   liveMediaStream,
   onRegisterCapture,
   onLocalPersonDetections,
+  onRealtimeEdgeThreat,
   onReconnectStream,
   onAnalyzeCamera,
   onToggleVoiceListening,
@@ -115,12 +146,16 @@ export function CameraFeedCard({
       : ''
   );
   const [liveMotionPercent, setLiveMotionPercent] = useState(0);
+  const [contactPairsCount, setContactPairsCount] = useState(0);
   const [scanModeLabel, setScanModeLabel] = useState('Edge AI · Loading model');
   const [localEdgeState, setLocalEdgeState] = useState<'loading' | 'ready' | 'fallback'>('loading');
   const [streamError, setStreamError] = useState<string | null>(null);
+
   const rawCaptureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const motionCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const lastScannedThumbRef = useRef<Uint8ClampedArray | null>(null);
+  const prevEdgeThumbRef = useRef<Uint8ClampedArray | null>(null);
+  const liveMotionPercentRef = useRef<number>(0);
   const lastScanFinishedAtRef = useRef<number>(0);
   const hasScannedOnceRef = useRef<boolean>(Boolean(camera.lastAnalysis));
   const localDetectInFlightRef = useRef<boolean>(false);
@@ -131,19 +166,29 @@ export function CameraFeedCard({
     confirmed: [],
     pending: [],
   });
+  const edgeThreatStateRef = useRef<EdgeThreatTrackerState>(createInitialEdgeThreatState());
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const speechRestartTimerRef = useRef<number | null>(null);
   const speechClearTimerRef = useRef<number | null>(null);
   const [loudHoldSeconds, setLoudHoldSeconds] = useState(0);
   const loudHoldStartRef = useRef<number | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
+
   const liveTranscriptRef = useRef(camera.liveTranscript);
+  const audioLevelRef = useRef(camera.audioLevel);
+  const voiceListeningRef = useRef(camera.voiceListeningEnabled);
   const isAnalyzingRef = useRef(camera.isAnalyzing);
   const detectedPeopleRef = useRef(camera.lastAnalysis?.detectedPeople ?? []);
+  const detectedObjectsRef = useRef<DetectedObjectBox[]>(camera.lastAnalysis?.detectedObjects ?? []);
   const cameraStatusRef = useRef(camera.status);
+  const threatCategoryRef = useRef(camera.lastAnalysis?.threatCategory ?? 'none');
   const cloudQuotaExhaustedRef = useRef(cloudQuotaExhausted);
+  const facilityModeRef = useRef(facilityMode);
+  const threatSensitivityRef = useRef(threatSensitivity);
+
   const onAnalyzeCameraRef = useRef(onAnalyzeCamera);
   const onLocalPersonDetectionsRef = useRef(onLocalPersonDetections);
+  const onRealtimeEdgeThreatRef = useRef(onRealtimeEdgeThreat);
   const onUpdateTranscriptRef = useRef(onUpdateTranscript);
 
   const captureCleanFrame = (): { base64: string; dataUrl: string } | null => {
@@ -249,12 +294,32 @@ export function CameraFeedCard({
 
   useEffect(() => {
     detectedPeopleRef.current = camera.lastAnalysis?.detectedPeople ?? [];
+    detectedObjectsRef.current = camera.lastAnalysis?.detectedObjects ?? [];
     cameraStatusRef.current = camera.status;
-  }, [camera.lastAnalysis?.detectedPeople, camera.status]);
+    threatCategoryRef.current = camera.lastAnalysis?.threatCategory ?? 'none';
+  }, [
+    camera.lastAnalysis?.detectedPeople,
+    camera.lastAnalysis?.detectedObjects,
+    camera.lastAnalysis?.threatCategory,
+    camera.status,
+  ]);
+
+  useEffect(() => {
+    audioLevelRef.current = camera.audioLevel;
+    voiceListeningRef.current = camera.voiceListeningEnabled;
+  }, [camera.audioLevel, camera.voiceListeningEnabled]);
 
   useEffect(() => {
     cloudQuotaExhaustedRef.current = cloudQuotaExhausted;
   }, [cloudQuotaExhausted]);
+
+  useEffect(() => {
+    facilityModeRef.current = facilityMode;
+  }, [facilityMode]);
+
+  useEffect(() => {
+    threatSensitivityRef.current = threatSensitivity;
+  }, [threatSensitivity]);
 
   useEffect(() => {
     onAnalyzeCameraRef.current = onAnalyzeCamera;
@@ -265,6 +330,10 @@ export function CameraFeedCard({
   }, [onLocalPersonDetections]);
 
   useEffect(() => {
+    onRealtimeEdgeThreatRef.current = onRealtimeEdgeThreat;
+  }, [onRealtimeEdgeThreat]);
+
+  useEffect(() => {
     setTotalDraft(
       typeof camera.expectedTotalCount === 'number' && camera.expectedTotalCount > 0
         ? String(camera.expectedTotalCount)
@@ -272,7 +341,7 @@ export function CameraFeedCard({
     );
   }, [camera.expectedTotalCount]);
 
-  // Preload zero-quota on-device TensorFlow.js COCO-SSD person detector
+  // Preload zero-quota on-device TensorFlow.js COCO-SSD person + weapon detector
   useEffect(() => {
     let cancelled = false;
     ensureLocalPersonDetector()
@@ -293,7 +362,7 @@ export function CameraFeedCard({
     };
   }, []);
 
-  // Real-time zero-quota on-device Edge AI person detector (runs every 300ms with NO cooldown & NO API limits)
+  // Real-time zero-quota on-device Edge AI person + weapon + visual threat engine (runs every 300ms)
   useEffect(() => {
     if (!isAutoAiOn || !hasLiveSignal || localEdgeState !== 'ready') {
       return;
@@ -305,35 +374,124 @@ export function CameraFeedCard({
       const clean = captureCleanFrameRef.current();
       if (!clean || !rawCaptureCanvasRef.current) return;
 
+      // Measure true frame-to-frame visual motion right at inference time
+      const currThumb = sampleMotionPixelsRef.current();
+      const instantDelta =
+        currThumb && prevEdgeThumbRef.current
+          ? computeFrameDeltaPercent(prevEdgeThumbRef.current, currThumb)
+          : 0;
+      if (currThumb) {
+        prevEdgeThumbRef.current = new Uint8ClampedArray(currThumb);
+      }
+      liveMotionPercentRef.current = instantDelta;
+      setLiveMotionPercent(instantDelta);
+
       localDetectInFlightRef.current = true;
       try {
-        const { people: rawPeople, inferenceMs } = await detectPeopleLocallyOnCanvas(
-          rawCaptureCanvasRef.current,
-          38
-        );
+        const rawCanvas = rawCaptureCanvasRef.current;
+        const {
+          people: rawPeople,
+          weakPeople,
+          dangerousObjects,
+          occluderObjects,
+          inferenceMs,
+        } = await detectPeopleLocallyOnCanvas(rawCanvas, 48, {
+          hadTrackedPeople: personTrackerStateRef.current.confirmed.length > 0,
+        });
         if (cancelled) return;
+
+        // Lightweight 6x4 lower-torso patch sampler (shoulders/chest below face) for occlusion resilience
+        const sampleTorsoSignature = (
+          box_2d: [number, number, number, number]
+        ): number[] | null => {
+          try {
+            const cw = rawCanvas.width;
+            const ch = rawCanvas.height;
+            if (cw <= 0 || ch <= 0) return null;
+            const [ymin, xmin, ymax, xmax] = box_2d;
+            const torsoYmin = ymin + Math.round((ymax - ymin) * 0.44);
+            const sx = Math.max(0, Math.floor((xmin / 1000) * cw));
+            const sy = Math.max(0, Math.floor((torsoYmin / 1000) * ch));
+            const sw = Math.max(4, Math.floor(((xmax - xmin) / 1000) * cw));
+            const sh = Math.max(4, Math.floor(((ymax - torsoYmin) / 1000) * ch));
+            const scratch = document.createElement('canvas');
+            scratch.width = 6;
+            scratch.height = 4;
+            const sctx = scratch.getContext('2d', { willReadFrequently: true });
+            if (!sctx) return null;
+            sctx.drawImage(rawCanvas, sx, sy, Math.min(sw, cw - sx), Math.min(sh, ch - sy), 0, 0, 6, 4);
+            const data = sctx.getImageData(0, 0, 6, 4).data;
+            const vec: number[] = [];
+            for (let i = 0; i < data.length; i += 4) {
+              vec.push(Math.round(data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114));
+            }
+            return vec;
+          } catch {
+            return null;
+          }
+        };
 
         const { nextState, people } = stepPersonTracker(
           personTrackerStateRef.current,
           rawPeople,
-          { instantConfidence: 52, minConfidence: 38, maxMissedFrames: 2 }
+          {
+            instantConfidence: 62,
+            minConfidence: 48,
+            maxMissedFrames: 2,
+            maxOccludedFrames: 35,
+            weakDetections: weakPeople,
+            occluderObjects,
+            sampleTorsoSignature,
+          }
         );
         personTrackerStateRef.current = nextState;
         detectedPeopleRef.current = people;
+        detectedObjectsRef.current = dangerousObjects;
         localPeopleCountRef.current = people.length;
 
-        const sig = people
-          .map((p) => `${p.label}:${p.confidence}:${p.box_2d.map((v) => Math.round(v / 20)).join(',')}`)
-          .join('|');
+        const sig = [
+          ...people.map(
+            (p) =>
+              `${p.label}:${p.faceOccluded ? 'OCC' : 'CLR'}:${p.confidence}:${p.box_2d.map((v) => Math.round(v / 20)).join(',')}`
+          ),
+          ...dangerousObjects.map(
+            (o) => `W:${o.label}:${o.confidence}:${o.box_2d.map((v) => Math.round(v / 20)).join(',')}`
+          ),
+        ].join('|');
+
         if (sig !== lastLocalBoxSigRef.current) {
           lastLocalBoxSigRef.current = sig;
-          onLocalPersonDetectionsRef.current(camera.id, people);
+          onLocalPersonDetectionsRef.current(camera.id, people, dangerousObjects);
         }
+
+        // Run real-time stateful visual + weapon + contact threat detector on EVERY frame
+        const threatEval = evaluateRealtimeEdgeThreat(edgeThreatStateRef.current, {
+          people,
+          dangerousObjects,
+          frameDeltaPercent: instantDelta,
+          voiceTranscript: voiceListeningRef.current ? liveTranscriptRef.current : '',
+          audioLevel: voiceListeningRef.current ? audioLevelRef.current : 0,
+          facilityMode: facilityModeRef.current,
+          sensitivity: threatSensitivityRef.current,
+          nowMs: Date.now(),
+        });
+        edgeThreatStateRef.current = threatEval.nextState;
+        setContactPairsCount(threatEval.contactPairs);
+
+        if (threatEval.analysis || threatEval.shouldClearThreat) {
+          onRealtimeEdgeThreatRef.current(camera.id, {
+            analysis: threatEval.analysis,
+            shouldEmitAlert: threatEval.shouldEmitAlert,
+            shouldClearThreat: threatEval.shouldClearThreat,
+            previewDataUrl: threatEval.shouldEmitAlert ? clean.dataUrl : undefined,
+          });
+        }
+
         if (!isAnalyzingRef.current) {
           setScanModeLabel(
             cloudQuotaExhaustedRef.current
-              ? `Edge AI live · ${inferenceMs}ms (unlimited · 0 quota)`
-              : `Edge AI live · ${inferenceMs}ms (0 cooldown)`
+              ? `Edge AI · ${inferenceMs}ms (On-device armed)`
+              : `Edge + Cloud AI · ${inferenceMs}ms`
           );
         }
       } catch {
@@ -354,20 +512,20 @@ export function CameraFeedCard({
     };
   }, [camera.id, hasLiveSignal, isAutoAiOn, localEdgeState]);
 
-  // Continuous zero-cooldown cloud threat & voice AI loop
+  // Cloud multimodal threat verification loop (complements on-device Edge AI when cloud quota is available)
   useEffect(() => {
     if (!isAutoAiOn) {
-      setScanModeLabel('Continuous AI paused');
+      setScanModeLabel('Threat AI paused');
       setLiveMotionPercent(0);
       return;
     }
     if (!hasAiFeedSignal) {
-      setScanModeLabel('Waiting for camera signal');
+      setScanModeLabel('Waiting for video signal');
       setLiveMotionPercent(0);
       return;
     }
     if (localEdgeState === 'loading') {
-      setScanModeLabel('Loading on-device Edge AI...');
+      setScanModeLabel('Loading Edge AI model...');
       return;
     }
 
@@ -376,8 +534,12 @@ export function CameraFeedCard({
       const currPixels = sampleMotionPixelsRef.current();
       const deltaPercent = currPixels
         ? computeFrameDeltaPercent(lastScannedThumbRef.current, currPixels)
-        : 0;
-      setLiveMotionPercent(deltaPercent);
+        : liveMotionPercentRef.current;
+
+      if (!localEdgeReadyRef.current) {
+        setLiveMotionPercent(deltaPercent);
+        liveMotionPercentRef.current = deltaPercent;
+      }
 
       const decision = shouldTriggerInstantContinuousScan({
         autoAiEnabled: true,
@@ -392,11 +554,11 @@ export function CameraFeedCard({
       });
 
       if (decision.reason === 'in-flight') {
-        setScanModeLabel('Cloud threat AI analyzing...');
+        setScanModeLabel('Cloud AI verifying scene...');
         return;
       }
 
-      // If cloud API quota is full and on-device Edge AI is running, stay 100% on local Edge AI without 429 spam
+      // When cloud API quota is exhausted, on-device 300ms Edge AI handles all live threat detection continuously
       if (cloudQuotaExhausted && localEdgeReadyRef.current) {
         return;
       }
@@ -408,18 +570,18 @@ export function CameraFeedCard({
         hasScannedOnceRef.current = true;
         setScanModeLabel(
           decision.reason === 'instant-change'
-            ? 'Scene change · cloud threat check'
-            : 'Cloud threat AI · scanning live'
+            ? 'Scene change · verifying threats'
+            : 'Cloud vision scan active'
         );
         onAnalyzeCameraRef.current(camera.id, true);
       } else if (!localEdgeReadyRef.current) {
         setScanModeLabel(
           deltaPercent >= INSTANT_CHANGE_THRESHOLD_PERCENT
-            ? `Change ${deltaPercent.toFixed(0)}% · scanning`
-            : 'Continuous AI · watching live'
+            ? `Motion ${deltaPercent.toFixed(0)}% · scanning`
+            : 'Continuous AI · armed'
         );
       }
-    }, 250);
+    }, 350);
 
     return () => clearInterval(timer);
   }, [camera.id, cloudQuotaExhausted, hasAiFeedSignal, isAutoAiOn, localEdgeState]);
@@ -442,6 +604,8 @@ export function CameraFeedCard({
       return {
         frameBase64: current.base64,
         previewDataUrl: current.dataUrl,
+        liveMotionPercent: liveMotionPercentRef.current,
+        detectedObjects: detectedObjectsRef.current,
       };
     });
     return () => {
@@ -455,6 +619,8 @@ export function CameraFeedCard({
     hasLiveFrameRef.current = false;
     setHasLiveSignal(false);
     loadedImageRef.current = null;
+    prevEdgeThumbRef.current = null;
+    edgeThreatStateRef.current = createInitialEdgeThreatState();
 
     if (liveMediaStream && videoRef.current) {
       videoRef.current.srcObject = liveMediaStream;
@@ -493,14 +659,21 @@ export function CameraFeedCard({
     }
   }, [camera.customMediaType, camera.customMediaUrl, liveMediaStream]);
 
-  // Poll real IP camera HTTP snapshot or MJPEG URL via server proxy when streamUrl is configured
+  // Poll real Wi-Fi / IP CCTV HTTP snapshot or MJPEG URL (via proxy or Direct LAN mode)
   useEffect(() => {
     if (!camera.streamUrl) return;
     let cancelled = false;
+    let inFlight = false;
 
     const loadSnapshot = () => {
+      if (inFlight || cancelled) return;
+      inFlight = true;
       const img = new Image();
+      if (camera.wifiDirectMode) {
+        img.crossOrigin = 'anonymous';
+      }
       img.onload = () => {
+        inFlight = false;
         if (cancelled) return;
         if (img.naturalWidth > 0) {
           setStreamError(null);
@@ -510,21 +683,33 @@ export function CameraFeedCard({
         }
       };
       img.onerror = () => {
+        inFlight = false;
         if (cancelled) return;
         hasLiveFrameRef.current = false;
         setHasLiveSignal(false);
-        setStreamError('Unable to reach camera snapshot or MJPEG stream URL.');
+        setStreamError(
+          camera.sourceKind === 'wifi-cctv'
+            ? 'Unable to reach Wi-Fi CCTV feed. Verify camera IP/URL, Wi-Fi network, or toggle Direct LAN mode.'
+            : 'Unable to reach camera snapshot or MJPEG stream URL.'
+        );
       };
-      img.src = `/api/snapshot-proxy?url=${encodeURIComponent(camera.streamUrl!)}&t=${Date.now()}`;
+
+      if (camera.wifiDirectMode) {
+        const sep = camera.streamUrl!.includes('?') ? '&' : '?';
+        img.src = `${camera.streamUrl!}${sep}_t=${Date.now()}`;
+      } else {
+        img.src = `/api/snapshot-proxy?url=${encodeURIComponent(camera.streamUrl!)}&t=${Date.now()}`;
+      }
     };
 
     loadSnapshot();
-    const timer = setInterval(loadSnapshot, 2000);
+    const pollMs = camera.sourceKind === 'wifi-cctv' ? 900 : 1500;
+    const timer = setInterval(loadSnapshot, pollMs);
     return () => {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [camera.streamUrl]);
+  }, [camera.sourceKind, camera.streamUrl, camera.wifiDirectMode]);
 
   // Measure real time-domain RMS decibel level (dB SPL) with peak-hold responsiveness
   useEffect(() => {
@@ -593,7 +778,7 @@ export function CameraFeedCard({
     };
   }, [camera.id, dbCalibrationOffset, liveMediaStream, micActive]);
 
-  // Draw live video/image frame onto canvas
+  // Draw live video/image frame + grounded person & weapon bounding boxes onto display canvas
   useEffect(() => {
     let rafId = 0;
     let lastDraw = 0;
@@ -610,7 +795,7 @@ export function CameraFeedCard({
 
       const width = canvas.width;
       const height = canvas.height;
-      ctx.fillStyle = '#0f172a';
+      ctx.fillStyle = '#070A0F';
       ctx.fillRect(0, 0, width, height);
 
       const video = videoRef.current;
@@ -642,25 +827,25 @@ export function CameraFeedCard({
           hasLiveFrameRef.current = false;
           setHasLiveSignal(false);
         }
-        ctx.fillStyle = '#1e293b';
+        ctx.fillStyle = '#0D131D';
         ctx.fillRect(0, 0, width, height);
-        ctx.fillStyle = '#cbd5e1';
-        ctx.font = '500 14px "DM Sans", sans-serif';
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '500 13px "DM Sans", sans-serif';
         const message =
-          camera.sourceKind === 'stream-url'
-            ? 'Connecting to camera stream URL...'
-            : 'Camera stream offline. Click Reconnect Live Camera.';
+          camera.sourceKind === 'wifi-cctv'
+            ? 'Connecting to Wi-Fi CCTV stream...'
+            : camera.sourceKind === 'stream-url'
+              ? 'Connecting to IP camera stream...'
+              : 'Feed offline · Click Reconnect Live Camera';
         const m = ctx.measureText(message);
         ctx.fillText(message, Math.max(20, (width - m.width) / 2), height / 2);
       }
 
-      // Draw grounded AI person bounding boxes directly on live display canvas (never included in clean AI capture)
+      // Draw grounded AI person bounding boxes (including face-occluded tracking state)
       const boxes = detectedPeopleRef.current;
       if (hasLiveFrameRef.current && Array.isArray(boxes) && boxes.length > 0) {
         const isCritical = cameraStatusRef.current === 'fighting';
-        const strokeColor = isCritical ? '#ef4444' : '#10b981';
-        const fillTint = isCritical ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)';
-        const tagBg = isCritical ? 'rgba(185, 28, 28, 0.92)' : 'rgba(6, 95, 70, 0.92)';
+        const isBullying = threatCategoryRef.current === 'bullying';
 
         boxes.forEach((person, idx) => {
           const [ymin, xmin, ymax, xmax] = person.box_2d;
@@ -669,16 +854,42 @@ export function CameraFeedCard({
           const bw = Math.max(16, Math.min(width - x - 2, Math.round(((xmax - xmin) / 1000) * width)));
           const bh = Math.max(16, Math.min(height - y - 2, Math.round(((ymax - ymin) / 1000) * height)));
 
+          const isOccluded = Boolean(person.faceOccluded);
+          const strokeColor = isBullying
+            ? '#f97316'
+            : isCritical
+              ? '#ef4444'
+              : isOccluded
+                ? '#38bdf8'
+                : '#10b981';
+          const fillTint = isBullying
+            ? 'rgba(249, 115, 22, 0.14)'
+            : isCritical
+              ? 'rgba(239, 68, 68, 0.14)'
+              : isOccluded
+                ? 'rgba(56, 189, 248, 0.12)'
+                : 'rgba(16, 185, 129, 0.10)';
+          const tagBg = isBullying
+            ? 'rgba(194, 65, 12, 0.92)'
+            : isCritical
+              ? 'rgba(185, 28, 28, 0.92)'
+              : isOccluded
+                ? 'rgba(3, 105, 161, 0.92)'
+                : 'rgba(6, 95, 70, 0.90)';
+
           ctx.fillStyle = fillTint;
           ctx.fillRect(x, y, bw, bh);
 
           ctx.strokeStyle = strokeColor;
-          ctx.lineWidth = 2.5;
+          ctx.lineWidth = 2;
+          if (isOccluded && !isCritical) {
+            ctx.setLineDash([6, 4]);
+          }
           ctx.strokeRect(x, y, bw, bh);
+          ctx.setLineDash([]);
 
-          // Corner brackets for unmistakable visual grounding
-          const corner = Math.min(14, Math.floor(Math.min(bw, bh) / 3));
-          ctx.lineWidth = 4;
+          const corner = Math.min(12, Math.floor(Math.min(bw, bh) / 3));
+          ctx.lineWidth = 3.5;
           ctx.beginPath();
           ctx.moveTo(x, y + corner);
           ctx.lineTo(x, y);
@@ -694,16 +905,17 @@ export function CameraFeedCard({
           ctx.lineTo(x + bw, y + bh - corner);
           ctx.stroke();
 
-          const tagText = `#${idx + 1} ${person.label} · ${person.confidence}%`;
+          const tagText = isOccluded
+            ? `#${idx + 1} ${person.label}`
+            : `#${idx + 1} ${person.label} ${person.confidence}%`;
           ctx.font = '600 11px "JetBrains Mono", monospace';
           const textW = ctx.measureText(tagText).width;
           const tagW = Math.min(width - 8, Math.ceil(textW) + 12);
           const tagX = Math.max(4, Math.min(x, width - tagW - 4));
-          const rawTagY = y >= 54 ? y - 22 : Math.min(height - 54, y + 4);
+          const rawTagY = y >= 54 ? y - 20 : Math.min(height - 54, y + 4);
           let tagY = Math.max(34, Math.min(height - 54, rawTagY));
-          // Keep right-side labels clear of the top-right live count HUD badge
-          if (tagY < 90 && tagX + tagW > width - 165) {
-            tagY = Math.min(height - 54, Math.max(92, y + 6));
+          if (tagY < 88 && tagX + tagW > width - 150) {
+            tagY = Math.min(height - 54, Math.max(90, y + 6));
           }
           ctx.fillStyle = tagBg;
           ctx.fillRect(tagX, tagY, tagW, 18);
@@ -712,18 +924,48 @@ export function CameraFeedCard({
         });
       }
 
-      ctx.fillStyle = 'rgba(15, 23, 42, 0.68)';
-      ctx.fillRect(0, 0, width, 30);
-      ctx.fillStyle = '#f8fafc';
-      ctx.font = '500 12px "JetBrains Mono", monospace';
+      // Draw crimson bounding boxes for any detected weapon objects
+      const weapons = detectedObjectsRef.current;
+      if (hasLiveFrameRef.current && Array.isArray(weapons) && weapons.length > 0) {
+        weapons.forEach((weapon) => {
+          const [ymin, xmin, ymax, xmax] = weapon.box_2d;
+          const x = Math.max(2, Math.min(width - 18, Math.round((xmin / 1000) * width)));
+          const y = Math.max(32, Math.min(height - 38, Math.round((ymin / 1000) * height)));
+          const bw = Math.max(16, Math.min(width - x - 2, Math.round(((xmax - xmin) / 1000) * width)));
+          const bh = Math.max(16, Math.min(height - y - 2, Math.round(((ymax - ymin) / 1000) * height)));
+
+          ctx.fillStyle = 'rgba(220, 38, 38, 0.24)';
+          ctx.fillRect(x, y, bw, bh);
+          ctx.strokeStyle = '#ef4444';
+          ctx.lineWidth = 3;
+          ctx.strokeRect(x, y, bw, bh);
+
+          const tagText = `WEAPON: ${weapon.label.toUpperCase()} ${weapon.confidence}%`;
+          ctx.font = '700 11px "JetBrains Mono", monospace';
+          const textW = ctx.measureText(tagText).width;
+          const tagW = Math.min(width - 8, Math.ceil(textW) + 12);
+          const tagX = Math.max(4, Math.min(x, width - tagW - 4));
+          const tagY = Math.max(34, y >= 54 ? y - 20 : y + 4);
+          ctx.fillStyle = '#dc2626';
+          ctx.fillRect(tagX, tagY, tagW, 18);
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText(tagText, tagX + 6, tagY + 13, tagW - 12);
+        });
+      }
+
+      // Top CCTV telemetry bar
+      ctx.fillStyle = 'rgba(7, 10, 15, 0.78)';
+      ctx.fillRect(0, 0, width, 28);
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = '500 11px "JetBrains Mono", monospace';
       const timeLabel = new Date().toLocaleTimeString([], {
         hour: '2-digit',
         minute: '2-digit',
         second: '2-digit',
       });
-      ctx.fillText(`${camera.cameraCode} · ${camera.bluetoothDeviceName}`, 12, 20);
+      ctx.fillText(`${camera.cameraCode} · ${camera.bluetoothDeviceName}`, 10, 18);
       const timeMetrics = ctx.measureText(timeLabel);
-      ctx.fillText(timeLabel, width - timeMetrics.width - 12, 20);
+      ctx.fillText(timeLabel, width - timeMetrics.width - 10, 18);
     };
 
     rafId = requestAnimationFrame(drawFrame);
@@ -800,7 +1042,6 @@ export function CameraFeedCard({
 
       onUpdateTranscriptRef.current(camera.id, utterance, undefined, 'speech');
 
-      // Auto-clear stale sentence after 15 seconds of silence so old speech never sticks on screen
       if (speechClearTimerRef.current !== null) {
         clearTimeout(speechClearTimerRef.current);
       }
@@ -817,28 +1058,22 @@ export function CameraFeedCard({
         return;
       }
       if (code === 'not-allowed' || code === 'service-not-allowed') {
-        setMicError(
-          'Microphone speech recognition permission blocked (dB level metering remains active).'
-        );
+        setMicError('Speech recognition blocked (dB level metering remains active).');
       } else if (code === 'network') {
-        setMicError(
-          'Speech-to-text service briefly unreachable; retrying while dB metering stays live.'
-        );
+        setMicError('Speech-to-text retrying; dB metering remains live.');
       } else {
-        setMicError('Speech recognition paused; live dB metering remains active.');
+        setMicError('Speech recognition paused; live dB metering active.');
       }
     };
 
     recognition.onend = () => {
       if (!micActiveRef.current) return;
-      // Always start a fresh SpeechRecognition session after a short backoff so event.results
-      // resets cleanly and never accumulates or repeats old sentences.
       speechRestartTimerRef.current = window.setTimeout(() => {
         if (!micActiveRef.current) return;
         try {
           startFreshSpeechSession(SpeechCtor);
         } catch {
-          // ignore restart throttle when micActive remains true for dB metering
+          // ignore restart throttle
         }
       }, 280);
     };
@@ -861,7 +1096,6 @@ export function CameraFeedCard({
     }
 
     try {
-      // Reuse already-live camera audio track if present to avoid Windows/Chrome dual-mic conflicts
       const existingAudioTracks = liveMediaStream?.getAudioTracks() ?? [];
       if (existingAudioTracks.length === 0 && navigator.mediaDevices?.getUserMedia) {
         const audioConstraints: MediaTrackConstraints = {
@@ -893,7 +1127,7 @@ export function CameraFeedCard({
       if (SpeechCtor) {
         startFreshSpeechSession(SpeechCtor);
       } else {
-        setMicError('Microphone active (dB level monitored); browser speech-to-text is unavailable here.');
+        setMicError('Microphone live (dB monitored); speech-to-text unavailable in this browser.');
       }
       setMicActive(true);
     } catch {
@@ -908,24 +1142,45 @@ export function CameraFeedCard({
       (camera.sourceKind === 'bluetooth-cctv' && !camera.streamUrl && !camera.customMediaUrl)) &&
     !liveMediaStream;
 
+  const activeCategory = camera.lastAnalysis?.threatCategory;
+  const isBullyingStatus = camera.status === 'fighting' && activeCategory === 'bullying';
   const statusBorderClass =
-    camera.status === 'fighting'
-      ? 'animate-alert-critical-pulse border-2 border-red-500 ring-2 ring-red-200'
-      : camera.status === 'warning'
-        ? 'border-amber-300'
-        : 'border-slate-200';
+    isBullyingStatus
+      ? 'border-orange-500 ring-1 ring-orange-500/40'
+      : camera.status === 'fighting'
+        ? 'animate-alert-critical-pulse border-red-500 ring-1 ring-red-500/40'
+        : camera.status === 'warning'
+          ? 'border-amber-500/70'
+          : 'border-zinc-800/90 hover:border-zinc-700';
 
   const countWord = camera.studentCount === 1 ? labels.personSingular : labels.personPlural;
   const modelLabel = camera.lastAnalysis?.modelUsed
     ? formatAiModelLabel(camera.lastAnalysis.modelUsed)
     : null;
+  const detectedWeapons = camera.lastAnalysis?.detectedObjects ?? [];
+
+  const statusLabel =
+    camera.status === 'fighting'
+      ? activeCategory === 'robbery_or_weapon'
+        ? 'Weapon / Robbery'
+        : activeCategory === 'intrusion'
+          ? 'Breach Alert'
+          : activeCategory === 'beating'
+            ? 'Beating Detected'
+            : activeCategory === 'bullying'
+              ? 'Bullying Detected'
+              : 'Fight Detected'
+      : camera.status === 'warning'
+        ? 'Disturbance'
+        : 'Nominal';
 
   return (
     <article
       data-testid={`camera-card-${camera.id}`}
-      className={`bg-white border rounded-xl overflow-hidden flex flex-col transition-colors ${statusBorderClass}`}
+      className={`bg-[#101114] border rounded-lg overflow-hidden flex flex-col transition-colors ${statusBorderClass}`}
     >
-      <div className="relative bg-slate-900 aspect-video w-full overflow-hidden">
+      {/* Dominant 16:9 Live CCTV Monitor */}
+      <div className="relative bg-black aspect-video w-full overflow-hidden">
         <video
           ref={videoRef}
           muted
@@ -943,11 +1198,11 @@ export function CameraFeedCard({
         />
 
         {needsStreamReconnect ? (
-          <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/60 p-4">
+          <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/70 p-4">
             <button
               type="button"
               onClick={() => onReconnectStream(camera.id)}
-              className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 cursor-pointer"
+              className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white cursor-pointer"
             >
               <RefreshCw className="w-3.5 h-3.5" aria-hidden="true" />
               <span>Reconnect Live Camera</span>
@@ -955,66 +1210,61 @@ export function CameraFeedCard({
           </div>
         ) : null}
 
-        {/* High-visibility Live Count / Empty Room HUD Badge */}
+        {/* Minimal Tactical Occupancy HUD */}
         {hasLiveSignal ? (
           <div
             data-testid={`camera-hud-count-${camera.id}`}
-            className={`pointer-events-none absolute top-9 right-3 z-20 rounded-lg px-3 py-1.5 backdrop-blur-md border shadow-md flex items-center gap-2 ${
-              camera.status === 'fighting'
-                ? 'bg-red-700/90 border-red-300 text-white'
-                : camera.studentCount === 0
-                  ? 'bg-slate-900/85 border-slate-500/80 text-slate-100'
-                  : 'bg-emerald-900/85 border-emerald-400/80 text-white'
+            className={`pointer-events-none absolute top-9 right-2.5 z-20 rounded px-2 py-1 backdrop-blur-md border flex items-baseline gap-1.5 ${
+              isBullyingStatus
+                ? 'bg-orange-950/85 border-orange-400/70 text-orange-100'
+                : camera.status === 'fighting'
+                  ? 'bg-red-950/90 border-red-400/70 text-red-50'
+                  : 'bg-black/75 border-zinc-700/80 text-zinc-100'
             }`}
           >
-            <span className="text-2xl leading-none font-extrabold font-mono tabular-nums">
+            <span className="text-lg leading-none font-bold font-mono tabular-nums">
               {camera.studentCount}
             </span>
-            <div className="flex flex-col leading-tight">
-              <span className="text-[10px] font-bold uppercase tracking-wider">
-                {camera.studentCount === 0 ? 'EMPTY' : countWord.toUpperCase()}
-              </span>
-              <span className="text-[9px] font-mono opacity-85 uppercase">
-                {camera.studentCount === 0 ? '0 detected' : 'Live count'}
-              </span>
-            </div>
+            <span className="text-[10px] font-mono uppercase tracking-wider text-zinc-300">
+              {detectedWeapons.length > 0
+                ? `${detectedWeapons.length} WEAPON`
+                : camera.studentCount === 0
+                  ? 'EMPTY'
+                  : countWord}
+            </span>
           </div>
         ) : null}
 
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-black/85 via-black/45 to-transparent px-3.5 py-2.5 flex items-end justify-between gap-3">
-          <div className="text-xs text-slate-100 flex items-center gap-2 min-w-0">
+        {/* Bottom Scrim Telemetry Strip */}
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-black/90 via-black/50 to-transparent px-3 py-2 flex items-end justify-between gap-2">
+          <div className="text-[11px] font-mono text-zinc-300 flex items-center gap-2 min-w-0">
             <span
-              className={`font-mono font-semibold uppercase tracking-wider ${
-                hasLiveSignal ? 'text-emerald-300' : 'text-amber-300'
+              className={`font-semibold uppercase ${
+                hasLiveSignal ? 'text-emerald-400' : 'text-amber-400'
               }`}
             >
-              {hasLiveSignal ? 'LIVE' : 'NO SIGNAL'}
+              {hasLiveSignal ? 'LIVE' : 'OFFLINE'}
             </span>
-            <span aria-hidden="true" className="text-slate-400">·</span>
-            <span className="font-mono tabular-nums font-semibold">
-              {camera.studentCount} {countWord} live
-              {typeof camera.expectedTotalCount === 'number' && camera.expectedTotalCount > 0
-                ? ` / ${camera.expectedTotalCount}`
-                : ''}
-            </span>
-            <span aria-hidden="true" className="text-slate-400">·</span>
+            <span aria-hidden="true" className="text-zinc-600">·</span>
+            <span className="tabular-nums">Δ{liveMotionPercent.toFixed(0)}%</span>
+            <span aria-hidden="true" className="text-zinc-600">·</span>
             <span
-              className={`truncate ${
+              className={`truncate tabular-nums ${
                 camera.voiceListeningEnabled && camera.audioLevel > SOUND_ALERT_THRESHOLD_DB
-                  ? 'text-red-300 font-semibold'
-                  : 'text-slate-200'
+                  ? 'text-red-400 font-semibold'
+                  : 'text-zinc-300'
               }`}
             >
               {camera.voiceListeningEnabled
-                ? `Voice ${camera.audioLevel.toFixed(1)} dB${
+                ? `${camera.audioLevel.toFixed(1)} dB${
                     camera.audioLevel > SOUND_ALERT_THRESHOLD_DB
-                      ? ` (>${SOUND_ALERT_THRESHOLD_DB.toFixed(1)} · ${Math.min(
+                      ? ` (${Math.min(
                           SOUND_ALERT_SUSTAINED_MS / 1000,
                           loudHoldSeconds
                         ).toFixed(1)}s/3s)`
                       : ''
                   }`
-                : 'Voice muted'}
+                : 'Muted'}
             </span>
           </div>
 
@@ -1022,225 +1272,214 @@ export function CameraFeedCard({
             type="button"
             onClick={() => onToggleFocus(camera.id)}
             aria-label={isFocused ? `Exit focus for ${camera.classroomName}` : `Focus ${camera.classroomName}`}
-            className="pointer-events-auto p-1.5 rounded-md bg-black/50 text-white hover:bg-black/75 transition-colors cursor-pointer shrink-0"
+            className="pointer-events-auto p-1 rounded bg-black/60 text-zinc-300 hover:bg-black/90 hover:text-white transition-colors cursor-pointer shrink-0"
           >
             {isFocused ? (
-              <Minimize2 className="w-4 h-4" aria-hidden="true" />
+              <Minimize2 className="w-3.5 h-3.5" aria-hidden="true" />
             ) : (
-              <Maximize2 className="w-4 h-4" aria-hidden="true" />
+              <Maximize2 className="w-3.5 h-3.5" aria-hidden="true" />
             )}
           </button>
         </div>
       </div>
 
-      <div className="p-4 flex-1 flex flex-col gap-3">
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <h3 className="text-base font-semibold text-slate-900 truncate">
+      {/* Single Clean NVR Monitor Control Bar */}
+      <div className="px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t border-zinc-800/80">
+        <div className="min-w-0 flex-1 basis-[170px]">
+          <div className="flex items-center gap-2 min-w-0">
+            <h3 className="text-xs sm:text-sm font-semibold text-zinc-100 truncate">
               {camera.classroomName}
             </h3>
-            <p className="text-xs text-slate-500 mt-0.5 flex flex-wrap items-center gap-1.5">
-              <span>{camera.bluetoothDeviceName}</span>
-              <span aria-hidden="true">·</span>
-              <span>{camera.hasVoice ? 'Video + Voice' : 'Video'}</span>
-              <span aria-hidden="true">·</span>
-              <span className="font-mono">{camera.bluetoothAddress}</span>
-            </p>
+            <span
+              className={`inline-flex items-center gap-1 text-[11px] font-medium whitespace-nowrap shrink-0 ${
+                isBullyingStatus
+                  ? 'text-orange-400'
+                  : camera.status === 'fighting'
+                    ? 'text-red-400'
+                    : camera.status === 'warning'
+                      ? 'text-amber-400'
+                      : 'text-emerald-400'
+              }`}
+            >
+              {camera.status === 'fighting' ? (
+                <ShieldAlert className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              ) : camera.status === 'warning' ? (
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              ) : (
+                <CheckCircle2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              )}
+              <span>{statusLabel}</span>
+            </span>
           </div>
-
-          <div className="shrink-0">
-            {camera.status === 'fighting' ? (
-              <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-red-700 whitespace-nowrap">
-                <ShieldAlert className="w-4 h-4 text-red-600" aria-hidden="true" />
-                <span>
-                  {camera.lastAnalysis?.threatCategory === 'robbery_or_weapon'
-                    ? 'Threat / Robbery'
-                    : camera.lastAnalysis?.threatCategory === 'intrusion'
-                      ? 'Breach Alert'
-                      : camera.lastAnalysis?.threatCategory === 'beating'
-                        ? 'Beating Detected'
-                        : camera.lastAnalysis?.threatCategory === 'bullying'
-                          ? 'Bullying Detected'
-                          : 'Fight Detected'}
-                </span>
-              </span>
-            ) : camera.status === 'warning' ? (
-              <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-amber-700 whitespace-nowrap">
-                <AlertTriangle className="w-4 h-4 text-amber-600" aria-hidden="true" />
-                <span>Loud Disturbance</span>
-              </span>
-            ) : (
-              <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-700 whitespace-nowrap">
-                <CheckCircle2 className="w-4 h-4 text-emerald-600" aria-hidden="true" />
-                <span>Normal</span>
-              </span>
-            )}
-          </div>
+          <p className="text-[11px] text-zinc-500 mt-0.5 truncate">
+            <span className="font-mono text-zinc-300 tabular-nums" data-testid={`camera-live-count-${camera.id}`}>
+              {camera.studentCount} {countWord}
+            </span>
+            <span aria-hidden="true"> · </span>
+            <span className="font-mono" data-testid={`camera-cycle-label-${camera.id}`}>
+              {camera.isAnalyzing ? 'Analyzing...' : scanModeLabel}
+            </span>
+            {contactPairsCount > 0 ? (
+              <>
+                <span aria-hidden="true"> · </span>
+                <span className="font-mono text-amber-400">{contactPairsCount} overlap</span>
+              </>
+            ) : null}
+          </p>
         </div>
 
-        {/* Per-Camera Individual Live vs Class Total & Continuous Instant AI Box */}
-        <div className="bg-slate-50 border border-slate-200 rounded-lg p-2.5 space-y-2 text-xs">
-          <div className="flex items-center justify-between gap-2">
-            <div className="flex items-center gap-3 min-w-0">
-              <div className="flex items-center gap-1.5">
-                <span
-                  className={`inline-flex items-center justify-center min-w-[2rem] px-2 py-0.5 rounded-md text-base font-extrabold font-mono tabular-nums ${
-                    camera.status === 'fighting'
-                      ? 'bg-red-100 text-red-800 border border-red-300'
-                      : camera.studentCount === 0
-                        ? 'bg-slate-200 text-slate-700'
-                        : 'bg-emerald-100 text-emerald-900 border border-emerald-300'
-                  }`}
-                  data-testid={`camera-live-count-${camera.id}`}
+        <div className="flex items-center gap-1.5 shrink-0">
+          <button
+            type="button"
+            onClick={() => onAnalyzeCamera(camera.id, false)}
+            disabled={camera.isAnalyzing}
+            aria-label={`Scan AI safety for ${camera.classroomName}`}
+            title="Scan frame now"
+            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white disabled:opacity-50 transition-colors whitespace-nowrap cursor-pointer"
+          >
+            <ScanSearch className="w-3.5 h-3.5" aria-hidden="true" />
+            <span className="hidden sm:inline">{camera.isAnalyzing ? 'Scanning' : 'Scan'}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleToggleLiveMic}
+            aria-label={
+              micActive
+                ? `Stop live microphone on ${camera.classroomName}`
+                : `Listen via microphone on ${camera.classroomName}`
+            }
+            title={micActive ? 'Stop live mic' : 'Enable live mic'}
+            className={`inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
+              micActive
+                ? 'bg-emerald-950/60 border-emerald-500/50 text-emerald-300'
+                : 'bg-[#17181C] border-zinc-800 text-zinc-300 hover:text-white hover:border-zinc-700'
+            }`}
+          >
+            {micActive ? (
+              <Mic className="w-3.5 h-3.5" aria-hidden="true" />
+            ) : (
+              <MicOff className="w-3.5 h-3.5" aria-hidden="true" />
+            )}
+            <span className="hidden xl:inline">{micActive ? 'Live' : 'Mic'}</span>
+          </button>
+
+          <button
+            type="button"
+            role="switch"
+            aria-checked={isAutoAiOn}
+            aria-label={`Toggle autonomous AI for ${camera.classroomName}`}
+            onClick={() => onUpdateCameraSettings(camera.id, { autoAiEnabled: !isAutoAiOn })}
+            className={`px-2 py-1.5 text-[11px] font-medium rounded-md border cursor-pointer whitespace-nowrap ${
+              isAutoAiOn
+                ? 'bg-emerald-950/50 text-emerald-300 border-emerald-700/60'
+                : 'bg-[#17181C] text-zinc-400 border-zinc-800 hover:text-zinc-200'
+            }`}
+          >
+            {isAutoAiOn ? 'Armed' : 'Paused'}
+          </button>
+
+          {!isFocused ? (
+            <button
+              type="button"
+              onClick={() => onToggleFocus(camera.id)}
+              aria-label={`Open dedicated place for ${camera.classroomName}`}
+              title="Inspect camera details"
+              className="inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md border border-zinc-800 bg-[#17181C] text-zinc-300 hover:text-white hover:border-zinc-700 transition-colors whitespace-nowrap cursor-pointer"
+            >
+              <FolderOpen className="w-3.5 h-3.5" aria-hidden="true" />
+              <span className="hidden sm:inline">Inspect</span>
+            </button>
+          ) : null}
+
+          <button
+            type="button"
+            onClick={() => onRemoveCamera(camera.id)}
+            aria-label={`Remove ${camera.classroomName}`}
+            title="Remove camera"
+            className="p-1.5 text-zinc-500 hover:text-red-400 rounded-md hover:bg-zinc-800/80 transition-colors cursor-pointer"
+          >
+            <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+          </button>
+        </div>
+      </div>
+
+      {/* Stream / Error Alerts (only rendered if present) */}
+      {streamError || camera.errorMessage || micError ? (
+        <div className="px-3.5 py-2 border-t border-zinc-800/80 bg-[#0D0E12] text-xs space-y-1">
+          {streamError ? (
+            <p role="alert" className="text-amber-400 font-medium">
+              {streamError}
+            </p>
+          ) : null}
+          {camera.errorMessage ? (
+            <p role="alert" className="text-red-400 font-medium">
+              {camera.errorMessage}
+            </p>
+          ) : null}
+          {micError ? <p className="text-amber-400">{micError}</p> : null}
+        </div>
+      ) : null}
+
+      {/* Focused Command Strip: Live Voice Cue Editor & Threat Assessment (shown cleanly only in Focused Inspect View) */}
+      {isFocused ? (
+        <div className="px-3.5 py-3 border-t border-zinc-800/80 bg-[#0C0D10] space-y-2 text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="text-zinc-400 font-medium">Audio Cue</span>
+              <span className="text-zinc-600" aria-hidden="true">·</span>
+              <span className="font-mono text-[11px] text-zinc-500">
+                {camera.bluetoothDeviceName} ({camera.bluetoothAddress})
+              </span>
+            </div>
+            <div className="flex items-center gap-3">
+              {editingTotal ? (
+                <form
+                  className="inline-flex items-center gap-1"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const num = Number(totalDraft);
+                    onUpdateCameraSettings(camera.id, {
+                      expectedTotalCount: Number.isFinite(num) && num > 0 ? Math.round(num) : undefined,
+                    });
+                    setEditingTotal(false);
+                  }}
                 >
-                  {camera.studentCount}
-                </span>
-                <span className="text-slate-600 font-semibold">
-                  {camera.studentCount === 0 ? 'Empty' : `${countWord} live`}
-                </span>
-              </div>
-              <div>
-                <span className="text-slate-500">Class total: </span>
-                {editingTotal ? (
-                  <form
-                    className="inline-flex items-center gap-1"
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      const num = Number(totalDraft);
-                      onUpdateCameraSettings(camera.id, {
-                        expectedTotalCount: Number.isFinite(num) && num > 0 ? Math.round(num) : undefined,
-                      });
-                      setEditingTotal(false);
-                    }}
-                  >
-                    <input
-                      type="number"
-                      min={0}
-                      max={10000}
-                      aria-label={`Class total for ${camera.classroomName}`}
-                      value={totalDraft}
-                      onChange={(e) => setTotalDraft(e.target.value)}
-                      className="w-14 text-xs px-1.5 py-0.5 border border-slate-300 rounded bg-white text-slate-900"
-                    />
-                    <button
-                      type="submit"
-                      className="text-[11px] font-semibold text-blue-600 hover:underline cursor-pointer"
-                    >
-                      Save
-                    </button>
-                  </form>
-                ) : (
+                  <input
+                    type="number"
+                    min={0}
+                    max={10000}
+                    aria-label={`Class total for ${camera.classroomName}`}
+                    value={totalDraft}
+                    onChange={(e) => setTotalDraft(e.target.value)}
+                    className="w-14 text-xs px-1.5 py-0.5 border border-zinc-700 rounded bg-[#09090B] text-zinc-100"
+                  />
                   <button
-                    type="button"
-                    onClick={() => setEditingTotal(true)}
-                    className="font-mono font-semibold text-slate-800 hover:text-blue-600 underline decoration-dotted cursor-pointer tabular-nums"
+                    type="submit"
+                    className="text-[11px] font-semibold text-zinc-100 hover:underline cursor-pointer"
                   >
+                    Save
+                  </button>
+                </form>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setEditingTotal(true)}
+                  className="text-xs text-zinc-400 hover:text-zinc-100 cursor-pointer whitespace-nowrap"
+                >
+                  Total:{' '}
+                  <span className="font-mono text-zinc-200 tabular-nums">
                     {typeof camera.expectedTotalCount === 'number' && camera.expectedTotalCount > 0
                       ? camera.expectedTotalCount
                       : 'Set'}
-                  </button>
-                )}
-              </div>
-            </div>
-
-            <button
-              type="button"
-              role="switch"
-              aria-checked={isAutoAiOn}
-              aria-label={`Toggle autonomous AI for ${camera.classroomName}`}
-              onClick={() => onUpdateCameraSettings(camera.id, { autoAiEnabled: !isAutoAiOn })}
-              className={`px-2 py-0.5 text-[11px] font-medium rounded border cursor-pointer whitespace-nowrap ${
-                isAutoAiOn
-                  ? 'bg-blue-600 text-white border-blue-600'
-                  : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-100'
-              }`}
-            >
-              {isAutoAiOn ? 'Auto AI On' : 'Auto AI Off'}
-            </button>
-          </div>
-
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-1.5 min-w-0">
-              <span
-                className={`inline-block w-2 h-2 rounded-full shrink-0 ${
-                  camera.isAnalyzing
-                    ? 'bg-blue-600 animate-pulse'
-                    : isAutoAiOn && hasAiFeedSignal
-                      ? 'bg-emerald-500'
-                      : 'bg-slate-400'
-                }`}
-                aria-hidden="true"
-              />
-              <span className="font-medium text-slate-700 truncate" data-testid={`camera-cycle-label-${camera.id}`}>
-                {camera.isAnalyzing ? 'AI analyzing live frame...' : scanModeLabel}
-              </span>
-              {isAutoAiOn && hasAiFeedSignal && liveMotionPercent > 0 ? (
-                <span className="text-[10px] font-mono text-slate-500 tabular-nums shrink-0">
-                  Δ{liveMotionPercent.toFixed(0)}%
-                </span>
-              ) : null}
-            </div>
-
-            <select
-              aria-label={`AI model for ${camera.classroomName}`}
-              value={activeCameraAiModel}
-              onChange={(e) =>
-                onUpdateCameraSettings(camera.id, { aiModel: e.target.value as AiEngineModel })
-              }
-              className="text-[11px] bg-white border border-slate-300 rounded px-1.5 py-0.5 text-slate-800"
-            >
-              <option value="gemini-4-neon">Gemini 4 Neon</option>
-              <option value="gemini-4-hydrogen">Gemini 4 Hydrogen</option>
-              <option value="gpt-6-astra">GPT-6 Astra (High)</option>
-              <option value="gpt-6-sol">GPT-6 Sol</option>
-            </select>
-          </div>
-
-          {isAutoAiOn && hasAiFeedSignal ? (
-            <div className="w-full h-1 bg-slate-200 rounded-full overflow-hidden" aria-hidden="true">
-              <div
-                className={`h-full transition-all duration-200 ${
-                  camera.isAnalyzing ? 'bg-blue-600 w-full animate-pulse' : 'bg-emerald-500'
-                }`}
-                style={
-                  camera.isAnalyzing
-                    ? undefined
-                    : { width: `${Math.min(100, Math.max(18, Math.round(liveMotionPercent * 4)))}%` }
-                }
-              />
-            </div>
-          ) : null}
-
-          {camera.lastAnalysis ? (
-            <div className="text-[11px] text-slate-600 flex flex-wrap items-center gap-1.5 pt-0.5">
-              <span className="font-semibold text-slate-700">Detected:</span>
-              {camera.lastAnalysis.detectedPeople && camera.lastAnalysis.detectedPeople.length > 0 ? (
-                camera.lastAnalysis.detectedPeople.map((p, idx) => (
-                  <span
-                    key={`${p.label}-${idx}`}
-                    className="inline-flex items-center px-1.5 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-900 font-mono text-[10px]"
-                  >
-                    #{idx + 1} {p.label} ({p.confidence}%)
                   </span>
-                ))
-              ) : (
-                <span className="text-slate-500 font-medium">0 humans in frame (Empty)</span>
+                </button>
               )}
-            </div>
-          ) : null}
-        </div>
-
-        <div className="border-t border-slate-100 pt-2.5 space-y-1.5 text-xs">
-          <div className="flex items-center justify-between gap-2">
-            <span className="font-medium text-slate-600">
-              Live speech{micActive ? ' · Listening' : ''}
-            </span>
-            <div className="flex items-center gap-3">
               {camera.liveTranscript && !editingVoice ? (
                 <button
                   type="button"
                   onClick={() => onUpdateTranscript(camera.id, '', undefined, 'audio-meter')}
-                  className="text-xs text-slate-400 hover:text-slate-700 font-medium cursor-pointer whitespace-nowrap"
+                  className="text-xs text-zinc-500 hover:text-zinc-200 cursor-pointer"
                 >
                   Clear
                 </button>
@@ -1248,16 +1487,16 @@ export function CameraFeedCard({
               <button
                 type="button"
                 onClick={() => setEditingVoice((prev) => !prev)}
-                className="text-xs text-slate-500 hover:text-slate-900 font-medium cursor-pointer whitespace-nowrap"
+                className="text-xs text-zinc-300 hover:text-white cursor-pointer whitespace-nowrap"
               >
                 {editingVoice ? 'Cancel' : 'Edit cue'}
               </button>
               <button
                 type="button"
                 onClick={() => onToggleVoiceListening(camera.id)}
-                className="text-xs text-blue-600 hover:underline font-medium cursor-pointer whitespace-nowrap"
+                className="text-xs text-zinc-300 hover:text-white font-medium cursor-pointer whitespace-nowrap"
               >
-                {camera.voiceListeningEnabled ? 'Mute voice' : 'Enable voice'}
+                {camera.voiceListeningEnabled ? 'Mute' : 'Unmute'}
               </button>
             </div>
           </div>
@@ -1276,12 +1515,12 @@ export function CameraFeedCard({
                 aria-label={`Voice transcript for ${camera.classroomName}`}
                 value={voiceDraft}
                 onChange={(e) => setVoiceDraft(e.target.value)}
-                className="flex-1 min-w-0 text-xs px-2 py-1 border border-slate-300 rounded-md text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-600"
-                placeholder="Enter voice note or live speech text..."
+                className="flex-1 min-w-0 text-xs px-2.5 py-1.5 border border-zinc-700 rounded-md bg-[#09090B] text-zinc-100 focus-visible:outline-2 focus-visible:outline-zinc-400"
+                placeholder="Type speech or distress phrase..."
               />
               <button
                 type="submit"
-                className="px-2.5 py-1 text-xs font-medium rounded-md bg-blue-600 text-white hover:bg-blue-700 cursor-pointer shrink-0"
+                className="px-3 py-1.5 text-xs font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white cursor-pointer shrink-0"
               >
                 Save
               </button>
@@ -1289,106 +1528,42 @@ export function CameraFeedCard({
           ) : (
             <p
               data-testid={`live-speech-${camera.id}`}
-              className="text-slate-700 leading-relaxed line-clamp-2"
+              className="text-zinc-300 leading-relaxed"
             >
               {camera.voiceListeningEnabled
                 ? camera.liveTranscript ||
                   (micActive
-                    ? 'Listening live for speech... speak to transcribe.'
-                    : 'No speech transcript captured yet. Click Live Mic to listen.')
-                : 'Voice monitoring paused for this zone.'}
+                    ? 'Listening live for speech...'
+                    : 'No speech captured yet · Click Mic or Edit cue to test voice alerts.')
+                : 'Voice monitoring muted for this camera.'}
             </p>
           )}
 
           {camera.lastAnalysis ? (
-            <div className="space-y-0.5">
-              <p className="text-slate-500 leading-relaxed">
-                <span className="font-medium text-slate-700">
-                  AI check{modelLabel ? ` (${modelLabel})` : ''}:
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-zinc-800/70">
+              <p className="text-zinc-400 leading-relaxed flex-1 min-w-0">
+                <span className="text-zinc-200 font-medium">
+                  Assessment{modelLabel ? ` (${modelLabel})` : ''}:
                 </span>{' '}
                 {camera.lastAnalysis.summary}
               </p>
-              {camera.lastAnalysis.fallbackNote ? (
-                <p className="text-[11px] text-amber-700">{camera.lastAnalysis.fallbackNote}</p>
-              ) : null}
-            </div>
-          ) : (
-            <p className="text-slate-400">
-              Continuous instant AI scans every change automatically with zero wait limit, or click Scan Now.
-            </p>
-          )}
-
-          {streamError ? (
-            <p role="alert" className="text-amber-700 font-medium">
-              {streamError}
-            </p>
-          ) : null}
-          {camera.errorMessage ? (
-            <p role="alert" className="text-red-600 font-medium">
-              {camera.errorMessage}
-            </p>
-          ) : null}
-          {micError ? <p className="text-amber-700">{micError}</p> : null}
-        </div>
-
-        <div className="mt-auto pt-2.5 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2">
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={() => onAnalyzeCamera(camera.id, false)}
-              disabled={camera.isAnalyzing}
-              aria-label={`Scan AI safety for ${camera.classroomName}`}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-60 transition-colors whitespace-nowrap cursor-pointer"
-            >
-              <ScanSearch className="w-3.5 h-3.5" aria-hidden="true" />
-              <span>{camera.isAnalyzing ? 'Analyzing...' : 'Scan Now'}</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={handleToggleLiveMic}
-              aria-label={
-                micActive
-                  ? `Stop live microphone on ${camera.classroomName}`
-                  : `Listen via microphone on ${camera.classroomName}`
-              }
-              className={`inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap cursor-pointer ${
-                micActive
-                  ? 'bg-blue-50 border-blue-300 text-blue-700'
-                  : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-50'
-              }`}
-            >
-              {micActive ? (
-                <Mic className="w-3.5 h-3.5" aria-hidden="true" />
-              ) : (
-                <MicOff className="w-3.5 h-3.5" aria-hidden="true" />
-              )}
-              <span>{micActive ? 'Mic Live' : 'Live Mic'}</span>
-            </button>
-
-            {!isFocused ? (
-              <button
-                type="button"
-                onClick={() => onToggleFocus(camera.id)}
-                aria-label={`Open dedicated place for ${camera.classroomName}`}
-                className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-lg border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 transition-colors whitespace-nowrap cursor-pointer"
+              <select
+                aria-label={`AI model for ${camera.classroomName}`}
+                value={activeCameraAiModel}
+                onChange={(e) =>
+                  onUpdateCameraSettings(camera.id, { aiModel: e.target.value as AiEngineModel })
+                }
+                className="text-[11px] bg-[#17181C] border border-zinc-800 rounded px-2 py-1 text-zinc-300 shrink-0"
               >
-                <FolderOpen className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>Open Place</span>
-              </button>
-            ) : null}
-          </div>
-
-          <button
-            type="button"
-            onClick={() => onRemoveCamera(camera.id)}
-            aria-label={`Remove ${camera.classroomName}`}
-            className="p-1.5 text-slate-400 hover:text-red-600 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
-          >
-            <Trash2 className="w-4 h-4" aria-hidden="true" />
-          </button>
+                <option value="gemini-4-neon">Gemini 4 Neon</option>
+                <option value="gemini-4-hydrogen">Gemini 4 Hydrogen</option>
+                <option value="gpt-6-astra">GPT-6 Astra</option>
+                <option value="gpt-6-sol">GPT-6 Sol</option>
+              </select>
+            </div>
+          ) : null}
         </div>
-      </div>
+      ) : null}
     </article>
   );
 }

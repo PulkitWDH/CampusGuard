@@ -4,9 +4,12 @@ import type {
   BluetoothDeviceCandidate,
   ClassroomAnalysis,
   ClassroomCamera,
+  DetectedObjectBox,
   DetectedPersonBox,
   FacilityMode,
   IncidentAlert,
+  ThreatCategory,
+  ThreatSensitivity,
 } from '../types';
 
 const CAMERA_KEYWORDS = [
@@ -962,22 +965,30 @@ export function isSamePersonDuplicate(
   b: [number, number, number, number]
 ): boolean {
   const iou = computeBoxIoU(a, b);
-  if (iou > 0.72) return true;
+  if (iou > 0.5) return true;
 
-  // Only merge nested boxes when they truly belong to the SAME person
-  // (e.g. a head/torso box inside the exact same person's body box),
-  // NOT two distinct people standing side-by-side or front-and-back.
+  // Merge nested/sliced boxes belonging to the same person (e.g. head/torso sub-box inside full body)
+  // while keeping two genuinely offset front-and-back people separate.
   const containment = computeBoxContainment(a, b);
-  if (containment > 0.85) {
+  if (containment > 0.78) {
+    return true;
+  }
+  if (containment > 0.65) {
     const cxA = (a[1] + a[3]) / 2;
     const cxB = (b[1] + b[3]) / 2;
     const maxW = Math.max(1, a[3] - a[1], b[3] - b[1]);
-    const maxH = Math.max(1, a[2] - a[0], b[2] - b[0]);
-    const horizontalAligned = Math.abs(cxA - cxB) <= 0.24 * maxW;
-    const topAligned = Math.abs(a[0] - b[0]) <= 0.24 * maxH;
-    if (horizontalAligned && topAligned) {
+    if (Math.abs(cxA - cxB) <= 0.3 * maxW) {
       return true;
     }
+  }
+
+  // Merge boxes that share almost the same horizontal & vertical span (jittered duplicate of same person)
+  const interX = Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1]));
+  const interY = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0]));
+  const minW = Math.max(1, Math.min(a[3] - a[1], b[3] - b[1]));
+  const minH = Math.max(1, Math.min(a[2] - a[0], b[2] - b[0]));
+  if (interX / minW >= 0.76 && interY / minH >= 0.68) {
+    return true;
   }
 
   return false;
@@ -1059,7 +1070,7 @@ export function mergeTiledPersonDetections(
   fullFrameBoxes: DetectedPersonBox[],
   leftTileBoxes: DetectedPersonBox[],
   rightTileBoxes: DetectedPersonBox[],
-  minConfidence = 38
+  minConfidence = 48
 ): DetectedPersonBox[] {
   const describeZone = (xmin: number, xmax: number): string => {
     const center = (xmin + xmax) / 2;
@@ -1090,28 +1101,35 @@ export function mergeTiledPersonDetections(
     };
   });
 
-  // Drop tile-seam clipped half-boxes if a complete full-frame box already wraps that person
-  const isClippedSeamDuplicate = (
+  // Drop ANY tile fragment that slices or overlaps an already-detected full-frame person
+  const isTileFragmentOfFullPerson = (
     tileBox: DetectedPersonBox,
     touchesSeam: boolean
   ): boolean => {
-    if (!touchesSeam) return false;
+    const [tymin, txmin, tymax, txmax] = tileBox.box_2d;
+    const tw = Math.max(1, txmax - txmin);
+    const th = Math.max(1, tymax - tymin);
     return fullFrameBoxes.some((full) => {
+      const [fymin, fxmin, fymax, fxmax] = full.box_2d;
       const containment = computeBoxContainment(full.box_2d, tileBox.box_2d);
-      const maxH = Math.max(1, full.box_2d[2] - full.box_2d[0], tileBox.box_2d[2] - tileBox.box_2d[0]);
-      const topClose = Math.abs(full.box_2d[0] - tileBox.box_2d[0]) <= 0.25 * maxH;
-      return containment > 0.72 && topClose;
+      if (containment >= 0.55) return true;
+      if (touchesSeam && containment >= 0.25) return true;
+
+      const interX = Math.max(0, Math.min(fxmax, txmax) - Math.max(fxmin, txmin));
+      const interY = Math.max(0, Math.min(fymax, tymax) - Math.max(fymin, tymin));
+      if (interX / tw >= 0.6 && interY / th >= 0.45) return true;
+      return false;
     });
   };
 
   const filteredLeft = mappedLeft.filter(
-    (b) => !isClippedSeamDuplicate(b, b.box_2d[3] >= 585)
+    (b) => !isTileFragmentOfFullPerson(b, b.box_2d[3] >= 560)
   );
   const filteredRight = mappedRight.filter(
-    (b) => !isClippedSeamDuplicate(b, b.box_2d[1] <= 415)
+    (b) => !isTileFragmentOfFullPerson(b, b.box_2d[1] <= 440)
   );
 
-  // Merge full-frame + unclipped tile boxes with person-aware deduplication
+  // Merge full-frame + unclipped tile boxes with strict person-aware deduplication
   return filterVerifiedPersonDetections(
     [...fullFrameBoxes, ...filteredLeft, ...filteredRight],
     minConfidence
@@ -1121,6 +1139,10 @@ export function mergeTiledPersonDetections(
 export interface TrackedPersonEntry {
   box: DetectedPersonBox;
   missedFrames: number;
+  confirmedFrames?: number;
+  torsoSignature?: number[];
+  faceOccluded?: boolean;
+  occludedBy?: string;
 }
 
 export interface PersonTrackerState {
@@ -1128,23 +1150,134 @@ export interface PersonTrackerState {
   pending: DetectedPersonBox[];
 }
 
+/**
+ * Compares two compact lower-torso pixel signatures (0..255 luma/RGB values sampled from the
+ * shoulders/chest region of a person's bounding box). Returns a similarity score in [0, 1]
+ * that stays high (>= 0.64) when a person covers their face with a racket/hand/book while
+ * their torso remains in frame, and drops sharply (< 0.45) when they walk away.
+ */
+export function computeTorsoPatchSimilarity(
+  sigA: number[] | null | undefined,
+  sigB: number[] | null | undefined
+): number {
+  if (!sigA || !sigB || sigA.length === 0 || sigA.length !== sigB.length) {
+    return 0;
+  }
+  let diffSum = 0;
+  let meanA = 0;
+  let meanB = 0;
+  for (let i = 0; i < sigA.length; i += 1) {
+    diffSum += Math.abs(sigA[i] - sigB[i]);
+    meanA += sigA[i];
+    meanB += sigB[i];
+  }
+  meanA /= sigA.length;
+  meanB /= sigB.length;
+
+  const madScore = Math.max(0, 1 - diffSum / (sigA.length * 105));
+
+  // Combine with zero-mean cosine correlation & reject flat uniform walls when person has left
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < sigA.length; i += 1) {
+    const da = sigA[i] - meanA;
+    const db = sigB[i] - meanB;
+    dot += da * db;
+    normA += da * da;
+    normB += db * db;
+  }
+  const stdB = Math.sqrt(normB / sigB.length);
+  if (stdB < 5 && Math.sqrt(normA / sigA.length) >= 10) {
+    // Previously textured torso became a flat wall/background -> person left
+    return 0;
+  }
+  const denom = Math.sqrt(normA * normB);
+  const corrScore = denom > 1e-4 ? Math.max(0, (dot / denom + 1) / 2) : madScore;
+
+  return Math.round((madScore * 0.62 + corrScore * 0.38) * 1000) / 1000;
+}
+
+/**
+ * Checks whether any detected handheld occluder object (e.g. Tennis Racket, Book, Backpack,
+ * Phone, Umbrella) overlaps the upper 60% (head/face/upper-chest zone) of a person's box.
+ */
+export function findFaceOccluderForPerson(
+  personBox: [number, number, number, number],
+  occluderObjects: DetectedObjectBox[] | undefined
+): DetectedObjectBox | null {
+  if (!occluderObjects || occluderObjects.length === 0) return null;
+  const [pymin, pxmin, pymax, pxmax] = personBox;
+  const pw = Math.max(1, pxmax - pxmin);
+  const ph = Math.max(1, pymax - pymin);
+
+  // Upper 62% of the person's box covers head, face, and raised hands holding a racket/object
+  const headZone: [number, number, number, number] = [
+    Math.max(0, pymin - Math.round(ph * 0.12)),
+    Math.max(0, pxmin - Math.round(pw * 0.1)),
+    Math.min(1000, pymin + Math.round(ph * 0.62)),
+    Math.min(1000, pxmax + Math.round(pw * 0.1)),
+  ];
+
+  let best: DetectedObjectBox | null = null;
+  let bestOverlap = 0;
+
+  for (const obj of occluderObjects) {
+    const [oymin, oxmin, oymax, oxmax] = obj.box_2d;
+    const interY = Math.max(0, Math.min(headZone[2], oymax) - Math.max(headZone[0], oymin));
+    const interX = Math.max(0, Math.min(headZone[3], oxmax) - Math.max(headZone[1], oxmin));
+    const interArea = interX * interY;
+    if (interArea <= 0) continue;
+
+    const headArea = Math.max(1, (headZone[2] - headZone[0]) * (headZone[3] - headZone[1]));
+    const objArea = Math.max(1, (oymax - oymin) * (oxmax - oxmin));
+    const coverage = Math.max(interArea / headArea, interArea / objArea);
+
+    if (coverage >= 0.16 && coverage > bestOverlap) {
+      bestOverlap = coverage;
+      best = obj;
+    }
+  }
+  return best;
+}
+
 function boxesSpatiallyMatch(
   a: [number, number, number, number],
   b: [number, number, number, number]
 ): boolean {
-  if (computeBoxIoU(a, b) >= 0.24) return true;
+  if (computeBoxIoU(a, b) >= 0.22) return true;
   const cxA = (a[1] + a[3]) / 2;
   const cyA = (a[0] + a[2]) / 2;
   const cxB = (b[1] + b[3]) / 2;
   const cyB = (b[0] + b[2]) / 2;
   const maxDim = Math.max(1, a[3] - a[1], a[2] - a[0], b[3] - b[1], b[2] - b[0]);
   const dist = Math.hypot(cxA - cxB, cyA - cyB);
-  return dist <= 0.38 * maxDim;
+  return dist <= 0.42 * maxDim;
+}
+
+function formatOccludedPersonBox(
+  box: DetectedPersonBox,
+  occludedBy?: string
+): DetectedPersonBox {
+  const cleanLabel = occludedBy
+    ? `Person (Face Covered · ${occludedBy})`
+    : 'Person (Face Occluded)';
+  return {
+    ...box,
+    label: cleanLabel,
+    faceOccluded: true,
+    occludedBy: occludedBy || 'Object / Hand',
+  };
 }
 
 /**
- * Multi-frame person tracker that locks onto 2nd/3rd/4th+ partially occluded people
- * without single-frame flicker (2 -> 1 -> 2), while clearing quickly to 0 on empty rooms.
+ * Multi-frame occlusion-resilient person tracker.
+ * - Locks onto 2nd/3rd/4th+ partially occluded people without 2->1->2 flicker.
+ * - Recognizes when a person covers their face with a racket, book, bag, or hand via:
+ *   (1) weak torso/body recovery detections (18-37%),
+ *   (2) handheld occluder overlap over the head/face zone, and
+ *   (3) lower-torso visual signature continuity (shoulders/chest pixels remain present).
+ * - Still clears promptly to 0 when people truly leave the room.
  */
 export function stepPersonTracker(
   prevState: PersonTrackerState,
@@ -1153,14 +1286,23 @@ export function stepPersonTracker(
     instantConfidence?: number;
     minConfidence?: number;
     maxMissedFrames?: number;
+    maxOccludedFrames?: number;
+    weakDetections?: DetectedPersonBox[];
+    occluderObjects?: DetectedObjectBox[];
+    sampleTorsoSignature?: (box_2d: [number, number, number, number]) => number[] | null;
   }
 ): { nextState: PersonTrackerState; people: DetectedPersonBox[] } {
-  const instantConfidence = options?.instantConfidence ?? 52;
-  const minConfidence = options?.minConfidence ?? 38;
+  const instantConfidence = options?.instantConfidence ?? 62;
+  const minConfidence = options?.minConfidence ?? 48;
   const maxMissedFrames = options?.maxMissedFrames ?? 2;
+  const maxOccludedFrames = options?.maxOccludedFrames ?? 35;
+  const weakDetections = options?.weakDetections ?? [];
+  const occluderObjects = options?.occluderObjects ?? [];
+  const sampleTorso = options?.sampleTorsoSignature;
 
   const usableRaw = rawDetections.filter((d) => d.confidence >= minConfidence);
   const matchedConfirmedIdx = new Set<number>();
+  const matchedWeakIdx = new Set<number>();
   const nextConfirmed: TrackedPersonEntry[] = [];
   const nextPending: DetectedPersonBox[] = [];
 
@@ -1179,41 +1321,208 @@ export function stepPersonTracker(
       }
     }
 
+    const faceOccluder = findFaceOccluderForPerson(raw.box_2d, occluderObjects);
+    const taggedBox = faceOccluder
+      ? formatOccludedPersonBox(raw, faceOccluder.label)
+      : { ...raw, faceOccluded: false, occludedBy: undefined };
+    const freshTorso = sampleTorso ? sampleTorso(raw.box_2d) ?? undefined : undefined;
+
     if (bestIdx !== -1) {
       matchedConfirmedIdx.add(bestIdx);
-      nextConfirmed.push({ box: raw, missedFrames: 0 });
+      const prevTrack = prevState.confirmed[bestIdx];
+      nextConfirmed.push({
+        box: taggedBox,
+        missedFrames: 0,
+        confirmedFrames: Math.min(100, (prevTrack.confirmedFrames ?? 1) + 1),
+        torsoSignature: freshTorso ?? prevTrack.torsoSignature,
+        faceOccluded: Boolean(faceOccluder),
+        occludedBy: faceOccluder?.label,
+      });
       continue;
     }
 
     // High-confidence person locks in immediately on frame 1
     if (raw.confidence >= instantConfidence) {
-      nextConfirmed.push({ box: raw, missedFrames: 0 });
+      nextConfirmed.push({
+        box: taggedBox,
+        missedFrames: 0,
+        confirmedFrames: 1,
+        torsoSignature: freshTorso,
+        faceOccluded: Boolean(faceOccluder),
+        occludedBy: faceOccluder?.label,
+      });
       continue;
     }
 
-    // Secondary/partially occluded person (38-51%) confirms once seen in 2 consecutive frames
+    // Secondary/partially occluded person (48-61%) confirms once seen in 2 consecutive frames
     const matchedPending = prevState.pending.some((p) =>
       boxesSpatiallyMatch(p.box_2d, raw.box_2d)
     );
     if (matchedPending) {
-      nextConfirmed.push({ box: raw, missedFrames: 0 });
+      nextConfirmed.push({
+        box: taggedBox,
+        missedFrames: 0,
+        confirmedFrames: 2,
+        torsoSignature: freshTorso,
+        faceOccluded: Boolean(faceOccluder),
+        occludedBy: faceOccluder?.label,
+      });
     } else {
-      nextPending.push(raw);
+      nextPending.push(taggedBox);
     }
   }
 
-  // Gracefully hold unmatched confirmed tracks across brief occlusion blinks,
-  // but drop promptly on empty frames (max 1 grace frame when room reads 0)
+  // Helper: detect if an unmatched old track actually moved into an already-confirmed box
+  // (prevents spawning a phantom 2nd "ghost" person whenever 1 person moves across the frame!)
+  const isNearExistingLiveTrack = (box: [number, number, number, number]): boolean => {
+    const cxA = (box[1] + box[3]) / 2;
+    const cyA = (box[0] + box[2]) / 2;
+    const wA = Math.max(1, box[3] - box[1]);
+    return nextConfirmed.some((live) => {
+      const b = live.box.box_2d;
+      if (computeBoxIoU(box, b) >= 0.12) return true;
+      if (computeBoxContainment(box, b) >= 0.4) return true;
+      const cxB = (b[1] + b[3]) / 2;
+      const cyB = (b[0] + b[2]) / 2;
+      const maxDim = Math.max(1, wA, box[2] - box[0], b[3] - b[1], b[2] - b[0]);
+      if (Math.hypot(cxA - cxB, cyA - cyB) <= 0.55 * maxDim) return true;
+      return false;
+    });
+  };
+
+  // Occlusion recovery for previously confirmed tracks that COCO-SSD missed this frame
   const emptyGrace = usableRaw.length === 0 ? 1 : maxMissedFrames;
   for (let i = 0; i < prevState.confirmed.length; i += 1) {
     if (matchedConfirmedIdx.has(i)) continue;
     const prev = prevState.confirmed[i];
+    const prevBox = prev.box.box_2d;
+
+    // ANTI-GHOST GUARD: If this track sits right next to/overlapping a live confirmed person,
+    // the person simply shifted position — drop the stale ghost immediately!
+    if (isNearExistingLiveTrack(prevBox)) {
+      continue;
+    }
+
+    // 1. Check weak/occluded person detections (18-47% confidence) matching this person's position
+    let bestWeakIdx = -1;
+    let bestWeakScore = -1;
+    for (let w = 0; w < weakDetections.length; w += 1) {
+      if (matchedWeakIdx.has(w)) continue;
+      const weak = weakDetections[w];
+      if (isNearExistingLiveTrack(weak.box_2d)) continue;
+      if (!boxesSpatiallyMatch(prevBox, weak.box_2d)) continue;
+      const iou = computeBoxIoU(prevBox, weak.box_2d);
+      if (iou > bestWeakScore) {
+        bestWeakScore = iou;
+        bestWeakIdx = w;
+      }
+    }
+
+    if (bestWeakIdx !== -1) {
+      matchedWeakIdx.add(bestWeakIdx);
+      const weak = weakDetections[bestWeakIdx];
+      const faceOccluder =
+        findFaceOccluderForPerson(weak.box_2d, occluderObjects) ??
+        findFaceOccluderForPerson(prevBox, occluderObjects);
+      const liveTorso = sampleTorso ? sampleTorso(weak.box_2d) ?? undefined : undefined;
+      nextConfirmed.push({
+        box: formatOccludedPersonBox(
+          {
+            ...weak,
+            confidence: Math.max(weak.confidence, Math.min(72, prev.box.confidence - 6)),
+          },
+          faceOccluder?.label ?? prev.occludedBy
+        ),
+        missedFrames: 0,
+        confirmedFrames: Math.min(100, (prev.confirmedFrames ?? 1) + 1),
+        torsoSignature: prev.torsoSignature ?? liveTorso,
+        faceOccluded: true,
+        occludedBy: faceOccluder?.label ?? prev.occludedBy ?? 'Object / Hand',
+      });
+      continue;
+    }
+
+    // 2. Check handheld occluder (e.g. Tennis Racket / Book over face) AND/OR textured torso continuity
+    const faceOccluder = findFaceOccluderForPerson(prevBox, occluderObjects);
+    const liveTorso =
+      sampleTorso && prev.torsoSignature ? sampleTorso(prevBox) : null;
+    const torsoSim =
+      liveTorso && prev.torsoSignature
+        ? computeTorsoPatchSimilarity(prev.torsoSignature, liveTorso)
+        : 0;
+
+    const isInteriorPerson = prevBox[1] > 30 && prevBox[3] < 970;
+    const isSolidTrack = (prev.confirmedFrames ?? 1) >= 2;
+    const torsoStillPresent = torsoSim >= 0.74;
+    const occludedButPresent =
+      isSolidTrack &&
+      isInteriorPerson &&
+      (Boolean(faceOccluder) || torsoStillPresent);
+
+    if (occludedButPresent) {
+      const strongHold = Boolean(faceOccluder) && (torsoSim >= 0.58 || !prev.torsoSignature);
+      const effectiveCap = faceOccluder ? maxOccludedFrames : Math.min(18, maxOccludedFrames);
+      const nextMissed = strongHold ? Math.min(prev.missedFrames, 1) : prev.missedFrames + 1;
+      if (nextMissed <= effectiveCap) {
+        const occluderName = faceOccluder?.label ?? prev.occludedBy ?? 'Object / Hand';
+        nextConfirmed.push({
+          box: formatOccludedPersonBox(
+            {
+              ...prev.box,
+              confidence: Math.max(55, Math.min(78, prev.box.confidence)),
+            },
+            occluderName
+          ),
+          missedFrames: nextMissed,
+          confirmedFrames: prev.confirmedFrames ?? 2,
+          torsoSignature: prev.torsoSignature,
+          faceOccluded: true,
+          occludedBy: occluderName,
+        });
+        continue;
+      }
+    }
+
+    // 3. Standard brief blink grace (drops promptly to 0 when person actually leaves)
     const nextMissed = prev.missedFrames + 1;
     if (nextMissed <= emptyGrace) {
       nextConfirmed.push({
-        box: prev.box,
+        ...prev,
         missedFrames: nextMissed,
       });
+    }
+  }
+
+  // 4. Even if someone enters the frame ALREADY holding a racket/book over their face,
+  // promote a weak torso detection overlapping a handheld occluder — ONLY if not overlapping an existing person
+  for (let w = 0; w < weakDetections.length; w += 1) {
+    if (matchedWeakIdx.has(w)) continue;
+    const weak = weakDetections[w];
+    if (weak.confidence < 24) continue;
+    if (isNearExistingLiveTrack(weak.box_2d)) continue;
+    const [ymin, xmin, ymax, xmax] = weak.box_2d;
+    const bw = xmax - xmin;
+    const bh = ymax - ymin;
+    if (bw < 110 || bh < 200) continue;
+
+    const faceOccluder = findFaceOccluderForPerson(weak.box_2d, occluderObjects);
+    if (!faceOccluder) continue;
+
+    const tagged = formatOccludedPersonBox(weak, faceOccluder.label);
+    const matchedPending = prevState.pending.some((p) =>
+      boxesSpatiallyMatch(p.box_2d, weak.box_2d)
+    );
+    if (matchedPending) {
+      nextConfirmed.push({
+        box: tagged,
+        missedFrames: 0,
+        confirmedFrames: 2,
+        torsoSignature: sampleTorso ? sampleTorso(weak.box_2d) ?? undefined : undefined,
+        faceOccluded: true,
+        occludedBy: faceOccluder.label,
+      });
+    } else {
+      nextPending.push(tagged);
     }
   }
 
@@ -1251,35 +1560,186 @@ const LOCAL_CRITICAL_VOICE_PATTERN =
 const LOCAL_WARNING_VOICE_PATTERN =
   /\b(stop|get off|shut up|hey|scream|screaming|loud|argument|push|shove)\b/i;
 
-/**
- * Pure on-device safety evaluation used seamlessly whenever cloud AI quota (HTTP 429)
- * is exhausted. Combines verified local multi-person boxes, overlapping physical contact,
- * crowding around a victim, decibel spikes, and live voice-recognition transcript cues
- * (including dedicated Beating and Bullying alerts) with ZERO cloud API calls.
- */
-export function evaluateLocalSafetyAnalysis(params: {
-  detectedPeople: DetectedPersonBox[];
-  voiceTranscript: string;
-  audioLevel: number;
-  facilityMode: FacilityMode;
-  audioSpikeDetected?: boolean;
-}): ClassroomAnalysis {
-  const people = params.detectedPeople;
-  const count = people.length;
-  const transcript = (params.voiceTranscript || '').trim();
-  const audioLevel = Number.isFinite(params.audioLevel) ? params.audioLevel : 0;
+function computeBoxHorizontalGap(
+  a: [number, number, number, number],
+  b: [number, number, number, number]
+): number {
+  if (a[3] < b[1]) return b[1] - a[3];
+  if (b[3] < a[1]) return a[1] - b[3];
+  return 0;
+}
 
+function computeVerticalOverlapRatio(
+  a: [number, number, number, number],
+  b: [number, number, number, number]
+): number {
+  const interTop = Math.max(a[0], b[0]);
+  const interBottom = Math.min(a[2], b[2]);
+  const interH = Math.max(0, interBottom - interTop);
+  const minH = Math.max(1, Math.min(a[2] - a[0], b[2] - b[0]));
+  return interH / minH;
+}
+
+function analyzeVisualPairGeometry(
+  people: DetectedPersonBox[],
+  sensitivity: ThreatSensitivity = 'standard'
+): {
+  closeContactPairs: number;
+  crowdingTargetDetected: boolean;
+  corneredPairDetected: boolean;
+  hasHorizontalCollapsedPerson: boolean;
+  maxPairIoU: number;
+} {
+  const count = people.length;
+  if (count === 0) {
+    return {
+      closeContactPairs: 0,
+      crowdingTargetDetected: false,
+      corneredPairDetected: false,
+      hasHorizontalCollapsedPerson: false,
+      maxPairIoU: 0,
+    };
+  }
+
+  // Require real bounding-box collision (NOT mere sitting side-by-side) and exclude nested duplicates
+  const collisionIouThreshold = sensitivity === 'high' ? 0.12 : 0.16;
+  const crowdGapThreshold = sensitivity === 'high' ? 38 : 26;
+  const crowdDegree = new Array<number>(count).fill(0);
   let closeContactPairs = 0;
+  let maxPairIoU = 0;
+  let hasHorizontalCollapsedPerson = false;
+
+  for (let i = 0; i < count; i += 1) {
+    const [ymin, xmin, ymax, xmax] = people[i].box_2d;
+    const w = Math.max(1, xmax - xmin);
+    const h = Math.max(1, ymax - ymin);
+    // Person knocked down or lying horizontally on floor
+    if (w / h >= 1.35 && ymin >= 340) {
+      hasHorizontalCollapsedPerson = true;
+    }
+  }
+
   if (count >= 2) {
     for (let i = 0; i < count; i += 1) {
       for (let j = i + 1; j < count; j += 1) {
-        if (computeBoxIoU(people[i].box_2d, people[j].box_2d) >= 0.12) {
+        const a = people[i].box_2d;
+        const b = people[j].box_2d;
+        const containment = computeBoxContainment(a, b);
+        // Never treat a nested/duplicate fragment as two distinct fighting humans
+        if (containment >= 0.65) continue;
+
+        const iou = computeBoxIoU(a, b);
+        if (iou > maxPairIoU) maxPairIoU = iou;
+        const hGap = computeBoxHorizontalGap(a, b);
+        const vOverlap = computeVerticalOverlapRatio(a, b);
+
+        // Actual physical collision / clashing overlap
+        if (iou >= collisionIouThreshold && vOverlap >= 0.35) {
           closeContactPairs += 1;
+          crowdDegree[i] += 1;
+          crowdDegree[j] += 1;
+        } else if (count >= 3 && hGap <= crowdGapThreshold && vOverlap >= 0.5) {
+          // Track tight encirclement strictly for 3+ person group crowding/bullying
+          crowdDegree[i] += 1;
+          crowdDegree[j] += 1;
         }
       }
     }
   }
-  const hasCloseContact = closeContactPairs > 0;
+
+  // Crowding / ganging up: strictly 3+ distinct people surrounding 1 center individual
+  const crowdingTargetDetected =
+    count >= 3 && crowdDegree.some((deg) => deg >= 2);
+
+  return {
+    closeContactPairs,
+    crowdingTargetDetected,
+    corneredPairDetected: false,
+    hasHorizontalCollapsedPerson,
+    maxPairIoU,
+  };
+}
+
+function measureBoxKinematics(
+  prevPeople: DetectedPersonBox[],
+  currPeople: DetectedPersonBox[]
+): {
+  maxBoxVelocity: number;
+  maxVerticalDrop: number;
+} {
+  if (prevPeople.length === 0 || currPeople.length === 0) {
+    return { maxBoxVelocity: 0, maxVerticalDrop: 0 };
+  }
+
+  let maxBoxVelocity = 0;
+  let maxVerticalDrop = 0;
+
+  for (const curr of currPeople) {
+    const [cymin, cxmin, cymax, cxmax] = curr.box_2d;
+    const ccx = (cxmin + cxmax) / 2;
+    const ccy = (cymin + cymax) / 2;
+
+    let bestPrev: DetectedPersonBox | null = null;
+    let bestDist = Infinity;
+    for (const prev of prevPeople) {
+      const [pymin, pxmin, pymax, pxmax] = prev.box_2d;
+      const pcx = (pxmin + pxmax) / 2;
+      const pcy = (pymin + pymax) / 2;
+      const dist = Math.hypot(ccx - pcx, ccy - pcy);
+      if (dist < bestDist && dist <= 320) {
+        bestDist = dist;
+        bestPrev = prev;
+      }
+    }
+
+    if (bestPrev) {
+      if (bestDist > maxBoxVelocity) {
+        maxBoxVelocity = bestDist;
+      }
+      // Sudden downward drop of a person's head/top edge (knocked down / tackled)
+      const verticalDrop = cymin - bestPrev.box_2d[0];
+      if (verticalDrop > maxVerticalDrop) {
+        maxVerticalDrop = verticalDrop;
+      }
+    }
+  }
+
+  return {
+    maxBoxVelocity: Math.round(maxBoxVelocity),
+    maxVerticalDrop: Math.round(maxVerticalDrop),
+  };
+}
+
+/**
+ * Pure on-device safety evaluation used seamlessly whenever cloud AI quota (HTTP 429)
+ * is exhausted OR when the user triggers an immediate local Scan Now.
+ * Combines verified local multi-person boxes, dangerous weapon objects, visual motion,
+ * overlapping physical contact, victim collapse, crowding around a victim, decibel spikes,
+ * and live voice-recognition transcript cues with ZERO cloud API calls.
+ */
+export function evaluateLocalSafetyAnalysis(params: {
+  detectedPeople: DetectedPersonBox[];
+  detectedObjects?: DetectedObjectBox[];
+  voiceTranscript: string;
+  audioLevel: number;
+  facilityMode: FacilityMode;
+  audioSpikeDetected?: boolean;
+  frameDeltaPercent?: number;
+  sensitivity?: ThreatSensitivity;
+}): ClassroomAnalysis {
+  const people = params.detectedPeople;
+  const dangerousObjects = params.detectedObjects ?? [];
+  const count = people.length;
+  const transcript = (params.voiceTranscript || '').trim();
+  const audioLevel = Number.isFinite(params.audioLevel) ? params.audioLevel : 0;
+  const frameDeltaPercent = Number.isFinite(params.frameDeltaPercent)
+    ? Math.max(0, params.frameDeltaPercent!)
+    : 0;
+  const sensitivity = params.sensitivity ?? 'standard';
+
+  const geometry = analyzeVisualPairGeometry(people, sensitivity);
+  const hasCloseContact = geometry.closeContactPairs > 0;
+  const hasWeaponObject = dangerousObjects.length > 0;
 
   const beatingVoiceHit = Boolean(transcript && LOCAL_BEATING_VOICE_PATTERN.test(transcript));
   const bullyingVoiceHit = Boolean(transcript && LOCAL_BULLYING_VOICE_PATTERN.test(transcript));
@@ -1287,22 +1747,37 @@ export function evaluateLocalSafetyAnalysis(params: {
   const warningVoiceHit = Boolean(transcript && LOCAL_WARNING_VOICE_PATTERN.test(transcript));
   const loudSpike = Boolean(params.audioSpikeDetected) || audioLevel > SOUND_ALERT_THRESHOLD_DB;
 
-  const crowdedIntimidation = count >= 3 && closeContactPairs >= 2 && audioLevel >= 72;
-  const intenseBeatingContact = hasCloseContact && audioLevel >= 80;
-  const closeAltercation = hasCloseContact && audioLevel >= 76;
+  const fightMotionThreshold = sensitivity === 'high' ? 12.0 : 16.0;
+  const violentBeatingMotionThreshold = sensitivity === 'high' ? 18.0 : 24.0;
+
+  const visualBeating =
+    count >= 2 &&
+    hasCloseContact &&
+    ((geometry.hasHorizontalCollapsedPerson &&
+      (frameDeltaPercent >= fightMotionThreshold || audioLevel >= 78)) ||
+      frameDeltaPercent >= violentBeatingMotionThreshold ||
+      (audioLevel >= 86 && frameDeltaPercent >= 12));
+
+  const visualFight =
+    count >= 2 &&
+    hasCloseContact &&
+    (frameDeltaPercent >= fightMotionThreshold || (audioLevel >= 82 && frameDeltaPercent >= 10));
+
+  const visualBullying =
+    geometry.crowdingTargetDetected && (frameDeltaPercent >= 6.0 || audioLevel >= 70);
 
   let threatCategory: ClassroomAnalysis['threatCategory'] = 'none';
   if (
-    criticalVoiceHit &&
-    params.facilityMode === 'bank' &&
-    /\b(robbery|gun|knife|weapon|hands up|shoot)\b/i.test(transcript)
+    hasWeaponObject ||
+    (criticalVoiceHit &&
+      /\b(robbery|gun|knife|weapon|hands up|shoot)\b/i.test(transcript))
   ) {
     threatCategory = 'robbery_or_weapon';
-  } else if (beatingVoiceHit || intenseBeatingContact) {
+  } else if (beatingVoiceHit || visualBeating) {
     threatCategory = 'beating';
-  } else if (bullyingVoiceHit || crowdedIntimidation) {
+  } else if (bullyingVoiceHit || visualBullying) {
     threatCategory = 'bullying';
-  } else if (criticalVoiceHit || closeAltercation) {
+  } else if (criticalVoiceHit || visualFight) {
     threatCategory = 'fight';
   } else if (warningVoiceHit || loudSpike) {
     threatCategory = 'disturbance';
@@ -1321,17 +1796,32 @@ export function evaluateLocalSafetyAnalysis(params: {
       : 'none';
 
   const detectedBehaviors: string[] = [];
+  if (hasWeaponObject) {
+    detectedBehaviors.push(
+      `Weapon object detected: ${dangerousObjects.map((o) => `${o.label} (${o.confidence}%)`).join(', ')}`
+    );
+  }
   if (beatingVoiceHit) detectedBehaviors.push(`Beating / striking cue: "${transcript.slice(0, 60)}"`);
   if (bullyingVoiceHit) detectedBehaviors.push(`Bullying / harassment cue: "${transcript.slice(0, 60)}"`);
   if (criticalVoiceHit && !beatingVoiceHit && !bullyingVoiceHit) {
     detectedBehaviors.push(`Distress speech cue: "${transcript.slice(0, 60)}"`);
   }
-  if (intenseBeatingContact) {
-    detectedBehaviors.push('Severe close physical contact + loud impact/shouting');
-  } else if (crowdedIntimidation) {
-    detectedBehaviors.push('Group crowding / cornering posture + raised voices');
-  } else if (closeAltercation) {
-    detectedBehaviors.push('Close overlapping physical contact + elevated audio');
+  if (visualBeating) {
+    detectedBehaviors.push(
+      geometry.hasHorizontalCollapsedPerson
+        ? 'Collapsed/fallen posture under close physical contact'
+        : `Violent physical contact (motion ${frameDeltaPercent.toFixed(0)}%)`
+    );
+  } else if (visualBullying) {
+    detectedBehaviors.push(
+      geometry.crowdingTargetDetected
+        ? 'Group crowding / surrounding single individual'
+        : 'Close cornering / intimidation posture detected'
+    );
+  } else if (visualFight) {
+    detectedBehaviors.push(
+      `Overlapping physical altercation (motion ${frameDeltaPercent.toFixed(0)}%)`
+    );
   }
   if (loudSpike) detectedBehaviors.push(`Loud sound level (${audioLevel.toFixed(1)} dB)`);
   if (warningVoiceHit && !isFighting) detectedBehaviors.push('Elevated verbal commotion');
@@ -1347,33 +1837,38 @@ export function evaluateLocalSafetyAnalysis(params: {
             ? 86
             : severity === 'warning'
               ? 58
-              : 6;
+              : 0;
 
   const summary =
-    threatCategory === 'beating'
-      ? `On-device BEATING alert: ${detectedBehaviors.join(' · ')} (${count} ${count === 1 ? 'person' : 'people'} in frame).`
-      : threatCategory === 'bullying'
-        ? `On-device BULLYING alert: ${detectedBehaviors.join(' · ')} (${count} ${count === 1 ? 'person' : 'people'} in frame).`
-        : isFighting
-          ? `On-device safety alert: ${detectedBehaviors.join(' · ')} (${count} ${count === 1 ? 'person' : 'people'} in frame).`
-          : count === 0
-            ? 'No people detected in live frame (empty room · On-device Edge AI).'
-            : `${count} ${count === 1 ? 'person' : 'people'} tracked live via on-device Edge AI (unlimited · 0 quota).`;
+    threatCategory === 'robbery_or_weapon'
+      ? `On-device WEAPON / ROBBERY alert: ${detectedBehaviors.join(' · ')}`
+      : threatCategory === 'beating'
+        ? `On-device BEATING alert: ${detectedBehaviors.join(' · ')} (${count} ${count === 1 ? 'person' : 'people'} in frame).`
+        : threatCategory === 'bullying'
+          ? `On-device BULLYING alert: ${detectedBehaviors.join(' · ')} (${count} ${count === 1 ? 'person' : 'people'} in frame).`
+          : isFighting
+            ? `On-device FIGHT alert: ${detectedBehaviors.join(' · ')} (${count} ${count === 1 ? 'person' : 'people'} in frame).`
+            : count === 0
+              ? 'No people detected in live frame (Empty zone · Edge AI).'
+              : `${count} ${count === 1 ? 'person' : 'people'} tracked live · Nominal (Edge AI).`;
 
   const recommendedAction =
-    threatCategory === 'beating'
-      ? 'Emergency intervention required immediately — stop the beating, protect the victim, and dispatch security/medical help.'
-      : threatCategory === 'bullying'
-        ? 'Intervene immediately, separate aggressor(s) from the targeted individual, and notify the supervising teacher.'
-        : isFighting
-          ? 'Inspect live feed immediately and notify supervising teacher or security.'
-          : severity === 'warning'
-            ? 'Check room noise/commotion on the live camera feed.'
-            : 'No action needed; zone is calm.';
+    threatCategory === 'robbery_or_weapon'
+      ? 'Initiate immediate security lockdown, alert campus/site security, and contact emergency responders.'
+      : threatCategory === 'beating'
+        ? 'Emergency intervention required immediately — stop the beating, protect the victim, and dispatch security/medical help.'
+        : threatCategory === 'bullying'
+          ? 'Intervene immediately, separate aggressor(s) from the targeted individual, and notify the supervising teacher.'
+          : isFighting
+            ? 'Inspect live feed immediately and dispatch supervising staff to separate individuals.'
+            : severity === 'warning'
+              ? 'Check room commotion on the live camera feed.'
+              : 'No action needed; zone is calm.';
 
   return {
     studentCount: count,
     detectedPeople: people,
+    detectedObjects: dangerousObjects,
     isFighting,
     severity,
     threatCategory,
@@ -1382,11 +1877,283 @@ export function evaluateLocalSafetyAnalysis(params: {
     recommendedAction,
     voiceAnalysis: transcript
       ? `Live speech monitored: "${transcript.slice(0, 80)}" (${audioLevel.toFixed(1)} dB).`
-      : `Ambient audio monitored on-device (${audioLevel.toFixed(1)} dB).`,
+      : `Ambient audio monitored (${audioLevel.toFixed(1)} dB).`,
     fightReason: isFighting ? detectedBehaviors.join('; ') : '',
     summary,
-    confidence: people[0]?.confidence ?? 92,
+    confidence: dangerousObjects[0]?.confidence ?? people[0]?.confidence ?? 92,
     analyzedAt: new Date().toISOString(),
+  };
+}
+
+export interface EdgeThreatTrackerState {
+  prevPeople: DetectedPersonBox[];
+  weaponStreak: number;
+  beatingStreak: number;
+  fightStreak: number;
+  bullyingStreak: number;
+  calmFrames: number;
+  activeThreatCategory: ThreatCategory;
+  lastAlertEmittedAtMs: number;
+  lastAlertCategory: ThreatCategory;
+}
+
+export function createInitialEdgeThreatState(): EdgeThreatTrackerState {
+  return {
+    prevPeople: [],
+    weaponStreak: 0,
+    beatingStreak: 0,
+    fightStreak: 0,
+    bullyingStreak: 0,
+    calmFrames: 0,
+    activeThreatCategory: 'none',
+    lastAlertEmittedAtMs: 0,
+    lastAlertCategory: 'none',
+  };
+}
+
+export interface RealtimeEdgeThreatResult {
+  nextState: EdgeThreatTrackerState;
+  analysis: ClassroomAnalysis | null;
+  shouldEmitAlert: boolean;
+  shouldClearThreat: boolean;
+  contactPairs: number;
+  maxBoxVelocity: number;
+}
+
+const THREAT_PRIORITY: Record<ThreatCategory, number> = {
+  none: 0,
+  disturbance: 1,
+  bullying: 2,
+  fight: 3,
+  beating: 4,
+  intrusion: 5,
+  robbery_or_weapon: 6,
+};
+
+/**
+ * Stateful 300ms real-time visual + object + kinematic threat engine.
+ * Runs 100% on-device with ZERO cloud quota and works on BOTH live webcams (with or without audio)
+ * AND silent uploaded/IP CCTV video feeds.
+ * Confirms visual threats across 2-3 consecutive frames to prevent single-frame false positives,
+ * then pops alerts immediately and auto-recovers smoothly once calm.
+ */
+export function evaluateRealtimeEdgeThreat(
+  prevState: EdgeThreatTrackerState,
+  input: {
+    people: DetectedPersonBox[];
+    dangerousObjects: DetectedObjectBox[];
+    frameDeltaPercent: number;
+    voiceTranscript: string;
+    audioLevel: number;
+    facilityMode: FacilityMode;
+    sensitivity?: ThreatSensitivity;
+    nowMs: number;
+    alertCooldownMs?: number;
+  }
+): RealtimeEdgeThreatResult {
+  const sensitivity = input.sensitivity ?? 'standard';
+  const alertCooldownMs = input.alertCooldownMs ?? 12000;
+  const frameDelta = Number.isFinite(input.frameDeltaPercent)
+    ? Math.max(0, input.frameDeltaPercent)
+    : 0;
+  const audioLevel = Number.isFinite(input.audioLevel) ? input.audioLevel : 0;
+  const transcript = (input.voiceTranscript || '').trim();
+
+  const geometry = analyzeVisualPairGeometry(input.people, sensitivity);
+  const kinematics = measureBoxKinematics(prevState.prevPeople, input.people);
+  const hasCloseContact = geometry.closeContactPairs > 0;
+
+  // Strictly calibrated thresholds: normal 1-person movement or 2 people sitting/walking NEVER fires false alerts
+  const fightMotionMin = sensitivity === 'high' ? 12.0 : 16.0;
+  const fightVelocityMin = sensitivity === 'high' ? 50 : 65;
+  const beatingMotionMin = sensitivity === 'high' ? 18.0 : 24.0;
+  const beatingVelocityMin = sensitivity === 'high' ? 68 : 85;
+  const dropMin = sensitivity === 'high' ? 60 : 75;
+
+  const hasWeaponFrame = input.dangerousObjects.length > 0;
+  const highConfWeapon = input.dangerousObjects.some((o) => o.confidence >= 84);
+
+  const hasMultiplePeople = input.people.length >= 2;
+  const strongVisualClash =
+    frameDelta >= fightMotionMin &&
+    (kinematics.maxBoxVelocity >= fightVelocityMin || audioLevel >= (sensitivity === 'high' ? 76 : 82));
+  const violentVisualAssault =
+    frameDelta >= beatingMotionMin && kinematics.maxBoxVelocity >= beatingVelocityMin;
+
+  const beatingFrameSignal =
+    hasMultiplePeople &&
+    hasCloseContact &&
+    (((geometry.hasHorizontalCollapsedPerson || kinematics.maxVerticalDrop >= dropMin) &&
+      frameDelta >= (sensitivity === 'high' ? 10 : 14)) ||
+      violentVisualAssault ||
+      (prevState.fightStreak >= 3 && violentVisualAssault));
+
+  const fightFrameSignal =
+    hasMultiplePeople &&
+    hasCloseContact &&
+    (strongVisualClash ||
+      (audioLevel >= (sensitivity === 'high' ? 78 : 84) && frameDelta >= 10));
+
+  const bullyingFrameSignal =
+    geometry.crowdingTargetDetected &&
+    (frameDelta >= 6.0 || kinematics.maxBoxVelocity >= 32 || audioLevel >= 70);
+
+  const weaponStreak = hasWeaponFrame ? prevState.weaponStreak + 1 : 0;
+  const beatingStreak = beatingFrameSignal ? prevState.beatingStreak + 1 : Math.max(0, prevState.beatingStreak - 1);
+  const fightStreak = fightFrameSignal ? prevState.fightStreak + 1 : Math.max(0, prevState.fightStreak - 1);
+  const bullyingStreak = bullyingFrameSignal
+    ? prevState.bullyingStreak + 1
+    : Math.max(0, prevState.bullyingStreak - 1);
+
+  const requiredWeaponFrames = highConfWeapon ? 2 : 3;
+  const requiredBeatingFrames = sensitivity === 'high' ? 3 : 4;
+  const requiredFightFrames = sensitivity === 'high' ? 3 : 4;
+  const requiredBullyingFrames = sensitivity === 'high' ? 3 : 5;
+
+  let confirmedCategory: ThreatCategory = 'none';
+  const cues: string[] = [];
+
+  if (weaponStreak >= requiredWeaponFrames) {
+    confirmedCategory = 'robbery_or_weapon';
+    cues.push(
+      `Weapon detected on camera: ${input.dangerousObjects.map((o) => `${o.label} (${o.confidence}%)`).join(', ')}`
+    );
+  } else if (beatingStreak >= requiredBeatingFrames) {
+    confirmedCategory = 'beating';
+    if (geometry.hasHorizontalCollapsedPerson || kinematics.maxVerticalDrop >= dropMin) {
+      cues.push('Victim dropped/collapsed under close physical assault');
+    } else {
+      cues.push(
+        `Repeated violent contact (motion ${frameDelta.toFixed(0)}%, velocity ${kinematics.maxBoxVelocity})`
+      );
+    }
+    if (audioLevel >= 74) {
+      cues.push(`Impact / distress audio (${audioLevel.toFixed(1)} dB)`);
+    }
+  } else if (fightStreak >= requiredFightFrames) {
+    confirmedCategory = 'fight';
+    cues.push(
+      `Clashing physical contact (${geometry.closeContactPairs} overlapping pair${geometry.closeContactPairs === 1 ? '' : 's'}, motion ${frameDelta.toFixed(0)}%)`
+    );
+    if (kinematics.maxBoxVelocity >= fightVelocityMin) {
+      cues.push(`Rapid body agitation (Δpos ${kinematics.maxBoxVelocity})`);
+    }
+  } else if (bullyingStreak >= requiredBullyingFrames) {
+    confirmedCategory = 'bullying';
+    if (geometry.crowdingTargetDetected) {
+      cues.push(`Group crowding / surrounding 1 individual (${input.people.length} people in tight cluster)`);
+    } else {
+      cues.push('Sustained cornering / intimidation posture detected');
+    }
+  }
+
+  const anySignalActive =
+    confirmedCategory !== 'none' ||
+    hasWeaponFrame ||
+    beatingFrameSignal ||
+    fightFrameSignal ||
+    bullyingFrameSignal;
+
+  const calmFrames = anySignalActive ? 0 : prevState.calmFrames + 1;
+  const shouldClearThreat =
+    prevState.activeThreatCategory !== 'none' && calmFrames >= 12;
+
+  if (confirmedCategory === 'none') {
+    const nextState: EdgeThreatTrackerState = {
+      prevPeople: input.people,
+      weaponStreak,
+      beatingStreak,
+      fightStreak,
+      bullyingStreak,
+      calmFrames,
+      activeThreatCategory: shouldClearThreat ? 'none' : prevState.activeThreatCategory,
+      lastAlertEmittedAtMs: prevState.lastAlertEmittedAtMs,
+      lastAlertCategory: shouldClearThreat ? 'none' : prevState.lastAlertCategory,
+    };
+    return {
+      nextState,
+      analysis: null,
+      shouldEmitAlert: false,
+      shouldClearThreat,
+      contactPairs: geometry.closeContactPairs,
+      maxBoxVelocity: kinematics.maxBoxVelocity,
+    };
+  }
+
+  // Confirmed visual / weapon threat!
+  const isNewOrUpgraded =
+    prevState.lastAlertCategory === 'none' ||
+    THREAT_PRIORITY[confirmedCategory] > THREAT_PRIORITY[prevState.lastAlertCategory];
+  const cooldownElapsed =
+    prevState.lastAlertEmittedAtMs === 0 ||
+    input.nowMs - prevState.lastAlertEmittedAtMs >= alertCooldownMs;
+  const shouldEmitAlert = isNewOrUpgraded || cooldownElapsed;
+
+  const threatScore =
+    confirmedCategory === 'robbery_or_weapon'
+      ? 97
+      : confirmedCategory === 'beating'
+        ? 95
+        : confirmedCategory === 'fight'
+          ? 89
+          : 86;
+
+  const recommendedAction =
+    confirmedCategory === 'robbery_or_weapon'
+      ? 'Initiate immediate security lockdown, notify site security, and dispatch emergency responders.'
+      : confirmedCategory === 'beating'
+        ? 'Emergency intervention required immediately — stop the beating, protect the victim, and call security/medical staff.'
+        : confirmedCategory === 'bullying'
+          ? 'Intervene immediately, separate aggressor(s) from the targeted individual, and notify supervising staff.'
+          : 'Dispatch supervising staff to separate individuals immediately.';
+
+  const summaryPrefix =
+    confirmedCategory === 'robbery_or_weapon'
+      ? 'Live Edge AI WEAPON ALERT'
+      : confirmedCategory === 'beating'
+        ? 'Live Edge AI BEATING ALERT'
+        : confirmedCategory === 'bullying'
+          ? 'Live Edge AI BULLYING ALERT'
+          : 'Live Edge AI FIGHT ALERT';
+
+  const analysis: ClassroomAnalysis = {
+    studentCount: input.people.length,
+    detectedPeople: input.people,
+    detectedObjects: input.dangerousObjects,
+    isFighting: true,
+    severity: 'critical',
+    threatCategory: confirmedCategory,
+    threatScore,
+    detectedBehaviors: cues,
+    recommendedAction,
+    voiceAnalysis: transcript
+      ? `Live speech: "${transcript.slice(0, 80)}" (${audioLevel.toFixed(1)} dB)`
+      : `Visual threat engine (${audioLevel.toFixed(1)} dB)`,
+    fightReason: cues.join('; '),
+    summary: `${summaryPrefix}: ${cues.join(' · ')}`,
+    confidence: input.dangerousObjects[0]?.confidence ?? input.people[0]?.confidence ?? 90,
+    analyzedAt: new Date(input.nowMs).toISOString(),
+  };
+
+  const nextState: EdgeThreatTrackerState = {
+    prevPeople: input.people,
+    weaponStreak,
+    beatingStreak,
+    fightStreak,
+    bullyingStreak,
+    calmFrames: 0,
+    activeThreatCategory: confirmedCategory,
+    lastAlertEmittedAtMs: shouldEmitAlert ? input.nowMs : prevState.lastAlertEmittedAtMs,
+    lastAlertCategory: shouldEmitAlert ? confirmedCategory : prevState.lastAlertCategory,
+  };
+
+  return {
+    nextState,
+    analysis,
+    shouldEmitAlert,
+    shouldClearThreat: false,
+    contactPairs: geometry.closeContactPairs,
+    maxBoxVelocity: kinematics.maxBoxVelocity,
   };
 }
 
