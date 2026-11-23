@@ -17,6 +17,12 @@ import {
   upsertMonitoredZone,
 } from './src/db/repository.ts';
 import { filterVerifiedPersonDetections } from './src/utils/monitoringLogic.ts';
+import {
+  buildWindowsLauncherEntries,
+  buildZipArchive,
+  isSafeZipProjectPath,
+  type ZipInputEntry,
+} from './src/utils/zipBuilder.ts';
 
 const execFileAsync = promisify(execFile);
 const PORT = Number(process.env.PORT || 3000);
@@ -1237,6 +1243,74 @@ async function startServer() {
       res.json({ ok: true });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unable to clear incidents.';
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  app.get('/api/download-app-zip', (req, res) => {
+    try {
+      const rootDir = process.cwd();
+      const rawOrigin = typeof req.query.origin === 'string' ? req.query.origin.trim() : '';
+      let hostedUrl = '';
+      if (rawOrigin) {
+        try {
+          const parsedOrigin = new URL(rawOrigin);
+          if (parsedOrigin.protocol === 'http:' || parsedOrigin.protocol === 'https:') {
+            hostedUrl = parsedOrigin.origin;
+          }
+        } catch {
+          hostedUrl = '';
+        }
+      }
+      if (!hostedUrl) {
+        const forwardedProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http')
+          .split(',')[0]
+          .trim();
+        const host = String(req.headers['x-forwarded-host'] || req.get('host') || `localhost:${PORT}`)
+          .split(',')[0]
+          .trim();
+        hostedUrl = `${forwardedProto}://${host}`;
+      }
+
+      const entries: ZipInputEntry[] = [...buildWindowsLauncherEntries(hostedUrl)];
+      const MAX_SINGLE_FILE_BYTES = 5 * 1024 * 1024;
+
+      const walk = (absDir: string, relPrefix: string) => {
+        const dirItems = fs.readdirSync(absDir, { withFileTypes: true });
+        for (const item of dirItems) {
+          const relPath = relPrefix ? `${relPrefix}/${item.name}` : item.name;
+          if (item.isDirectory()) {
+            // Prune ignored directories early for fast ZIP packaging
+            if (!isSafeZipProjectPath(`${relPath}/probe.txt`)) {
+              continue;
+            }
+            walk(path.join(absDir, item.name), relPath);
+          } else if (item.isFile()) {
+            if (!isSafeZipProjectPath(relPath)) continue;
+            const fullPath = path.join(absDir, item.name);
+            const stat = fs.statSync(fullPath);
+            if (stat.size > MAX_SINGLE_FILE_BYTES) continue;
+            entries.push({
+              path: relPath,
+              data: new Uint8Array(fs.readFileSync(fullPath)),
+            });
+          }
+        }
+      };
+
+      walk(rootDir, '');
+      const zipBytes = buildZipArchive(entries);
+
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader(
+        'Content-Disposition',
+        'attachment; filename="CampusGuard-Windows-App-and-Website.zip"'
+      );
+      res.setHeader('Content-Length', String(zipBytes.byteLength));
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(Buffer.from(zipBytes));
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Unable to build Windows & Web ZIP package.';
       res.status(500).json({ error: msg });
     }
   });

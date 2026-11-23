@@ -1,15 +1,18 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import {
   ChevronDown,
   ChevronRight,
   LogOut,
   SlidersHorizontal,
+  Trash2,
+  UserPlus,
 } from 'lucide-react';
 import type {
   AiEngineModel,
   ClassroomCamera,
   FacilityMode,
   ThreatSensitivity,
+  WatchlistSubject,
 } from '../types';
 import {
   type CampusSummary,
@@ -17,6 +20,7 @@ import {
   SOUND_ALERT_THRESHOLD_DB,
   formatFacilityLabels,
 } from '../utils/monitoringLogic';
+import { AppDownloadControls } from './AppDownloadControls';
 import { GoogleSignInButton } from './GoogleSignInButton';
 
 interface SidebarProps {
@@ -44,6 +48,10 @@ interface SidebarProps {
   isSigningIn: boolean;
   onGoogleSignIn: () => void;
   onSignOut: () => void;
+  watchlist: WatchlistSubject[];
+  onEnrollWatchlistPhoto: (file: File, label: string) => void;
+  onRemoveWatchlistSubject: (id: string) => void;
+  onStatusNotice?: (message: string) => void;
 }
 
 export function Sidebar({
@@ -71,8 +79,13 @@ export function Sidebar({
   isSigningIn,
   onGoogleSignIn,
   onSignOut,
+  watchlist,
+  onEnrollWatchlistPhoto,
+  onRemoveWatchlistSubject,
+  onStatusNotice,
 }: SidebarProps) {
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const watchlistFileRef = useRef<HTMLInputElement | null>(null);
   const labels = formatFacilityLabels(facilityMode);
 
   return (
@@ -210,6 +223,86 @@ export function Sidebar({
               </button>
             </div>
           </div>
+
+        </section>
+
+        {/* Real Cross-Camera Appearance Re-ID Watchlist */}
+        <section className="p-3.5 space-y-2.5" aria-label="Subject Re-ID Watchlist">
+          <div className="flex items-center justify-between px-0.5">
+            <h2 className="text-xs font-medium text-zinc-400">Watchlist Re-ID</h2>
+            <span className="text-xs font-mono text-zinc-500 tabular-nums">{watchlist.length}</span>
+          </div>
+
+          <input
+            ref={watchlistFileRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) {
+                const baseName = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim();
+                onEnrollWatchlistPhoto(file, baseName || `Target ${watchlist.length + 1}`);
+              }
+              e.target.value = '';
+            }}
+          />
+
+          <button
+            type="button"
+            onClick={() => watchlistFileRef.current?.click()}
+            className="w-full inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-md border border-zinc-800 bg-[#131419] text-zinc-200 hover:bg-zinc-800/80 hover:border-zinc-700 transition-colors cursor-pointer"
+          >
+            <UserPlus className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+            <span>Enroll Photo</span>
+          </button>
+
+          {watchlist.length === 0 ? (
+            <p className="px-0.5 text-[11px] text-zinc-500 leading-relaxed">
+              Flag any live tracked subject on a camera feed or enroll a photo to alert across all cameras — even if their face is covered.
+            </p>
+          ) : (
+            <ul className="space-y-1.5">
+              {watchlist.map((item) => (
+                <li
+                  key={item.id}
+                  className="flex items-center gap-2 p-1.5 rounded-md bg-[#131419] border border-zinc-800/90"
+                >
+                  <img
+                    src={item.thumbnailDataUrl}
+                    alt={item.label}
+                    className="w-9 h-9 rounded object-cover bg-black shrink-0 border border-zinc-700"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-medium text-zinc-100 truncate">{item.label}</div>
+                    <div className="flex items-center gap-1.5 mt-0.5">
+                      <span
+                        title="Upper-body clothing signature"
+                        className="w-2.5 h-2.5 rounded-sm border border-zinc-700 shrink-0"
+                        style={{ backgroundColor: item.signature.upperColorHex }}
+                      />
+                      <span
+                        title="Lower-body clothing signature"
+                        className="w-2.5 h-2.5 rounded-sm border border-zinc-700 shrink-0"
+                        style={{ backgroundColor: item.signature.lowerColorHex }}
+                      />
+                      <span className="text-[10px] font-mono text-zinc-400 tabular-nums truncate">
+                        {item.matchCount > 0 ? `${item.matchCount} hits` : item.sourceCameraCode}
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => onRemoveWatchlistSubject(item.id)}
+                    aria-label={`Remove ${item.label} from watchlist`}
+                    className="p-1 text-zinc-500 hover:text-red-400 transition-colors cursor-pointer shrink-0"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </section>
 
         {/* Collapsible System & Audio Settings (keeps rail uncluttered by default) */}
@@ -342,6 +435,9 @@ export function Sidebar({
             </div>
           ) : null}
         </section>
+
+        {/* Windows Desktop App (PWA) & Full Runnable ZIP Download */}
+        <AppDownloadControls onStatusNotice={onStatusNotice} />
       </div>
 
       {/* Operator Account Footer */}

@@ -29,6 +29,96 @@ export type ThreatCategory =
 
 export type ThreatSensitivity = 'standard' | 'high';
 
+export interface PerimeterZone {
+  id: string;
+  label: string;
+  /** Normalized 0..1000 coordinates relative to the active video/image draw rect */
+  box_2d: [number, number, number, number];
+}
+
+export interface SubjectTrailPoint {
+  x: number;
+  y: number;
+  atMs: number;
+}
+
+export interface AppearanceSignature {
+  /** 36-element normalized spatial HSV histogram (18 upper torso + 18 lower body) */
+  vector: number[];
+  upperColorHex: string;
+  lowerColorHex: string;
+  lowerBodyVisible: boolean;
+}
+
+export interface TrackedSubject {
+  id: string;
+  numericId: number;
+  box_2d: [number, number, number, number];
+  confidence: number;
+  faceOccluded?: boolean;
+  occludedBy?: string;
+  firstSeenAtMs: number;
+  lastSeenAtMs: number;
+  dwellSeconds: number;
+  speedNormPerSec: number;
+  trail: SubjectTrailPoint[];
+  matchedWatchlistId?: string;
+  matchedWatchlistLabel?: string;
+  matchedSimilarity?: number;
+}
+
+export interface WatchlistSubject {
+  id: string;
+  label: string;
+  notes?: string;
+  enrolledAt: string;
+  sourceCameraCode: string;
+  thumbnailDataUrl: string;
+  signature: AppearanceSignature;
+  matchCount: number;
+  lastMatchedAt?: string;
+  lastMatchedZone?: string;
+}
+
+export interface DvrEvidenceFrame {
+  capturedAt: string;
+  offsetSec: number;
+  imageDataUrl: string;
+  studentCount: number;
+  audioLevel: number;
+  threatScore: number;
+  transcript: string;
+}
+
+export interface ForensicEvidenceCase {
+  id: string;
+  caseNumber: string;
+  cameraId: string;
+  cameraCode: string;
+  classroomName: string;
+  triggerType:
+    | 'threat'
+    | 'perimeter_breach'
+    | 'watchlist_match'
+    | 'manual_lock'
+    | 'sound_threshold';
+  threatCategory: ThreatCategory;
+  severity: 'info' | 'warning' | 'critical';
+  headline: string;
+  summary: string;
+  sealedAt: string;
+  sha256Hash: string;
+  verified?: boolean;
+  frames: DvrEvidenceFrame[];
+  /** Real recorded WebM video clip URL when MediaRecorder captured live video */
+  videoClipUrl?: string;
+  videoClipMimeType?: string;
+  peakAudioDb: number;
+  maxPeopleCount: number;
+  transcriptSnapshot: string;
+  perimeterZone?: PerimeterZone | null;
+}
+
 export interface DetectedPersonBox {
   label: string;
   box_2d: [number, number, number, number];
@@ -105,6 +195,10 @@ export interface ClassroomCamera {
   lastAnalysis: ClassroomAnalysis | null;
   isAnalyzing: boolean;
   errorMessage?: string;
+  ptzAutoTrackEnabled?: boolean;
+  trailsEnabled?: boolean;
+  heatmapEnabled?: boolean;
+  perimeterZone?: PerimeterZone | null;
 }
 
 export interface BluetoothDeviceCandidate {
@@ -179,4 +273,4 @@ export interface WorkspaceGmailMessage {
   snippet: string;
 }
 
-export type ActiveWorkspaceView = 'grid' | 'bluetooth' | 'alerts' | 'workspace';
+export type ActiveWorkspaceView = 'grid' | 'bluetooth' | 'alerts' | 'evidence' | 'workspace';

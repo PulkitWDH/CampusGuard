@@ -1,25 +1,36 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
+  Crosshair,
+  Flame,
+  Focus,
   FolderOpen,
   Maximize2,
   Mic,
   MicOff,
   Minimize2,
   RefreshCw,
+  Route,
   ScanSearch,
   ShieldAlert,
   Trash2,
+  UserPlus,
+  Video,
 } from 'lucide-react';
 import type {
   AiEngineModel,
+  AppearanceSignature,
   ClassroomAnalysis,
   ClassroomCamera,
   DetectedObjectBox,
   DetectedPersonBox,
+  DvrEvidenceFrame,
   FacilityMode,
+  PerimeterZone,
   ThreatSensitivity,
+  TrackedSubject,
+  WatchlistSubject,
 } from '../types';
 import { captureCanvasJpegBase64 } from '../utils/mediaCapture';
 import {
@@ -49,6 +60,23 @@ import {
   shouldTriggerInstantContinuousScan,
   stepPersonTracker,
 } from '../utils/monitoringLogic';
+import {
+  HEATMAP_COLS,
+  HEATMAP_ROWS,
+  createActivityHeatmap,
+  detectPerimeterBreaches,
+  mapIronbowColor,
+  normalizeDragToPerimeterZone,
+  pushRollingDvrFrame,
+  updateActivityHeatmap,
+} from '../utils/tacticalForensics';
+import {
+  type PtzViewportRect,
+  computeSmoothPtzViewport,
+  extractAppearanceSignature,
+  matchSubjectsToWatchlist,
+  updateTrackedSubjects,
+} from '../utils/subjectIntelligence';
 
 export interface CameraFramePayload {
   frameBase64: string;
@@ -65,6 +93,12 @@ export interface RealtimeThreatEvent {
   previewDataUrl?: string;
 }
 
+export interface DvrBundleSnapshot {
+  frames: DvrEvidenceFrame[];
+  videoClipUrl?: string;
+  videoClipMimeType?: string;
+}
+
 interface CameraFeedCardProps {
   camera: ClassroomCamera;
   facilityMode: FacilityMode;
@@ -74,13 +108,42 @@ interface CameraFeedCardProps {
   cloudQuotaExhausted?: boolean;
   isFocused: boolean;
   liveMediaStream?: MediaStream | null;
+  watchlist?: WatchlistSubject[];
   onRegisterCapture: (cameraId: string, captureFn: (() => CameraFramePayload | null) | null) => void;
+  onRegisterDvrProvider?: (
+    cameraId: string,
+    provider: (() => DvrBundleSnapshot) | null
+  ) => void;
   onLocalPersonDetections: (
     cameraId: string,
     detectedPeople: DetectedPersonBox[],
     detectedObjects: DetectedObjectBox[]
   ) => void;
   onRealtimeEdgeThreat: (cameraId: string, event: RealtimeThreatEvent) => void;
+  onPerimeterBreach?: (
+    cameraId: string,
+    breachingPeople: DetectedPersonBox[],
+    zone: PerimeterZone,
+    bundle: DvrBundleSnapshot
+  ) => void;
+  onManualLockEvidence?: (cameraId: string, bundle: DvrBundleSnapshot) => void;
+  onEnrollLiveSubject?: (
+    cameraId: string,
+    payload: {
+      label: string;
+      thumbnailDataUrl: string;
+      signature: AppearanceSignature;
+    }
+  ) => void;
+  onWatchlistMatch?: (
+    cameraId: string,
+    payload: {
+      watchlistItem: WatchlistSubject;
+      subjectId: string;
+      similarity: number;
+      bundle: DvrBundleSnapshot;
+    }
+  ) => void;
   onReconnectStream: (cameraId: string) => void;
   onAnalyzeCamera: (cameraId: string, isAutoTrigger?: boolean) => void;
   onToggleVoiceListening: (cameraId: string) => void;
@@ -93,7 +156,16 @@ interface CameraFeedCardProps {
   onUpdateCameraSettings: (
     cameraId: string,
     patch: Partial<
-      Pick<ClassroomCamera, 'aiModel' | 'autoAiEnabled' | 'expectedTotalCount'>
+      Pick<
+        ClassroomCamera,
+        | 'aiModel'
+        | 'autoAiEnabled'
+        | 'expectedTotalCount'
+        | 'ptzAutoTrackEnabled'
+        | 'trailsEnabled'
+        | 'heatmapEnabled'
+        | 'perimeterZone'
+      >
     >
   ) => void;
   onToggleFocus: (cameraId: string) => void;
@@ -122,10 +194,16 @@ export function CameraFeedCard({
   dbCalibrationOffset = DEFAULT_DB_CALIBRATION_OFFSET,
   cloudQuotaExhausted = false,
   isFocused,
-  liveMediaStream,
+  liveMediaStream = null,
+  watchlist = [],
   onRegisterCapture,
+  onRegisterDvrProvider,
   onLocalPersonDetections,
   onRealtimeEdgeThreat,
+  onPerimeterBreach,
+  onManualLockEvidence,
+  onEnrollLiveSubject,
+  onWatchlistMatch,
   onReconnectStream,
   onAnalyzeCamera,
   onToggleVoiceListening,
@@ -204,6 +282,326 @@ export function CameraFeedCard({
   const onLocalPersonDetectionsRef = useRef(onLocalPersonDetections);
   const onRealtimeEdgeThreatRef = useRef(onRealtimeEdgeThreat);
   const onUpdateTranscriptRef = useRef(onUpdateTranscript);
+  const onPerimeterBreachRef = useRef(onPerimeterBreach);
+  onPerimeterBreachRef.current = onPerimeterBreach;
+  const onWatchlistMatchRef = useRef(onWatchlistMatch);
+  onWatchlistMatchRef.current = onWatchlistMatch;
+  const watchlistRef = useRef<WatchlistSubject[]>(watchlist);
+  watchlistRef.current = watchlist;
+
+  // Real-Time Subject Tracking, Auto-PTZ Zoom, Re-ID Watchlist, Heatmap, Perimeter & Black-Box Video DVR
+  const ptzAutoTrackEnabled = camera.ptzAutoTrackEnabled ?? true;
+  const trailsEnabled = camera.trailsEnabled ?? true;
+  const heatmapEnabled = Boolean(camera.heatmapEnabled);
+  const perimeterZone = camera.perimeterZone ?? null;
+  const ptzAutoTrackEnabledRef = useRef<boolean>(ptzAutoTrackEnabled);
+  const trailsEnabledRef = useRef<boolean>(trailsEnabled);
+  const heatmapEnabledRef = useRef<boolean>(heatmapEnabled);
+  const perimeterZoneRef = useRef<PerimeterZone | null>(perimeterZone);
+  const perimeterBreachedRef = useRef<boolean>(false);
+  const lastPerimeterAlertAtRef = useRef<number>(0);
+  const [perimeterBreached, setPerimeterBreached] = useState(false);
+  const [isDrawingZone, setIsDrawingZone] = useState(false);
+  const dragStartPxRef = useRef<{ x: number; y: number } | null>(null);
+  const dragCurrentPxRef = useRef<{ x: number; y: number } | null>(null);
+  const heatmapGridRef = useRef<Float32Array>(createActivityHeatmap(HEATMAP_COLS, HEATMAP_ROWS));
+  const dvrBufferRef = useRef<DvrEvidenceFrame[]>([]);
+  const [dvrFrameCount, setDvrFrameCount] = useState(0);
+  const [justLockedEvidence, setJustLockedEvidence] = useState(false);
+  const [isRecordingVideo, setIsRecordingVideo] = useState(false);
+
+  // Persistent Subject Tracker + Re-ID Signatures + Smooth Auto-PTZ Viewport
+  const trackedSubjectsRef = useRef<TrackedSubject[]>([]);
+  const nextSubjectNumericIdRef = useRef<number>(1);
+  const subjectSignaturesRef = useRef<Record<string, AppearanceSignature>>({});
+  const lastWatchlistAlertAtRef = useRef<Record<string, number>>({});
+  const ptzViewportRef = useRef<PtzViewportRect | null>(null);
+  const [lockedPtzSubjectId, setLockedPtzSubjectId] = useState<string | null>(null);
+  const lockedPtzSubjectIdRef = useRef<string | null>(null);
+  lockedPtzSubjectIdRef.current = lockedPtzSubjectId;
+  const [liveTrackedSubjects, setLiveTrackedSubjects] = useState<TrackedSubject[]>([]);
+  const lastTrackedUiSigRef = useRef<string>('');
+
+  // Real MediaRecorder rolling WebM video clip state
+  const currentVideoChunksRef = useRef<Blob[]>([]);
+  const completedVideoBlobRef = useRef<Blob | null>(null);
+  const activeVideoMimeRef = useRef<string>('video/webm');
+
+  useEffect(() => {
+    ptzAutoTrackEnabledRef.current = ptzAutoTrackEnabled;
+    trailsEnabledRef.current = trailsEnabled;
+    heatmapEnabledRef.current = heatmapEnabled;
+    perimeterZoneRef.current = perimeterZone;
+    if (!perimeterZone) {
+      perimeterBreachedRef.current = false;
+      setPerimeterBreached(false);
+    }
+  }, [heatmapEnabled, perimeterZone, ptzAutoTrackEnabled, trailsEnabled]);
+
+  const captureAnnotatedDvrFrame = (): DvrEvidenceFrame | null => {
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+    try {
+      const imageDataUrl = canvas.toDataURL('image/jpeg', 0.62);
+      return {
+        capturedAt: new Date().toISOString(),
+        offsetSec: 0,
+        imageDataUrl,
+        studentCount: localPeopleCountRef.current,
+        audioLevel: audioLevelRef.current,
+        threatScore: camera.lastAnalysis?.threatScore ?? (perimeterBreachedRef.current ? 92 : 0),
+        transcript: liveTranscriptRef.current.trim(),
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  const getLatestVideoClipSnapshot = (): { videoClipUrl?: string; videoClipMimeType?: string } => {
+    try {
+      const mimeType = activeVideoMimeRef.current || 'video/webm';
+      let blob: Blob | null = null;
+      if (currentVideoChunksRef.current.length >= 2) {
+        blob = new Blob(currentVideoChunksRef.current, { type: mimeType });
+      } else if (completedVideoBlobRef.current && completedVideoBlobRef.current.size > 0) {
+        blob = completedVideoBlobRef.current;
+      } else if (currentVideoChunksRef.current.length === 1) {
+        blob = new Blob(currentVideoChunksRef.current, { type: mimeType });
+      }
+      if (!blob || blob.size < 512) return {};
+      return {
+        videoClipUrl: URL.createObjectURL(blob),
+        videoClipMimeType: mimeType,
+      };
+    } catch {
+      return {};
+    }
+  };
+
+  const getDvrBundleSnapshot = (): DvrBundleSnapshot => {
+    const instant = captureAnnotatedDvrFrame();
+    if (instant) {
+      dvrBufferRef.current = pushRollingDvrFrame(dvrBufferRef.current, instant, 14);
+      setDvrFrameCount(dvrBufferRef.current.length);
+    }
+    const videoSnap = getLatestVideoClipSnapshot();
+    return {
+      frames: [...dvrBufferRef.current],
+      videoClipUrl: videoSnap.videoClipUrl,
+      videoClipMimeType: videoSnap.videoClipMimeType,
+    };
+  };
+
+  const getDvrBundleSnapshotRef = useRef(getDvrBundleSnapshot);
+  getDvrBundleSnapshotRef.current = getDvrBundleSnapshot;
+
+  useEffect(() => {
+    if (!onRegisterDvrProvider) return;
+    onRegisterDvrProvider(camera.id, () => getDvrBundleSnapshotRef.current());
+    return () => onRegisterDvrProvider(camera.id, null);
+  }, [camera.id, onRegisterDvrProvider]);
+
+  // Rolling 15-second Black-Box DVR frame sampler (1 frame every 1.2s, max 14 frames)
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (!isAudioOnly && !hasLiveFrameRef.current) return;
+      const frame = captureAnnotatedDvrFrame();
+      if (frame) {
+        dvrBufferRef.current = pushRollingDvrFrame(dvrBufferRef.current, frame, 14);
+        setDvrFrameCount(dvrBufferRef.current.length);
+      }
+    }, 1200);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [camera.id, isAudioOnly]);
+
+  // Real rolling MediaRecorder (.webm) black-box video clip buffer (self-contained 14s segments)
+  useEffect(() => {
+    if (isAudioOnly || !hasLiveSignal) {
+      setIsRecordingVideo(false);
+      return;
+    }
+    const canvas = canvasRef.current;
+    if (
+      !canvas ||
+      typeof MediaRecorder === 'undefined' ||
+      typeof canvas.captureStream !== 'function'
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    let stream: MediaStream | null = null;
+    let recorder: MediaRecorder | null = null;
+    let rotateTimer: number | null = null;
+
+    const preferredMimes = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+    const supportedMime =
+      preferredMimes.find((m) => {
+        try {
+          return MediaRecorder.isTypeSupported(m);
+        } catch {
+          return false;
+        }
+      }) || '';
+
+    const startSegment = () => {
+      if (cancelled || !stream) return;
+      if (currentVideoChunksRef.current.length > 0) {
+        completedVideoBlobRef.current = new Blob(currentVideoChunksRef.current, {
+          type: activeVideoMimeRef.current,
+        });
+      }
+      currentVideoChunksRef.current = [];
+      try {
+        recorder = supportedMime
+          ? new MediaRecorder(stream, {
+              mimeType: supportedMime,
+              videoBitsPerSecond: 650_000,
+            })
+          : new MediaRecorder(stream);
+        activeVideoMimeRef.current = recorder.mimeType || supportedMime || 'video/webm';
+        recorder.ondataavailable = (ev) => {
+          if (ev.data && ev.data.size > 0) {
+            currentVideoChunksRef.current.push(ev.data);
+          }
+        };
+        recorder.start(1000);
+        setIsRecordingVideo(true);
+      } catch {
+        setIsRecordingVideo(false);
+      }
+    };
+
+    try {
+      stream = canvas.captureStream(12);
+      startSegment();
+      rotateTimer = window.setInterval(() => {
+        if (recorder && recorder.state === 'recording') {
+          try {
+            recorder.stop();
+          } catch {
+            // ignore
+          }
+        }
+        startSegment();
+      }, 14_000);
+    } catch {
+      setIsRecordingVideo(false);
+    }
+
+    return () => {
+      cancelled = true;
+      if (rotateTimer !== null) window.clearInterval(rotateTimer);
+      if (recorder && recorder.state !== 'inactive') {
+        try {
+          recorder.stop();
+        } catch {
+          // ignore
+        }
+      }
+      if (stream) {
+        stream.getTracks().forEach((t) => t.stop());
+      }
+      setIsRecordingVideo(false);
+    };
+  }, [camera.id, hasLiveSignal, isAudioOnly]);
+
+  const handleFlagLiveSubject = (subject: TrackedSubject) => {
+    if (!onEnrollLiveSubject) return;
+    const rawCanvas = rawCaptureCanvasRef.current || canvasRef.current;
+    if (!rawCanvas || rawCanvas.width <= 0 || rawCanvas.height <= 0) return;
+
+    try {
+      const [ymin, xmin, ymax, xmax] = subject.box_2d;
+      const cw = rawCanvas.width;
+      const ch = rawCanvas.height;
+      const sx = Math.max(0, Math.floor((xmin / 1000) * cw));
+      const sy = Math.max(0, Math.floor((ymin / 1000) * ch));
+      const sw = Math.max(12, Math.min(cw - sx, Math.floor(((xmax - xmin) / 1000) * cw)));
+      const sh = Math.max(12, Math.min(ch - sy, Math.floor(((ymax - ymin) / 1000) * ch)));
+
+      const thumbCanvas = document.createElement('canvas');
+      thumbCanvas.width = 160;
+      thumbCanvas.height = 160;
+      const tctx = thumbCanvas.getContext('2d', { willReadFrequently: true });
+      if (!tctx) return;
+      tctx.fillStyle = '#09090b';
+      tctx.fillRect(0, 0, 160, 160);
+      const scale = Math.min(160 / sw, 160 / sh);
+      const dw = Math.round(sw * scale);
+      const dh = Math.round(sh * scale);
+      tctx.drawImage(rawCanvas, sx, sy, sw, sh, Math.round((160 - dw) / 2), Math.round((160 - dh) / 2), dw, dh);
+      const thumbnailDataUrl = thumbCanvas.toDataURL('image/jpeg', 0.82);
+
+      let signature = subjectSignaturesRef.current[subject.id];
+      if (!signature) {
+        const rctx = rawCanvas.getContext('2d', { willReadFrequently: true });
+        if (rctx) {
+          const rgba = rctx.getImageData(0, 0, cw, ch).data;
+          signature = extractAppearanceSignature(rgba, cw, ch, subject.box_2d);
+        }
+      }
+      if (!signature) return;
+
+      onEnrollLiveSubject(camera.id, {
+        label: `${subject.id} (${camera.cameraCode})`,
+        thumbnailDataUrl,
+        signature,
+      });
+    } catch {
+      // ignore cross-origin tainted stream errors
+    }
+  };
+
+  const getCanvasPointFromPointer = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return { x: 0, y: 0 };
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / Math.max(1, rect.width);
+    const scaleY = canvas.height / Math.max(1, rect.height);
+    return {
+      x: Math.max(0, Math.min(canvas.width, (e.clientX - rect.left) * scaleX)),
+      y: Math.max(0, Math.min(canvas.height, (e.clientY - rect.top) * scaleY)),
+    };
+  };
+
+  const handleCanvasPointerDown = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (!isDrawingZone || isAudioOnly) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const pt = getCanvasPointFromPointer(e);
+    dragStartPxRef.current = pt;
+    dragCurrentPxRef.current = pt;
+  };
+
+  const handleCanvasPointerMove = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (!isDrawingZone || !dragStartPxRef.current) return;
+    dragCurrentPxRef.current = getCanvasPointFromPointer(e);
+  };
+
+  const handleCanvasPointerUp = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (!isDrawingZone || !dragStartPxRef.current) return;
+    const endPt = getCanvasPointFromPointer(e);
+    const createdZone = normalizeDragToPerimeterZone(
+      dragStartPxRef.current,
+      endPt,
+      lastDrawRectRef.current,
+      'Restricted Perimeter'
+    );
+    dragStartPxRef.current = null;
+    dragCurrentPxRef.current = null;
+    setIsDrawingZone(false);
+    if (createdZone) {
+      onUpdateCameraSettings(camera.id, { perimeterZone: createdZone });
+    }
+  };
+
+  const handleManualLockClick = () => {
+    const bundle = getDvrBundleSnapshot();
+    onManualLockEvidence?.(camera.id, bundle);
+    setJustLockedEvidence(true);
+    window.setTimeout(() => setJustLockedEvidence(false), 1800);
+  };
 
   const captureCleanFrame = (): { base64: string; dataUrl: string } | null => {
     if (isAudioOnly || !hasLiveFrameRef.current) return null;
@@ -516,6 +914,112 @@ export function CameraFeedCard({
           onLocalPersonDetectionsRef.current(camera.id, people, dangerousObjects);
         }
 
+        // Accumulate real spatial activity heatmap dwell from confirmed tracked humans
+        updateActivityHeatmap(heatmapGridRef.current, people, HEATMAP_COLS, HEATMAP_ROWS);
+
+        // Update persistent Subject IDs, movement trajectories, dwell timers & Appearance Re-ID Watchlist
+        const nowTrackMs = Date.now();
+        const trackedStep = updateTrackedSubjects(
+          trackedSubjectsRef.current,
+          people,
+          nowTrackMs,
+          nextSubjectNumericIdRef.current
+        );
+        nextSubjectNumericIdRef.current = trackedStep.nextNumericId;
+        let nextTracked = trackedStep.subjects;
+
+        // Extract real 36-bin spatial HSV appearance signatures directly from raw frame pixels
+        try {
+          const rctx = rawCanvas.getContext('2d', { willReadFrequently: true });
+          if (rctx && nextTracked.length > 0) {
+            const rawPixels = rctx.getImageData(0, 0, rawCanvas.width, rawCanvas.height).data;
+            const nextSigs: Record<string, AppearanceSignature> = {};
+            for (const subj of nextTracked) {
+              nextSigs[subj.id] = extractAppearanceSignature(
+                rawPixels,
+                rawCanvas.width,
+                rawCanvas.height,
+                subj.box_2d
+              );
+            }
+            subjectSignaturesRef.current = nextSigs;
+
+            // Cross-camera Watchlist Re-ID matching (works even when face is covered)
+            if (watchlistRef.current.length > 0) {
+              const matches = matchSubjectsToWatchlist(
+                nextTracked,
+                nextSigs,
+                watchlistRef.current,
+                84
+              );
+              const matchBySubject = new Map(matches.map((m) => [m.subjectId, m]));
+              nextTracked = nextTracked.map((subj) => {
+                const hit = matchBySubject.get(subj.id);
+                if (!hit) {
+                  return {
+                    ...subj,
+                    matchedWatchlistId: undefined,
+                    matchedWatchlistLabel: undefined,
+                    matchedSimilarity: undefined,
+                  };
+                }
+                return {
+                  ...subj,
+                  matchedWatchlistId: hit.watchlistItem.id,
+                  matchedWatchlistLabel: hit.watchlistItem.label,
+                  matchedSimilarity: hit.similarity,
+                };
+              });
+
+              for (const hit of matches) {
+                const lastHitMs = lastWatchlistAlertAtRef.current[hit.watchlistItem.id] ?? 0;
+                if (nowTrackMs - lastHitMs >= 15_000) {
+                  lastWatchlistAlertAtRef.current[hit.watchlistItem.id] = nowTrackMs;
+                  onWatchlistMatchRef.current?.(camera.id, {
+                    watchlistItem: hit.watchlistItem,
+                    subjectId: hit.subjectId,
+                    similarity: hit.similarity,
+                    bundle: getDvrBundleSnapshotRef.current(),
+                  });
+                }
+              }
+            }
+          } else {
+            subjectSignaturesRef.current = {};
+          }
+        } catch {
+          // ignore cross-origin tainted readback
+        }
+
+        trackedSubjectsRef.current = nextTracked;
+        const trackedUiSig = nextTracked
+          .map((s) => `${s.id}:${s.dwellSeconds}:${s.matchedWatchlistId ?? ''}:${s.matchedSimilarity ?? 0}`)
+          .join('|');
+        if (trackedUiSig !== lastTrackedUiSigRef.current) {
+          lastTrackedUiSigRef.current = trackedUiSig;
+          setLiveTrackedSubjects(nextTracked);
+        }
+
+        // Evaluate interactive Restricted Perimeter Zone breach in real time
+        const activeZone = perimeterZoneRef.current;
+        if (activeZone) {
+          const breachEval = detectPerimeterBreaches(people, activeZone);
+          if (breachEval.breached !== perimeterBreachedRef.current) {
+            perimeterBreachedRef.current = breachEval.breached;
+            setPerimeterBreached(breachEval.breached);
+          }
+          const nowBreachMs = Date.now();
+          if (breachEval.breached && nowBreachMs - lastPerimeterAlertAtRef.current >= 12_000) {
+            lastPerimeterAlertAtRef.current = nowBreachMs;
+            onPerimeterBreachRef.current?.(
+              camera.id,
+              breachEval.breachingPeople,
+              activeZone,
+              getDvrBundleSnapshotRef.current()
+            );
+          }
+        }
+
         // Run real-time stateful visual + weapon + contact threat detector on EVERY frame
         const threatEval = evaluateRealtimeEdgeThreat(edgeThreatStateRef.current, {
           people,
@@ -726,7 +1230,7 @@ export function CameraFeedCard({
           hasLiveFrameRef.current = true;
           setHasLiveSignal(true);
           const canvas = canvasRef.current;
-          const ctx = canvas?.getContext('2d');
+          const ctx = canvas?.getContext('2d', { willReadFrequently: true });
           if (canvas && ctx) {
             ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
           }
@@ -881,7 +1385,7 @@ export function CameraFeedCard({
     const drawFrame = (timestamp: number) => {
       const canvas = canvasRef.current;
       if (!canvas) return;
-      const ctx = canvas.getContext('2d');
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
       if (!ctx) return;
 
       const width = canvas.width;
@@ -1037,14 +1541,116 @@ export function CameraFeedCard({
           ctx.fillText(message, Math.max(20, (width - m.width) / 2), height / 2);
         }
 
-        // Draw grounded AI person bounding boxes aligned to the aspect-preserved video rect
-        const boxes = detectedPeopleRef.current;
         const activeRect = lastDrawRectRef.current;
+
+        // Spatial Activity Dwell Heatmap overlay (real accumulated person coordinates)
+        if (heatmapEnabledRef.current) {
+          const grid = heatmapGridRef.current;
+          const cellW = activeRect.width / HEATMAP_COLS;
+          const cellH = activeRect.height / HEATMAP_ROWS;
+          for (let r = 0; r < HEATMAP_ROWS; r += 1) {
+            for (let c = 0; c < HEATMAP_COLS; c += 1) {
+              const intensity = grid[r * HEATMAP_COLS + c];
+              if (intensity < 0.05) continue;
+              const [hr, hg, hb] = mapIronbowColor(0.35 + intensity * 0.65);
+              ctx.fillStyle = `rgba(${hr}, ${hg}, ${hb}, ${(0.18 + intensity * 0.48).toFixed(2)})`;
+              ctx.fillRect(
+                activeRect.x + c * cellW,
+                activeRect.y + r * cellH,
+                Math.ceil(cellW),
+                Math.ceil(cellH)
+              );
+            }
+          }
+        }
+
+        // Real-time Movement Trajectory Trails for every persistent tracked subject
+        const trackedSubjects = trackedSubjectsRef.current;
+        if (hasLiveFrameRef.current && trailsEnabledRef.current && trackedSubjects.length > 0) {
+          trackedSubjects.forEach((subj) => {
+            if (subj.trail.length < 2) return;
+            const isWatchlistHit = Boolean(subj.matchedWatchlistId);
+            ctx.save();
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            for (let i = 1; i < subj.trail.length; i += 1) {
+              const prevPt = subj.trail[i - 1];
+              const currPt = subj.trail[i];
+              const alpha = (i / subj.trail.length) * 0.85;
+              const px1 = activeRect.x + (prevPt.x / 1000) * activeRect.width;
+              const py1 = activeRect.y + (prevPt.y / 1000) * activeRect.height;
+              const px2 = activeRect.x + (currPt.x / 1000) * activeRect.width;
+              const py2 = activeRect.y + (currPt.y / 1000) * activeRect.height;
+              ctx.strokeStyle = isWatchlistHit
+                ? `rgba(239, 68, 68, ${alpha.toFixed(2)})`
+                : `rgba(56, 189, 248, ${alpha.toFixed(2)})`;
+              ctx.lineWidth = 2.5;
+              ctx.beginPath();
+              ctx.moveTo(px1, py1);
+              ctx.lineTo(px2, py2);
+              ctx.stroke();
+            }
+            const head = subj.trail[subj.trail.length - 1];
+            const hx = activeRect.x + (head.x / 1000) * activeRect.width;
+            const hy = activeRect.y + (head.y / 1000) * activeRect.height;
+            ctx.fillStyle = isWatchlistHit ? '#ef4444' : '#38bdf8';
+            ctx.beginPath();
+            ctx.arc(hx, hy, 3.5, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+          });
+        }
+
+        // Draw active Restricted Perimeter Zone or in-progress drag preview
+        const activePerimeter = perimeterZoneRef.current;
+        if (activePerimeter) {
+          const pRect = mapNormalizedBoxToRect(activePerimeter.box_2d, activeRect);
+          const isBreached = perimeterBreachedRef.current;
+          ctx.save();
+          ctx.fillStyle = isBreached ? 'rgba(220, 38, 38, 0.28)' : 'rgba(245, 158, 11, 0.14)';
+          ctx.fillRect(pRect.x, pRect.y, pRect.width, pRect.height);
+          ctx.strokeStyle = isBreached ? '#ef4444' : '#f59e0b';
+          ctx.lineWidth = isBreached ? 3 : 2;
+          if (!isBreached) ctx.setLineDash([7, 5]);
+          ctx.strokeRect(pRect.x, pRect.y, pRect.width, pRect.height);
+          ctx.restore();
+
+          const pLabel = isBreached
+            ? 'PERIMETER BREACH'
+            : activePerimeter.label.toUpperCase();
+          ctx.font = '700 10px "JetBrains Mono", monospace';
+          const pW = Math.min(width - 12, Math.ceil(ctx.measureText(pLabel).width) + 12);
+          const pTagY = Math.max(30, pRect.y >= 48 ? pRect.y - 18 : pRect.y + 4);
+          ctx.fillStyle = isBreached ? '#dc2626' : 'rgba(180, 83, 9, 0.92)';
+          ctx.fillRect(pRect.x, pTagY, pW, 16);
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText(pLabel, pRect.x + 6, pTagY + 11, pW - 10);
+        }
+
+        if (dragStartPxRef.current && dragCurrentPxRef.current) {
+          const sx = Math.min(dragStartPxRef.current.x, dragCurrentPxRef.current.x);
+          const sy = Math.min(dragStartPxRef.current.y, dragCurrentPxRef.current.y);
+          const sw = Math.abs(dragCurrentPxRef.current.x - dragStartPxRef.current.x);
+          const sh = Math.abs(dragCurrentPxRef.current.y - dragStartPxRef.current.y);
+          ctx.save();
+          ctx.fillStyle = 'rgba(245, 158, 11, 0.18)';
+          ctx.fillRect(sx, sy, sw, sh);
+          ctx.strokeStyle = '#fbbf24';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([5, 4]);
+          ctx.strokeRect(sx, sy, sw, sh);
+          ctx.restore();
+        }
+
+        // Draw grounded AI person bounding boxes with persistent Subject ID, Dwell Time & Watchlist Re-ID
+        const boxes = detectedPeopleRef.current;
         if (hasLiveFrameRef.current && Array.isArray(boxes) && boxes.length > 0) {
           const isCritical = cameraStatusRef.current === 'fighting';
           const isBullying = threatCategoryRef.current === 'bullying';
 
           boxes.forEach((person, idx) => {
+            const matchedSubj = trackedSubjects[idx];
+            const isWatchlistHit = Boolean(matchedSubj?.matchedWatchlistId);
             const mapped = mapNormalizedBoxToRect(person.box_2d, activeRect);
             const x = Math.max(2, Math.min(width - 18, mapped.x));
             const y = Math.max(32, Math.min(height - 38, mapped.y));
@@ -1052,34 +1658,40 @@ export function CameraFeedCard({
             const bh = Math.max(16, Math.min(height - y - 2, mapped.height));
 
             const isOccluded = Boolean(person.faceOccluded);
-            const strokeColor = isBullying
-              ? '#f97316'
-              : isCritical
-                ? '#ef4444'
-                : isOccluded
-                  ? '#38bdf8'
-                  : '#10b981';
-            const fillTint = isBullying
-              ? 'rgba(249, 115, 22, 0.14)'
-              : isCritical
-                ? 'rgba(239, 68, 68, 0.14)'
-                : isOccluded
-                  ? 'rgba(56, 189, 248, 0.12)'
-                  : 'rgba(16, 185, 129, 0.10)';
-            const tagBg = isBullying
-              ? 'rgba(194, 65, 12, 0.92)'
-              : isCritical
-                ? 'rgba(185, 28, 28, 0.92)'
-                : isOccluded
-                  ? 'rgba(3, 105, 161, 0.92)'
-                  : 'rgba(6, 95, 70, 0.90)';
+            const strokeColor = isWatchlistHit
+              ? '#ef4444'
+              : isBullying
+                ? '#f97316'
+                : isCritical
+                  ? '#ef4444'
+                  : isOccluded
+                    ? '#38bdf8'
+                    : '#10b981';
+            const fillTint = isWatchlistHit
+              ? 'rgba(239, 68, 68, 0.18)'
+              : isBullying
+                ? 'rgba(249, 115, 22, 0.14)'
+                : isCritical
+                  ? 'rgba(239, 68, 68, 0.14)'
+                  : isOccluded
+                    ? 'rgba(56, 189, 248, 0.12)'
+                    : 'rgba(16, 185, 129, 0.10)';
+            const tagBg = isWatchlistHit
+              ? 'rgba(220, 38, 38, 0.95)'
+              : isBullying
+                ? 'rgba(194, 65, 12, 0.92)'
+                : isCritical
+                  ? 'rgba(185, 28, 28, 0.92)'
+                  : isOccluded
+                    ? 'rgba(3, 105, 161, 0.92)'
+                    : 'rgba(6, 95, 70, 0.90)';
 
             ctx.fillStyle = fillTint;
             ctx.fillRect(x, y, bw, bh);
 
             ctx.strokeStyle = strokeColor;
-            ctx.lineWidth = 2;
-            if (isOccluded && !isCritical) {
+            ctx.lineWidth = isWatchlistHit ? 2.5 : 2;
+            if (isOccluded && !isCritical && !isWatchlistHit) {
               ctx.setLineDash([6, 4]);
             }
             ctx.strokeRect(x, y, bw, bh);
@@ -1102,9 +1714,14 @@ export function CameraFeedCard({
             ctx.lineTo(x + bw, y + bh - corner);
             ctx.stroke();
 
-            const tagText = isOccluded
-              ? `#${idx + 1} ${person.label}`
-              : `#${idx + 1} ${person.label} ${person.confidence}%`;
+            const subjectPrefix = matchedSubj ? matchedSubj.id : `#${idx + 1}`;
+            const dwellSuffix =
+              matchedSubj && matchedSubj.dwellSeconds > 0 ? ` · ${matchedSubj.dwellSeconds}s` : '';
+            const tagText = isWatchlistHit
+              ? `WATCHLIST: ${matchedSubj?.matchedWatchlistLabel} ${matchedSubj?.matchedSimilarity}%`
+              : isOccluded
+                ? `${subjectPrefix}${dwellSuffix} · OCCLUDED`
+                : `${subjectPrefix}${dwellSuffix} · ${person.confidence}%`;
             ctx.font = '600 11px "JetBrains Mono", monospace';
             const textW = ctx.measureText(tagText).width;
             const tagW = Math.min(width - 8, Math.ceil(textW) + 12);
@@ -1119,6 +1736,85 @@ export function CameraFeedCard({
             ctx.fillStyle = '#ffffff';
             ctx.fillText(tagText, tagX + 6, tagY + 13, tagW - 12);
           });
+        }
+
+        // Real Digital Auto-PTZ Close-Up Picture-in-Picture (smoothly tracks locked/active subject)
+        if (hasLiveFrameRef.current && ptzAutoTrackEnabledRef.current && trackedSubjects.length > 0) {
+          const targetSubj =
+            trackedSubjects.find((s) => s.id === lockedPtzSubjectIdRef.current) ||
+            trackedSubjects.find((s) => Boolean(s.matchedWatchlistId)) ||
+            trackedSubjects[0];
+
+          const srcMedia: HTMLVideoElement | HTMLImageElement | null =
+            hasVideoFeed && video
+              ? video
+              : loadedImageRef.current &&
+                  loadedImageRef.current.complete &&
+                  loadedImageRef.current.naturalWidth > 0
+                ? loadedImageRef.current
+                : null;
+
+          if (targetSubj && srcMedia) {
+            const srcW =
+              srcMedia instanceof HTMLVideoElement ? srcMedia.videoWidth : srcMedia.naturalWidth;
+            const srcH =
+              srcMedia instanceof HTMLVideoElement ? srcMedia.videoHeight : srcMedia.naturalHeight;
+
+            if (srcW > 0 && srcH > 0) {
+              const vp = computeSmoothPtzViewport(targetSubj.box_2d, ptzViewportRef.current, 0.24);
+              ptzViewportRef.current = vp;
+
+              const cropX = Math.max(0, Math.floor((vp.xmin / 1000) * srcW));
+              const cropY = Math.max(0, Math.floor((vp.ymin / 1000) * srcH));
+              const cropW = Math.max(16, Math.min(srcW - cropX, Math.floor(((vp.xmax - vp.xmin) / 1000) * srcW)));
+              const cropH = Math.max(16, Math.min(srcH - cropY, Math.floor(((vp.ymax - vp.ymin) / 1000) * srcH)));
+
+              const pipW = 192;
+              const pipH = 112;
+              const pipX = width - pipW - 10;
+              const pipY = height - pipH - 36;
+              const isHit = Boolean(targetSubj.matchedWatchlistId);
+
+              ctx.save();
+              ctx.fillStyle = '#09090b';
+              ctx.fillRect(pipX - 2, pipY - 18, pipW + 4, pipH + 20);
+              ctx.drawImage(srcMedia, cropX, cropY, cropW, cropH, pipX, pipY, pipW, pipH);
+
+              // Crisp PTZ reticle + header strip
+              ctx.strokeStyle = isHit ? '#ef4444' : '#38bdf8';
+              ctx.lineWidth = 1.5;
+              ctx.strokeRect(pipX - 1, pipY - 17, pipW + 2, pipH + 18);
+
+              ctx.fillStyle = isHit ? 'rgba(185, 28, 28, 0.94)' : 'rgba(9, 12, 18, 0.92)';
+              ctx.fillRect(pipX - 1, pipY - 17, pipW + 2, 17);
+
+              ctx.fillStyle = '#ffffff';
+              ctx.font = '700 9px "JetBrains Mono", monospace';
+              const ptzLabel = isHit
+                ? `PTZ LOCK · ${targetSubj.matchedWatchlistLabel?.slice(0, 12)} · ${vp.zoomFactor}x`
+                : `AUTO-PTZ · ${targetSubj.id} · ${vp.zoomFactor}x`;
+              ctx.fillText(ptzLabel, pipX + 5, pipY - 5, pipW - 10);
+
+              // Subtle optical center crosshair inside PiP
+              const cx = pipX + pipW / 2;
+              const cy = pipY + pipH / 2;
+              ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+              ctx.lineWidth = 1;
+              ctx.beginPath();
+              ctx.moveTo(cx - 8, cy);
+              ctx.lineTo(cx - 3, cy);
+              ctx.moveTo(cx + 3, cy);
+              ctx.lineTo(cx + 8, cy);
+              ctx.moveTo(cx, cy - 8);
+              ctx.lineTo(cx, cy - 3);
+              ctx.moveTo(cx, cy + 3);
+              ctx.lineTo(cx, cy + 8);
+              ctx.stroke();
+              ctx.restore();
+            }
+          }
+        } else if (trackedSubjects.length === 0) {
+          ptzViewportRef.current = null;
         }
 
         // Draw crimson bounding boxes for any detected weapon objects
@@ -1428,13 +2124,24 @@ export function CameraFeedCard({
           width={640}
           height={360}
           data-testid={`camera-canvas-${camera.id}`}
+          onPointerDown={handleCanvasPointerDown}
+          onPointerMove={handleCanvasPointerMove}
+          onPointerUp={handleCanvasPointerUp}
           aria-label={
             isAudioOnly
               ? `Live acoustic monitor for ${camera.classroomName}`
               : `Live CCTV feed for ${camera.classroomName}`
           }
-          className="w-full h-full object-cover block relative z-10"
+          className={`w-full h-full object-cover block relative z-10 ${
+            isDrawingZone ? 'cursor-crosshair touch-none' : ''
+          }`}
         />
+
+        {isDrawingZone ? (
+          <div className="pointer-events-none absolute top-9 left-2.5 z-20 rounded bg-amber-950/90 border border-amber-500/60 px-2.5 py-1 text-[11px] font-medium text-amber-100">
+            Drag on feed to draw restricted perimeter
+          </div>
+        ) : null}
 
         {needsStreamReconnect ? (
           <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/70 p-4">
@@ -1617,6 +2324,23 @@ export function CameraFeedCard({
 
           <button
             type="button"
+            onClick={handleManualLockClick}
+            aria-label={`Lock forensic DVR evidence for ${camera.classroomName}`}
+            title="Save rolling WebM DVR video clip & forensic frames to Evidence Vault (SHA-256)"
+            className={`inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
+              justLockedEvidence
+                ? 'bg-emerald-950/70 border-emerald-500/60 text-emerald-300'
+                : 'bg-[#17181C] border-zinc-800 text-zinc-200 hover:text-white hover:border-zinc-700'
+            }`}
+          >
+            <Video className="w-3.5 h-3.5" aria-hidden="true" />
+            <span className="hidden sm:inline">
+              {justLockedEvidence ? 'Clip Saved' : 'Save Clip'}
+            </span>
+          </button>
+
+          <button
+            type="button"
             onClick={handleToggleLiveMic}
             aria-label={
               micActive
@@ -1677,6 +2401,152 @@ export function CameraFeedCard({
           </button>
         </div>
       </div>
+
+      {/* Real-Time Tracking, Auto-PTZ Zoom, Heatmap & Restricted Perimeter Strip (video feeds) */}
+      {!isAudioOnly ? (
+        <div className="px-3.5 py-2 border-t border-zinc-800/80 bg-[#0C0D11] space-y-2 text-[11px]">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() =>
+                  onUpdateCameraSettings(camera.id, {
+                    ptzAutoTrackEnabled: !ptzAutoTrackEnabled,
+                  })
+                }
+                aria-pressed={ptzAutoTrackEnabled}
+                aria-label={`Toggle digital Auto-PTZ zoom tracking for ${camera.classroomName}`}
+                className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded border transition-colors cursor-pointer whitespace-nowrap ${
+                  ptzAutoTrackEnabled
+                    ? 'bg-sky-950/60 border-sky-500/60 text-sky-200'
+                    : 'bg-[#14161B] border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                <Focus className="w-3 h-3" aria-hidden="true" />
+                <span>Auto-PTZ</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() =>
+                  onUpdateCameraSettings(camera.id, { trailsEnabled: !trailsEnabled })
+                }
+                aria-pressed={trailsEnabled}
+                aria-label={`Toggle movement trajectory trails for ${camera.classroomName}`}
+                className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded border transition-colors cursor-pointer whitespace-nowrap ${
+                  trailsEnabled
+                    ? 'bg-sky-950/60 border-sky-500/60 text-sky-200'
+                    : 'bg-[#14161B] border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                <Route className="w-3 h-3" aria-hidden="true" />
+                <span>Trails</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() =>
+                  onUpdateCameraSettings(camera.id, { heatmapEnabled: !heatmapEnabled })
+                }
+                aria-pressed={heatmapEnabled}
+                aria-label={`Toggle activity heatmap for ${camera.classroomName}`}
+                className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded border transition-colors cursor-pointer whitespace-nowrap ${
+                  heatmapEnabled
+                    ? 'bg-amber-950/60 border-amber-500/60 text-amber-300'
+                    : 'bg-[#14161B] border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                <Flame className="w-3 h-3" aria-hidden="true" />
+                <span>Heatmap</span>
+              </button>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  if (perimeterZone && !isDrawingZone) {
+                    onUpdateCameraSettings(camera.id, { perimeterZone: null });
+                  } else {
+                    setIsDrawingZone((prev) => !prev);
+                  }
+                }}
+                aria-label={
+                  perimeterZone && !isDrawingZone
+                    ? `Clear restricted perimeter on ${camera.classroomName}`
+                    : `Draw restricted perimeter on ${camera.classroomName}`
+                }
+                className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded border transition-colors cursor-pointer whitespace-nowrap ${
+                  perimeterBreached
+                    ? 'bg-red-950/80 border-red-500/70 text-red-200'
+                    : isDrawingZone || perimeterZone
+                      ? 'bg-amber-950/60 border-amber-500/60 text-amber-200'
+                      : 'bg-[#14161B] border-zinc-800 text-zinc-300 hover:text-white hover:border-zinc-700'
+                }`}
+              >
+                <Crosshair className="w-3 h-3" aria-hidden="true" />
+                <span>
+                  {isDrawingZone
+                    ? 'Cancel Draw'
+                    : perimeterZone
+                      ? 'Clear Zone'
+                      : 'Draw Zone'}
+                </span>
+              </button>
+
+              <span className="font-mono text-[10px] text-zinc-500 tabular-nums hidden sm:inline">
+                {isRecordingVideo ? `REC · ${dvrFrameCount}f` : `DVR ${dvrFrameCount}f`}
+              </span>
+            </div>
+          </div>
+
+          {/* Live Tracked Subjects Strip: Click to lock Auto-PTZ or Flag to Cross-Camera Re-ID Watchlist */}
+          {liveTrackedSubjects.length > 0 ? (
+            <div className="pt-1.5 border-t border-zinc-800/70 flex flex-wrap items-center gap-1.5">
+              <span className="text-[10px] font-mono text-zinc-500 uppercase mr-1">Tracked:</span>
+              {liveTrackedSubjects.map((subj) => {
+                const isLocked =
+                  lockedPtzSubjectId === subj.id ||
+                  (!lockedPtzSubjectId && liveTrackedSubjects[0]?.id === subj.id);
+                const isHit = Boolean(subj.matchedWatchlistId);
+                return (
+                  <div
+                    key={subj.id}
+                    className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded border text-[11px] font-mono tabular-nums ${
+                      isHit
+                        ? 'bg-red-950/70 border-red-500/70 text-red-100'
+                        : isLocked && ptzAutoTrackEnabled
+                          ? 'bg-sky-950/50 border-sky-500/50 text-sky-100'
+                          : 'bg-[#14161B] border-zinc-800 text-zinc-300'
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setLockedPtzSubjectId(subj.id)}
+                      title={`Lock Auto-PTZ onto ${subj.id}`}
+                      className="hover:underline cursor-pointer"
+                    >
+                      {isHit ? `${subj.matchedWatchlistLabel} ${subj.matchedSimilarity}%` : subj.id}
+                      {subj.dwellSeconds > 0 ? ` · ${subj.dwellSeconds}s` : ''}
+                    </button>
+                    {!isHit && onEnrollLiveSubject ? (
+                      <button
+                        type="button"
+                        onClick={() => handleFlagLiveSubject(subj)}
+                        title={`Flag ${subj.id} to Cross-Camera Re-ID Watchlist`}
+                        className="inline-flex items-center gap-0.5 pl-1.5 border-l border-zinc-700 text-amber-300 hover:text-amber-200 cursor-pointer font-sans font-medium"
+                      >
+                        <UserPlus className="w-3 h-3" aria-hidden="true" />
+                        <span>Flag</span>
+                      </button>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
 
       {/* Stream / Error Alerts (only rendered if present) */}
       {streamError || camera.errorMessage || micError ? (

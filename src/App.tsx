@@ -13,14 +13,17 @@ import {
 import type { User } from 'firebase/auth';
 import { AlertPopupOverlay } from './components/AlertPopupOverlay';
 import { AlertsPanel } from './components/AlertsPanel';
+import { AppDownloadControls, OfflineBanner } from './components/AppDownloadControls';
 import { BluetoothDirectoryView } from './components/BluetoothDirectoryView';
 import { BluetoothScannerModal, type ScannerModalTab } from './components/BluetoothScannerModal';
 import {
   CameraFeedCard,
   type CameraFramePayload,
+  type DvrBundleSnapshot,
   type RealtimeThreatEvent,
 } from './components/CameraFeedCard';
 import { DedicatedCameraPanel } from './components/DedicatedCameraPanel';
+import { EvidenceVaultView } from './components/EvidenceVaultView';
 import { LiveIncidentRail } from './components/LiveIncidentRail';
 import { NotificationBanner } from './components/NotificationBanner';
 import { Sidebar } from './components/Sidebar';
@@ -50,18 +53,24 @@ import {
 import type {
   ActiveWorkspaceView,
   AiEngineModel,
+  AppearanceSignature,
   BluetoothDeviceCandidate,
   ClassroomAnalysis,
   ClassroomCamera,
   DetectedObjectBox,
   DetectedPersonBox,
   FacilityMode,
+  ForensicEvidenceCase,
   IncidentAlert,
+  PerimeterZone,
   ThreatSensitivity,
+  WatchlistSubject,
   WorkspaceCourse,
   WorkspaceGmailMessage,
   WorkspaceTeacher,
 } from './types';
+import { extractAppearanceSignature } from './utils/subjectIntelligence';
+import { sealForensicEvidenceCase } from './utils/tacticalForensics';
 import { openRawMediaStream, playAlertChime, sendBrowserNotification } from './utils/mediaCapture';
 import {
   DEFAULT_DB_CALIBRATION_OFFSET,
@@ -89,6 +98,19 @@ const STORAGE_FACILITY_KEY = 'campusguard_facility_mode_v1';
 const STORAGE_TEACHER_EMAIL_KEY = 'campusguard_teacher_email_v1';
 const STORAGE_DB_OFFSET_KEY = 'campusguard_db_offset_v1';
 const STORAGE_SENSITIVITY_KEY = 'campusguard_threat_sensitivity_v1';
+const STORAGE_WATCHLIST_KEY = 'campusguard_watchlist_v1';
+
+function loadSavedWatchlist(): WatchlistSubject[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(STORAGE_WATCHLIST_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as WatchlistSubject[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
 
 function loadSavedThreatSensitivity(): ThreatSensitivity {
   if (typeof window === 'undefined') return 'standard';
@@ -186,6 +208,9 @@ export default function App() {
   const [wallLayout, setWallLayout] = useState<'1x1' | '2x2' | '3x3'>('2x2');
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
+  const [evidenceCases, setEvidenceCases] = useState<ForensicEvidenceCase[]>([]);
+  const [selectedEvidenceId, setSelectedEvidenceId] = useState<string | null>(null);
+  const [watchlist, setWatchlist] = useState<WatchlistSubject[]>(loadSavedWatchlist);
 
   const openScannerOnTab = useCallback((tab: ScannerModalTab) => {
     setScannerInitialTab(tab);
@@ -297,6 +322,8 @@ export default function App() {
   }, [courseTeachers]);
 
   const frameCapturersRef = useRef<Record<string, () => CameraFramePayload | null>>({});
+  const dvrProvidersRef = useRef<Record<string, () => DvrBundleSnapshot>>({});
+  const caseCounterRef = useRef(1);
   const mediaStreamsRef = useRef<Record<string, MediaStream>>({});
   const analyzingIdsRef = useRef<Set<string>>(new Set());
   const lastSpikeScanAtRef = useRef<Record<string, number>>({});
@@ -591,6 +618,14 @@ export default function App() {
     }
   }, [threatSensitivity]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_WATCHLIST_KEY, JSON.stringify(watchlist.slice(0, 24)));
+    } catch {
+      // ignore storage quota errors
+    }
+  }, [watchlist]);
+
   const labels = useMemo(() => formatFacilityLabels(facilityMode), [facilityMode]);
 
   const summary = useMemo(
@@ -615,6 +650,89 @@ export default function App() {
       } else {
         delete frameCapturersRef.current[cameraId];
       }
+    },
+    []
+  );
+
+  const registerDvrProvider = useCallback(
+    (cameraId: string, provider: (() => DvrBundleSnapshot) | null) => {
+      if (provider) {
+        dvrProvidersRef.current[cameraId] = provider;
+      } else {
+        delete dvrProvidersRef.current[cameraId];
+      }
+    },
+    []
+  );
+
+  const sealEvidenceCaseForCamera = useCallback(
+    async (params: {
+      camera: ClassroomCamera | null;
+      triggerType: ForensicEvidenceCase['triggerType'];
+      threatCategory: ForensicEvidenceCase['threatCategory'];
+      severity: ForensicEvidenceCase['severity'];
+      headline: string;
+      summary: string;
+      bundle?: DvrBundleSnapshot;
+      fallbackSnapshotUrl?: string;
+      perimeterZone?: PerimeterZone;
+    }): Promise<ForensicEvidenceCase> => {
+      const { camera } = params;
+      const caseSeq = caseCounterRef.current++;
+      const caseNumber = `CASE-${String(caseSeq).padStart(3, '0')}`;
+      const sealedAt = new Date().toISOString();
+
+      const liveBundle =
+        params.bundle ?? (camera ? dvrProvidersRef.current[camera.id]?.() : undefined);
+      let collectedFrames = liveBundle?.frames ? [...liveBundle.frames] : [];
+
+      if (collectedFrames.length === 0 && params.fallbackSnapshotUrl) {
+        collectedFrames = [
+          {
+            capturedAt: sealedAt,
+            offsetSec: 0,
+            imageDataUrl: params.fallbackSnapshotUrl,
+            studentCount: camera?.studentCount ?? 0,
+            audioLevel: camera?.audioLevel ?? 0,
+            threatScore: camera?.lastAnalysis?.threatScore ?? 0,
+            transcript: camera?.liveTranscript ?? '',
+          },
+        ];
+      }
+
+      const peakAudioDb = Math.max(
+        camera?.audioLevel ?? 0,
+        ...collectedFrames.map((f) => f.audioLevel || 0)
+      );
+      const maxPeopleCount = Math.max(
+        camera?.studentCount ?? 0,
+        ...collectedFrames.map((f) => f.studentCount || 0)
+      );
+
+      const sealed = await sealForensicEvidenceCase({
+        id: `ev-${Date.now()}-${caseSeq}`,
+        caseNumber,
+        cameraId: camera?.id ?? 'site-command',
+        cameraCode: camera?.cameraCode ?? 'SITE',
+        classroomName: camera?.classroomName ?? 'Site Command',
+        triggerType: params.triggerType,
+        threatCategory: params.threatCategory,
+        severity: params.severity,
+        headline: params.headline,
+        summary: params.summary,
+        sealedAt,
+        peakAudioDb,
+        maxPeopleCount,
+        transcriptSnapshot: camera?.liveTranscript || '',
+        perimeterZone: params.perimeterZone ?? camera?.perimeterZone,
+        videoClipUrl: liveBundle?.videoClipUrl,
+        videoClipMimeType: liveBundle?.videoClipMimeType,
+        frames: collectedFrames,
+      });
+
+      setEvidenceCases((prev) => [sealed, ...prev].slice(0, 40));
+      setSelectedEvidenceId((prev) => prev ?? sealed.id);
+      return sealed;
     },
     []
   );
@@ -688,6 +806,15 @@ export default function App() {
           setAlerts((prev) => [enrichedAlert, ...prev]);
           setPopupAlerts((prev) => [enrichedAlert, ...prev.filter((item) => item.id !== enrichedAlert.id)].slice(0, 6));
           void persistIncidentAsync(enrichedAlert);
+          void sealEvidenceCaseForCamera({
+            camera: target,
+            triggerType: 'threat',
+            threatCategory: enrichedAlert.threatCategory ?? 'disturbance',
+            severity: enrichedAlert.severity === 'critical' ? 'critical' : 'warning',
+            headline: enrichedAlert.headline,
+            summary: enrichedAlert.details,
+            fallbackSnapshotUrl: previewDataUrl,
+          });
           if (soundAlertsEnabled) {
             playAlertChime();
           }
@@ -824,6 +951,15 @@ export default function App() {
           setAlerts((prev) => [enrichedAlert, ...prev]);
           setPopupAlerts((prev) => [enrichedAlert, ...prev.filter((item) => item.id !== enrichedAlert.id)].slice(0, 6));
           void persistIncidentAsync(enrichedAlert);
+          void sealEvidenceCaseForCamera({
+            camera: target,
+            triggerType: 'threat',
+            threatCategory: enrichedAlert.threatCategory ?? 'disturbance',
+            severity: enrichedAlert.severity === 'critical' ? 'critical' : 'warning',
+            headline: enrichedAlert.headline,
+            summary: enrichedAlert.details,
+            fallbackSnapshotUrl: capturePayload?.previewDataUrl,
+          });
           if (soundAlertsEnabled) {
             playAlertChime();
           }
@@ -874,6 +1010,7 @@ export default function App() {
       facilityMode,
       persistIncidentAsync,
       persistZoneAsync,
+      sealEvidenceCaseForCamera,
       selectedAiModel,
       soundAlertsEnabled,
       threatSensitivity,
@@ -1010,6 +1147,15 @@ export default function App() {
             [enriched, ...prev.filter((item) => item.id !== enriched.id)].slice(0, 6)
           );
           void persistIncidentAsync(enriched);
+          void sealEvidenceCaseForCamera({
+            camera: target,
+            triggerType: 'threat',
+            threatCategory: enriched.threatCategory ?? 'disturbance',
+            severity: enriched.severity === 'critical' ? 'critical' : 'warning',
+            headline: enriched.headline,
+            summary: enriched.details,
+            fallbackSnapshotUrl: event.previewDataUrl,
+          });
           if (soundAlertsEnabled) {
             playAlertChime();
           }
@@ -1019,8 +1165,368 @@ export default function App() {
         }
       }
     },
-    [desktopNotifications, facilityMode, persistIncidentAsync, soundAlertsEnabled]
+    [
+      desktopNotifications,
+      facilityMode,
+      persistIncidentAsync,
+      sealEvidenceCaseForCamera,
+      soundAlertsEnabled,
+    ]
   );
+
+  const handlePerimeterBreach = useCallback(
+    (
+      cameraId: string,
+      breachingPeople: DetectedPersonBox[],
+      zone: PerimeterZone,
+      bundle: DvrBundleSnapshot
+    ) => {
+      const target = camerasRef.current.find((c) => c.id === cameraId);
+      if (!target) return;
+      const nowIso = new Date().toISOString();
+      const count = breachingPeople.length;
+      const headline = `Restricted Perimeter Breach (${zone.label || 'Restricted Zone'})`;
+      const details = `${count} ${count === 1 ? 'person' : 'people'} crossed into restricted zone "${zone.label || 'Restricted Zone'}" on ${target.classroomName}. Forensic video & DVR buffer automatically sealed.`;
+
+      setCameras((prev) =>
+        prev.map((cam) =>
+          cam.id === cameraId
+            ? {
+                ...cam,
+                status: 'fighting',
+                lastAnalysis: cam.lastAnalysis
+                  ? {
+                      ...cam.lastAnalysis,
+                      isFighting: true,
+                      severity: 'critical',
+                      threatCategory: 'intrusion',
+                      threatScore: 96,
+                      detectedBehaviors: ['Restricted perimeter breach'],
+                      fightReason: details,
+                      recommendedAction:
+                        'Dispatch security immediately and review sealed DVR frames & video clip in Evidence Vault.',
+                      summary: headline,
+                      analyzedAt: nowIso,
+                    }
+                  : {
+                      studentCount: cam.studentCount,
+                      detectedPeople: breachingPeople,
+                      detectedObjects: [],
+                      isFighting: true,
+                      severity: 'critical',
+                      threatCategory: 'intrusion',
+                      threatScore: 96,
+                      detectedBehaviors: ['Restricted perimeter breach'],
+                      recommendedAction:
+                        'Dispatch security immediately and review sealed DVR frames & video clip in Evidence Vault.',
+                      voiceAnalysis: 'Perimeter intrusion alarm active.',
+                      fightReason: details,
+                      summary: headline,
+                      confidence: 96,
+                      analyzedAt: nowIso,
+                    },
+              }
+            : cam
+        )
+      );
+
+      const snapshot = bundle.frames[bundle.frames.length - 1]?.imageDataUrl;
+      const breachAlert: IncidentAlert = {
+        id: `alert-breach-${Date.now()}-${cameraId}`,
+        alertType: 'ai-vision',
+        cameraId: target.id,
+        cameraCode: target.cameraCode,
+        classroomName: target.classroomName,
+        timestamp: nowIso,
+        severity: 'critical',
+        threatCategory: 'intrusion',
+        threatScore: 96,
+        headline,
+        details,
+        detectedBehaviors: ['Restricted perimeter breach'],
+        recommendedAction:
+          'Dispatch security immediately and review sealed DVR frames & video clip in Evidence Vault.',
+        voiceCue: target.liveTranscript || 'Perimeter sensor triggered.',
+        studentCount: target.studentCount,
+        evidenceSnapshotUrl: snapshot,
+        acknowledged: false,
+      };
+
+      setAlerts((prev) => [breachAlert, ...prev]);
+      setPopupAlerts((prev) =>
+        [breachAlert, ...prev.filter((item) => item.id !== breachAlert.id)].slice(0, 6)
+      );
+      void persistIncidentAsync(breachAlert);
+      void sealEvidenceCaseForCamera({
+        camera: target,
+        triggerType: 'perimeter_breach',
+        threatCategory: 'intrusion',
+        severity: 'critical',
+        headline,
+        summary: details,
+        bundle,
+        perimeterZone: zone,
+      });
+
+      if (soundAlertsEnabled) {
+        playAlertChime();
+      }
+      if (desktopNotifications) {
+        sendBrowserNotification(breachAlert);
+      }
+    },
+    [desktopNotifications, persistIncidentAsync, sealEvidenceCaseForCamera, soundAlertsEnabled]
+  );
+
+  const handleManualLockEvidence = useCallback(
+    (cameraId: string, bundle: DvrBundleSnapshot) => {
+      const target = camerasRef.current.find((c) => c.id === cameraId);
+      if (!target) return;
+      const frameCount = bundle.frames.length;
+      const hasVideoClip = Boolean(bundle.videoClipUrl);
+      void sealEvidenceCaseForCamera({
+        camera: target,
+        triggerType: 'manual_lock',
+        threatCategory: target.lastAnalysis?.threatCategory ?? 'none',
+        severity: target.status === 'fighting' ? 'critical' : 'info',
+        headline: `Manual Forensic Clip · ${target.classroomName}`,
+        summary: `Operator saved ${
+          hasVideoClip ? 'recorded .webm video clip and ' : ''
+        }${frameCount} rolling black-box DVR ${
+          frameCount === 1 ? 'frame' : 'frames'
+        } from ${target.cameraCode} (${target.classroomName}) with SHA-256 Chain-of-Custody seal.`,
+        bundle,
+      }).then((sealed) => {
+        setSelectedEvidenceId(sealed.id);
+        setStatusNotice(
+          `Forensic evidence ${sealed.caseNumber} sealed (SHA-256) in Evidence Vault (${sealed.frames.length} frames${
+            sealed.videoClipUrl ? ' + .webm video clip' : ''
+          }).`
+        );
+      });
+    },
+    [sealEvidenceCaseForCamera]
+  );
+
+  const handleEnrollLiveSubject = useCallback(
+    (
+      cameraId: string,
+      payload: {
+        label: string;
+        thumbnailDataUrl: string;
+        signature: AppearanceSignature;
+      }
+    ) => {
+      const target = camerasRef.current.find((c) => c.id === cameraId);
+      const entry: WatchlistSubject = {
+        id: `wl-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        label: payload.label,
+        enrolledAt: new Date().toISOString(),
+        sourceCameraCode: target?.cameraCode ?? 'LIVE',
+        thumbnailDataUrl: payload.thumbnailDataUrl,
+        signature: payload.signature,
+        matchCount: 0,
+      };
+      setWatchlist((prev) => [entry, ...prev].slice(0, 24));
+      setStatusNotice(
+        `Watchlist Re-ID armed for "${entry.label}" (${entry.sourceCameraCode}). All cameras will alert automatically if this person appears.`
+      );
+    },
+    []
+  );
+
+  const handleEnrollWatchlistPhoto = useCallback((file: File, label: string) => {
+    const objectUrl = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const maxDim = 256;
+        const scale = Math.min(1, maxDim / Math.max(img.naturalWidth || 1, img.naturalHeight || 1));
+        const w = Math.max(32, Math.round((img.naturalWidth || 160) * scale));
+        const h = Math.max(32, Math.round((img.naturalHeight || 160) * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        ctx.drawImage(img, 0, 0, w, h);
+        const rgba = ctx.getImageData(0, 0, w, h).data;
+        const signature = extractAppearanceSignature(rgba, w, h, [0, 0, 1000, 1000]);
+
+        const thumbCanvas = document.createElement('canvas');
+        thumbCanvas.width = 160;
+        thumbCanvas.height = 160;
+        const tCtx = thumbCanvas.getContext('2d');
+        let thumbnailDataUrl = '';
+        if (tCtx) {
+          const srcSide = Math.min(img.naturalWidth || w, img.naturalHeight || h);
+          const sx = Math.max(0, Math.round(((img.naturalWidth || w) - srcSide) / 2));
+          const sy = Math.max(0, Math.round(((img.naturalHeight || h) - srcSide) / 2));
+          tCtx.drawImage(img, sx, sy, srcSide, srcSide, 0, 0, 160, 160);
+          thumbnailDataUrl = thumbCanvas.toDataURL('image/jpeg', 0.82);
+        }
+
+        const entry: WatchlistSubject = {
+          id: `wl-photo-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          label: label.trim() || 'Watchlist Target',
+          enrolledAt: new Date().toISOString(),
+          sourceCameraCode: 'PHOTO',
+          thumbnailDataUrl,
+          signature,
+          matchCount: 0,
+        };
+        setWatchlist((prev) => [entry, ...prev].slice(0, 24));
+        setStatusNotice(
+          `Enrolled "${entry.label}" into Cross-Camera Watchlist Re-ID. Matching active across all cameras.`
+        );
+      } finally {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      setGlobalError('Could not read reference photo for Watchlist enrollment.');
+    };
+    img.src = objectUrl;
+  }, []);
+
+  const handleRemoveWatchlistSubject = useCallback((id: string) => {
+    setWatchlist((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
+  const handleWatchlistMatch = useCallback(
+    (
+      cameraId: string,
+      payload: {
+        watchlistItem: WatchlistSubject;
+        subjectId: string;
+        similarity: number;
+        bundle: DvrBundleSnapshot;
+      }
+    ) => {
+      const target = camerasRef.current.find((c) => c.id === cameraId);
+      if (!target) return;
+      const nowIso = new Date().toISOString();
+      const { watchlistItem, subjectId, similarity, bundle } = payload;
+
+      setWatchlist((prev) =>
+        prev.map((item) =>
+          item.id === watchlistItem.id
+            ? {
+                ...item,
+                matchCount: item.matchCount + 1,
+                lastMatchedAt: nowIso,
+                lastMatchedZone: target.classroomName,
+              }
+            : item
+        )
+      );
+
+      const headline = `WATCHLIST MATCH · ${watchlistItem.label} (${similarity}%)`;
+      const details = `Tracked subject ${subjectId} on ${target.classroomName} (${target.cameraCode}) matched Watchlist target "${watchlistItem.label}" with ${similarity}% spatial appearance Re-ID confidence.`;
+
+      setCameras((prev) =>
+        prev.map((cam) =>
+          cam.id === cameraId
+            ? {
+                ...cam,
+                status: 'fighting',
+                lastAnalysis: cam.lastAnalysis
+                  ? {
+                      ...cam.lastAnalysis,
+                      isFighting: true,
+                      severity: 'critical',
+                      threatCategory: 'intrusion',
+                      threatScore: Math.max(cam.lastAnalysis.threatScore ?? 0, similarity),
+                      detectedBehaviors: [
+                        `Watchlist Re-ID match: ${watchlistItem.label} (${similarity}%)`,
+                      ],
+                      fightReason: details,
+                      recommendedAction:
+                        'Verify matched subject on live feed and review sealed clip in Evidence Vault.',
+                      summary: headline,
+                      analyzedAt: nowIso,
+                    }
+                  : {
+                      studentCount: Math.max(1, cam.studentCount),
+                      detectedPeople: [],
+                      detectedObjects: [],
+                      isFighting: true,
+                      severity: 'critical',
+                      threatCategory: 'intrusion',
+                      threatScore: similarity,
+                      detectedBehaviors: [
+                        `Watchlist Re-ID match: ${watchlistItem.label} (${similarity}%)`,
+                      ],
+                      recommendedAction:
+                        'Verify matched subject on live feed and review sealed clip in Evidence Vault.',
+                      voiceAnalysis: 'Watchlist Re-ID engine triggered.',
+                      fightReason: details,
+                      summary: headline,
+                      confidence: similarity,
+                      analyzedAt: nowIso,
+                    },
+              }
+            : cam
+        )
+      );
+
+      const snapshot = bundle.frames[bundle.frames.length - 1]?.imageDataUrl;
+      const matchAlert: IncidentAlert = {
+        id: `alert-wl-${Date.now()}-${cameraId}`,
+        alertType: 'ai-vision',
+        cameraId: target.id,
+        cameraCode: target.cameraCode,
+        classroomName: target.classroomName,
+        timestamp: nowIso,
+        severity: 'critical',
+        threatCategory: 'intrusion',
+        threatScore: similarity,
+        headline,
+        details,
+        detectedBehaviors: [`Watchlist Re-ID match: ${watchlistItem.label} (${similarity}%)`],
+        recommendedAction:
+          'Verify matched subject on live feed and review sealed clip in Evidence Vault.',
+        voiceCue: target.liveTranscript || 'Cross-camera Re-ID alert.',
+        studentCount: target.studentCount,
+        evidenceSnapshotUrl: snapshot ?? watchlistItem.thumbnailDataUrl,
+        acknowledged: false,
+      };
+
+      setAlerts((prev) => [matchAlert, ...prev]);
+      setPopupAlerts((prev) =>
+        [matchAlert, ...prev.filter((item) => item.id !== matchAlert.id)].slice(0, 6)
+      );
+      void persistIncidentAsync(matchAlert);
+      void sealEvidenceCaseForCamera({
+        camera: target,
+        triggerType: 'watchlist_match',
+        threatCategory: 'intrusion',
+        severity: 'critical',
+        headline,
+        summary: details,
+        bundle,
+      });
+
+      if (soundAlertsEnabled) {
+        playAlertChime();
+      }
+      if (desktopNotifications) {
+        sendBrowserNotification(matchAlert);
+      }
+    },
+    [desktopNotifications, persistIncidentAsync, sealEvidenceCaseForCamera, soundAlertsEnabled]
+  );
+
+  const handleDeleteEvidenceCase = useCallback((caseId: string) => {
+    setEvidenceCases((prev) => {
+      const next = prev.filter((item) => item.id !== caseId);
+      setSelectedEvidenceId((current) =>
+        current === caseId ? next[0]?.id ?? null : current
+      );
+      return next;
+    });
+  }, []);
 
   const handleUpdateCameraSettings = useCallback(
     (
@@ -1036,6 +1542,10 @@ export default function App() {
           | 'linkedCourseId'
           | 'linkedCourseName'
           | 'teacherEmail'
+          | 'ptzAutoTrackEnabled'
+          | 'trailsEnabled'
+          | 'heatmapEnabled'
+          | 'perimeterZone'
         >
       >
     ) => {
@@ -1208,6 +1718,15 @@ export default function App() {
             [enrichedVoiceAlert, ...prev.filter((item) => item.id !== enrichedVoiceAlert.id)].slice(0, 6)
           );
           void persistIncidentAsync(enrichedVoiceAlert);
+          void sealEvidenceCaseForCamera({
+            camera: target,
+            triggerType: 'threat',
+            threatCategory: enrichedVoiceAlert.threatCategory ?? 'disturbance',
+            severity: 'critical',
+            headline: enrichedVoiceAlert.headline,
+            summary: enrichedVoiceAlert.details,
+            fallbackSnapshotUrl: capture?.previewDataUrl,
+          });
           if (soundAlertsEnabled) {
             playAlertChime();
           }
@@ -1249,6 +1768,14 @@ export default function App() {
               setAlerts((prev) => [dbAlert, ...prev]);
               setPopupAlerts((prev) => [dbAlert, ...prev.filter((item) => item.id !== dbAlert.id)].slice(0, 6));
               void persistIncidentAsync(dbAlert);
+              void sealEvidenceCaseForCamera({
+                camera: target,
+                triggerType: 'sound_threshold',
+                threatCategory: 'disturbance',
+                severity: 'critical',
+                headline: dbAlert.headline,
+                summary: dbAlert.details,
+              });
               if (soundAlertsEnabled) {
                 playAlertChime();
               }
@@ -1278,6 +1805,7 @@ export default function App() {
       desktopNotifications,
       facilityMode,
       persistIncidentAsync,
+      sealEvidenceCaseForCamera,
       soundAlertsEnabled,
     ]
   );
@@ -1569,6 +2097,7 @@ export default function App() {
       stream.getTracks().forEach((t) => t.stop());
       delete mediaStreamsRef.current[cameraId];
     }
+    delete dvrProvidersRef.current[cameraId];
     setCameras((prev) => prev.filter((c) => c.id !== cameraId));
     setFocusedCameraId((prev) => (prev === cameraId ? null : prev));
 
@@ -1809,8 +2338,10 @@ export default function App() {
         activeView={activeView}
         onSelectView={setActiveView}
         unreadAlertsCount={summary.activeAlertsCount}
+        evidenceCount={evidenceCases.length}
         onOpenScanner={() => openScannerOnTab('wifi')}
       />
+      <OfflineBanner />
 
       <div className="flex flex-1 min-w-0">
         <Sidebar
@@ -1847,6 +2378,10 @@ export default function App() {
           onSignOut={() => {
             void handleSignOut();
           }}
+          watchlist={watchlist}
+          onEnrollWatchlistPhoto={handleEnrollWatchlistPhoto}
+          onRemoveWatchlistSubject={handleRemoveWatchlistSubject}
+          onStatusNotice={setStatusNotice}
         />
 
         {activeView === 'grid' ? (
@@ -1896,7 +2431,7 @@ export default function App() {
                 </div>
 
                 {/* Right Controls: Mobile selectors + Wall Layout Switcher */}
-                <div className="flex items-center gap-2 shrink-0">
+                <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 min-w-0">
                   <select
                     aria-label="Select facility mode"
                     value={facilityMode}
@@ -1916,6 +2451,7 @@ export default function App() {
                   >
                     AI: {threatSensitivity === 'high' ? 'High' : 'Std'}
                   </button>
+                  <AppDownloadControls compact onStatusNotice={setStatusNotice} />
 
                   {focusedCamera ? (
                     <button
@@ -2136,9 +2672,15 @@ export default function App() {
                       cloudQuotaExhausted={cloudQuotaExhausted}
                       isFocused
                       liveMediaStream={mediaStreamsRef.current[focusedCamera.id] ?? null}
+                      watchlist={watchlist}
                       onRegisterCapture={registerCapture}
+                      onRegisterDvrProvider={registerDvrProvider}
                       onLocalPersonDetections={handleLocalPersonDetections}
                       onRealtimeEdgeThreat={handleRealtimeEdgeThreat}
+                      onPerimeterBreach={handlePerimeterBreach}
+                      onManualLockEvidence={handleManualLockEvidence}
+                      onEnrollLiveSubject={handleEnrollLiveSubject}
+                      onWatchlistMatch={handleWatchlistMatch}
                       onReconnectStream={(id) => {
                         void handleReconnectStream(id);
                       }}
@@ -2172,9 +2714,15 @@ export default function App() {
                               cloudQuotaExhausted={cloudQuotaExhausted}
                               isFocused={false}
                               liveMediaStream={mediaStreamsRef.current[cam.id] ?? null}
+                              watchlist={watchlist}
                               onRegisterCapture={registerCapture}
+                              onRegisterDvrProvider={registerDvrProvider}
                               onLocalPersonDetections={handleLocalPersonDetections}
                               onRealtimeEdgeThreat={handleRealtimeEdgeThreat}
+                              onPerimeterBreach={handlePerimeterBreach}
+                              onManualLockEvidence={handleManualLockEvidence}
+                              onEnrollLiveSubject={handleEnrollLiveSubject}
+                              onWatchlistMatch={handleWatchlistMatch}
                               onReconnectStream={(id) => {
                                 void handleReconnectStream(id);
                               }}
@@ -2211,9 +2759,15 @@ export default function App() {
                         cloudQuotaExhausted={cloudQuotaExhausted}
                         isFocused={false}
                         liveMediaStream={mediaStreamsRef.current[cam.id] ?? null}
+                        watchlist={watchlist}
                         onRegisterCapture={registerCapture}
+                        onRegisterDvrProvider={registerDvrProvider}
                         onLocalPersonDetections={handleLocalPersonDetections}
                         onRealtimeEdgeThreat={handleRealtimeEdgeThreat}
+                        onPerimeterBreach={handlePerimeterBreach}
+                        onManualLockEvidence={handleManualLockEvidence}
+                        onEnrollLiveSubject={handleEnrollLiveSubject}
+                        onWatchlistMatch={handleWatchlistMatch}
                         onReconnectStream={(id) => {
                           void handleReconnectStream(id);
                         }}
@@ -2337,6 +2891,16 @@ export default function App() {
                   onNotifyTeacher={(alert) => setDispatchAlert(alert)}
                 />
               </div>
+            ) : null}
+
+            {activeView === 'evidence' ? (
+              <EvidenceVaultView
+                cases={evidenceCases}
+                selectedCaseId={selectedEvidenceId}
+                onSelectCase={setSelectedEvidenceId}
+                onDeleteCase={handleDeleteEvidenceCase}
+                onReturnToWall={() => setActiveView('grid')}
+              />
             ) : null}
 
             {activeView === 'workspace' ? (
