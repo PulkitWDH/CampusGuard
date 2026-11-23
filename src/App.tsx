@@ -465,7 +465,9 @@ export default function App() {
         await syncWorkspaceFromGoogle(accessToken);
       }
     } catch (err) {
-      setWorkspaceError(err instanceof Error ? err.message : 'Google sign-in failed.');
+      const msg = err instanceof Error ? err.message : 'Google sign-in failed.';
+      setWorkspaceError(msg);
+      setGlobalError(msg);
     } finally {
       setIsSigningIn(false);
     }
