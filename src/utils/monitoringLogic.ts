@@ -1292,8 +1292,8 @@ export function stepPersonTracker(
     sampleTorsoSignature?: (box_2d: [number, number, number, number]) => number[] | null;
   }
 ): { nextState: PersonTrackerState; people: DetectedPersonBox[] } {
-  const instantConfidence = options?.instantConfidence ?? 62;
-  const minConfidence = options?.minConfidence ?? 48;
+  const instantConfidence = options?.instantConfidence ?? 58;
+  const minConfidence = options?.minConfidence ?? 36;
   const maxMissedFrames = options?.maxMissedFrames ?? 2;
   const maxOccludedFrames = options?.maxOccludedFrames ?? 35;
   const weakDetections = options?.weakDetections ?? [];
@@ -2221,10 +2221,69 @@ export function parseSafeJsonText<T>(rawText: string): SafeJsonParseResult<T> {
   }
 }
 
+export function computeAspectPreservingSize(
+  srcWidth: number,
+  srcHeight: number,
+  maxDim = 640
+): { width: number; height: number } {
+  const safeW = Number.isFinite(srcWidth) && srcWidth > 0 ? srcWidth : maxDim;
+  const safeH = Number.isFinite(srcHeight) && srcHeight > 0 ? srcHeight : Math.round((maxDim * 9) / 16);
+  const longest = Math.max(safeW, safeH);
+  const scale = longest > maxDim ? maxDim / longest : 1;
+  return {
+    width: Math.max(2, Math.round(safeW * scale)),
+    height: Math.max(2, Math.round(safeH * scale)),
+  };
+}
 
+export interface ContainDrawRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
 
+/**
+ * Computes an aspect-ratio-preserving letterbox/pillarbox destination rectangle inside dstWidth x dstHeight
+ * so portrait mobile cameras (e.g. 480x640 or 720x1280) are never horizontally stretched on 16:9 displays.
+ */
+export function computeContainDrawRect(
+  srcWidth: number,
+  srcHeight: number,
+  dstWidth: number,
+  dstHeight: number
+): ContainDrawRect {
+  if (
+    !Number.isFinite(srcWidth) ||
+    !Number.isFinite(srcHeight) ||
+    srcWidth <= 0 ||
+    srcHeight <= 0 ||
+    dstWidth <= 0 ||
+    dstHeight <= 0
+  ) {
+    return { x: 0, y: 0, width: Math.max(1, dstWidth), height: Math.max(1, dstHeight) };
+  }
 
+  const scale = Math.min(dstWidth / srcWidth, dstHeight / srcHeight);
+  const drawW = Math.max(1, Math.round(srcWidth * scale));
+  const drawH = Math.max(1, Math.round(srcHeight * scale));
+  const x = Math.round((dstWidth - drawW) / 2);
+  const y = Math.round((dstHeight - drawH) / 2);
+  return { x, y, width: drawW, height: drawH };
+}
 
-
-
-
+/**
+ * Maps a [ymin, xmin, ymax, xmax] normalized 0..1000 bounding box into pixel coordinates
+ * relative to the actual drawn video/image rectangle on the canvas.
+ */
+export function mapNormalizedBoxToRect(
+  box_2d: [number, number, number, number],
+  rect: ContainDrawRect
+): ContainDrawRect {
+  const [ymin, xmin, ymax, xmax] = box_2d;
+  const x = Math.round(rect.x + (xmin / 1000) * rect.width);
+  const y = Math.round(rect.y + (ymin / 1000) * rect.height);
+  const width = Math.max(16, Math.round(((xmax - xmin) / 1000) * rect.width));
+  const height = Math.max(16, Math.round(((ymax - ymin) / 1000) * rect.height));
+  return { x, y, width, height };
+}

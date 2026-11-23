@@ -1,11 +1,14 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Bluetooth,
   Camera,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   ExternalLink,
   Mic,
   Plus,
+  Radio,
   RefreshCw,
   Upload,
   Video,
@@ -26,8 +29,17 @@ import {
   WIFI_CAMERA_BRAND_PRESETS,
   buildWifiCameraUrl,
 } from '../utils/wifiCameraPresets';
+import {
+  WIFI_HOTSPOT_QUICK_PRESETS,
+  detectBrowserNetworkInfo,
+  deduplicateDiscoveredWifiCameras,
+  scanComputerWifiCameras,
+  type WifiDiscoveredCamera,
+  type WifiHotspotQuickPreset,
+  type WifiScanProgress,
+} from '../utils/wifiDiscovery';
 
-export type ScannerModalTab = 'wifi' | 'bluetooth' | 'hardware' | 'upload';
+export type ScannerModalTab = 'wifi' | 'bluetooth' | 'hardware' | 'microphone' | 'upload';
 
 interface BluetoothScannerModalProps {
   isOpen: boolean;
@@ -38,9 +50,12 @@ interface BluetoothScannerModalProps {
   onClose: () => void;
   onAddWifiCamera: (params: {
     classroomName: string;
-    streamUrl: string;
+    streamUrl?: string;
     wifiBrand: string;
     wifiDirectMode: boolean;
+    stream?: MediaStream;
+    videoDeviceId?: string;
+    audioDeviceId?: string;
   }) => void;
   onAddBluetoothCamera: (
     device: BluetoothDeviceCandidate,
@@ -51,6 +66,12 @@ interface BluetoothScannerModalProps {
     classroomName: string,
     stream: MediaStream,
     videoDeviceId?: string,
+    audioDeviceId?: string,
+    deviceLabel?: string
+  ) => void;
+  onAddMicrophoneZone: (
+    classroomName: string,
+    stream: MediaStream | null,
     audioDeviceId?: string,
     deviceLabel?: string
   ) => void;
@@ -73,6 +94,7 @@ export function BluetoothScannerModal({
   onAddWifiCamera,
   onAddBluetoothCamera,
   onAddHardwareCamera,
+  onAddMicrophoneZone,
   onAddUploadedCamera,
 }: BluetoothScannerModalProps) {
   const [activeTab, setActiveTab] = useState<ScannerModalTab>(initialTab);
@@ -90,14 +112,14 @@ export function BluetoothScannerModal({
   const [btStreamUrls, setBtStreamUrls] = useState<Record<string, string>>({});
   const [overrideEligibleIds, setOverrideEligibleIds] = useState<Record<string, boolean>>({});
 
-  // Wi-Fi CCTV Camera setup
+  // Wi-Fi CCTV Camera setup (zero-PIN computer Wi-Fi auto-discovery + optional advanced manual entry)
   const [wifiBrandId, setWifiBrandId] = useState<string>('ip-webcam');
   const [wifiRoomName, setWifiRoomName] = useState('');
   const [wifiHostOrUrl, setWifiHostOrUrl] = useState('');
   const [wifiPort, setWifiPort] = useState('8080');
   const [wifiUsername, setWifiUsername] = useState('');
   const [wifiPassword, setWifiPassword] = useState('');
-  const [wifiDirectMode, setWifiDirectMode] = useState(false);
+  const [wifiDirectMode, setWifiDirectMode] = useState(true);
   const [wifiTesting, setWifiTesting] = useState(false);
   const [wifiError, setWifiError] = useState<string | null>(null);
   const [wifiTestResult, setWifiTestResult] = useState<{
@@ -106,6 +128,15 @@ export function BluetoothScannerModal({
     previewDataUrl?: string;
     note: string;
   } | null>(null);
+  const [isScanningWifi, setIsScanningWifi] = useState(false);
+  const [wifiScanCompleted, setWifiScanCompleted] = useState(false);
+  const [wifiScanProgress, setWifiScanProgress] = useState<WifiScanProgress | null>(null);
+  const [discoveredWifiCameras, setDiscoveredWifiCameras] = useState<WifiDiscoveredCamera[]>([]);
+  const [wifiDetectedSubnet, setWifiDetectedSubnet] = useState<string | null>(null);
+  const [connectingWifiId, setConnectingWifiId] = useState<string | null>(null);
+  const [showAdvancedWifi, setShowAdvancedWifi] = useState(false);
+  const wifiScanAbortRef = useRef<AbortController | null>(null);
+  const networkStatus = detectBrowserNetworkInfo();
 
   // Hardware cameras & mics
   const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
@@ -115,6 +146,11 @@ export function BluetoothScannerModal({
   const [hardwareRoomName, setHardwareRoomName] = useState('');
   const [hardwareError, setHardwareError] = useState<string | null>(null);
   const [isLoadingDevices, setIsLoadingDevices] = useState(false);
+
+  // Microphone-only acoustic monitor
+  const [micRoomName, setMicRoomName] = useState('');
+  const [micOnlyError, setMicOnlyError] = useState<string | null>(null);
+  const [isConnectingMic, setIsConnectingMic] = useState(false);
 
   // Upload footage
   const [uploadRoomName, setUploadRoomName] = useState('');
@@ -155,9 +191,22 @@ export function BluetoothScannerModal({
           setBlockedByIframe(true);
         }
       });
+    } else if (wifiScanAbortRef.current) {
+      wifiScanAbortRef.current.abort();
+      wifiScanAbortRef.current = null;
+      setIsScanningWifi(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
+
+  useEffect(() => {
+    return () => {
+      if (wifiScanAbortRef.current) {
+        wifiScanAbortRef.current.abort();
+        wifiScanAbortRef.current = null;
+      }
+    };
+  }, []);
 
   if (!isOpen) return null;
 
@@ -288,6 +337,112 @@ export function BluetoothScannerModal({
     onClose();
   };
 
+  const handleScanComputerWifi = async (requestWirelessLabels = false) => {
+    setWifiError(null);
+    if (wifiScanAbortRef.current) {
+      wifiScanAbortRef.current.abort();
+    }
+
+    if (requestWirelessLabels) {
+      await refreshMediaDevices(true);
+    }
+
+    const controller = new AbortController();
+    wifiScanAbortRef.current = controller;
+    setIsScanningWifi(true);
+    setWifiScanCompleted(false);
+    setDiscoveredWifiCameras([]);
+    setWifiDetectedSubnet(null);
+
+    try {
+      const result = await scanComputerWifiCameras({
+        signal: controller.signal,
+        onProgress: (progress) => setWifiScanProgress(progress),
+        onFound: (cam) => {
+          setDiscoveredWifiCameras((prev) => deduplicateDiscoveredWifiCameras([...prev, cam]));
+        },
+      });
+      if (!controller.signal.aborted) {
+        setDiscoveredWifiCameras(result.cameras);
+        setWifiDetectedSubnet(result.detectedSubnet);
+        setWifiScanCompleted(true);
+      }
+    } catch {
+      if (!controller.signal.aborted) {
+        setWifiError('Unable to complete computer Wi-Fi scan.');
+      }
+    } finally {
+      if (wifiScanAbortRef.current === controller) {
+        wifiScanAbortRef.current = null;
+        setIsScanningWifi(false);
+      }
+    }
+  };
+
+  const handleStopWifiScan = () => {
+    if (wifiScanAbortRef.current) {
+      wifiScanAbortRef.current.abort();
+      wifiScanAbortRef.current = null;
+    }
+    setIsScanningWifi(false);
+    setWifiScanCompleted(true);
+  };
+
+  const handleConnectDiscoveredWifiCamera = async (camera: WifiDiscoveredCamera) => {
+    setWifiError(null);
+    const zoneLabel = wifiRoomName.trim() || camera.name;
+
+    if (camera.kind === 'wireless-media-device') {
+      setConnectingWifiId(camera.id);
+      try {
+        const stream = await openRawMediaStream({
+          includeVideo: true,
+          videoDeviceId: camera.videoDeviceId,
+          audioDeviceId: camera.audioDeviceId,
+        });
+        onAddWifiCamera({
+          classroomName: zoneLabel,
+          wifiBrand: camera.brandLabel,
+          wifiDirectMode: true,
+          stream,
+          videoDeviceId: camera.videoDeviceId,
+          audioDeviceId: camera.audioDeviceId,
+        });
+        setWifiRoomName('');
+        onClose();
+      } catch {
+        setWifiError(
+          `Could not open "${camera.name}". Allow camera access or verify the wireless camera app is active on your computer's Wi-Fi.`
+        );
+      } finally {
+        setConnectingWifiId(null);
+      }
+      return;
+    }
+
+    onAddWifiCamera({
+      classroomName: zoneLabel,
+      streamUrl: camera.streamUrl,
+      wifiBrand: camera.brandLabel,
+      wifiDirectMode: true,
+    });
+    setWifiRoomName('');
+    onClose();
+  };
+
+  const handleConnectHotspotPreset = (preset: WifiHotspotQuickPreset) => {
+    setWifiError(null);
+    const zoneLabel = wifiRoomName.trim() || preset.label;
+    onAddWifiCamera({
+      classroomName: zoneLabel,
+      streamUrl: preset.streamUrl,
+      wifiBrand: preset.brandLabel,
+      wifiDirectMode: true,
+    });
+    setWifiRoomName('');
+    onClose();
+  };
+
   const handleSearchNearbyBt = async (requestMediaLabels = false) => {
     setIsScanningBt(true);
     setBtNotices([]);
@@ -395,6 +550,58 @@ export function BluetoothScannerModal({
     }
   };
 
+  const handleConnectMicrophoneOnly = async (withLiveStream: boolean) => {
+    setMicOnlyError(null);
+    if (!micRoomName.trim()) {
+      setMicOnlyError('Please enter a zone or classroom name.');
+      return;
+    }
+
+    const chosenMic = audioDevices.find((d) => d.deviceId === selectedAudioId);
+    const label = chosenMic?.label || 'Acoustic Microphone';
+
+    if (!withLiveStream) {
+      onAddMicrophoneZone(
+        micRoomName.trim(),
+        null,
+        selectedAudioId || undefined,
+        label
+      );
+      setMicRoomName('');
+      onClose();
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setMicOnlyError(
+        'Live browser microphone capture is unavailable here. Use "Add Standby Mic Zone" to test acoustic & speech cues.'
+      );
+      return;
+    }
+
+    setIsConnectingMic(true);
+    try {
+      const stream = await openRawMediaStream({
+        includeVideo: false,
+        audioDeviceId: selectedAudioId || undefined,
+      });
+      onAddMicrophoneZone(
+        micRoomName.trim(),
+        stream,
+        selectedAudioId || undefined,
+        label
+      );
+      setMicRoomName('');
+      onClose();
+    } catch {
+      setMicOnlyError(
+        'Microphone permission was denied or the device is unavailable. Allow mic access or use "Add Standby Mic Zone".'
+      );
+    } finally {
+      setIsConnectingMic(false);
+    }
+  };
+
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -448,7 +655,7 @@ export function BluetoothScannerModal({
               Add Security Camera Feed
             </h2>
             <p className="text-xs text-zinc-400 mt-0.5">
-              Connect Wi-Fi-only CCTV cameras, Bluetooth CCTV, local USB/built-in cameras, or recorded footage.
+              Connect Wi-Fi CCTV cameras, Bluetooth CCTV, local webcams, microphone-only monitors, or recorded footage.
             </p>
           </div>
           <button
@@ -467,6 +674,7 @@ export function BluetoothScannerModal({
               { id: 'wifi', label: 'Wi-Fi CCTV', icon: Wifi },
               { id: 'bluetooth', label: 'Bluetooth CCTV', icon: Bluetooth },
               { id: 'hardware', label: 'USB / Built-in Cam', icon: Camera },
+              { id: 'microphone', label: 'Mic Only', icon: Mic },
               { id: 'upload', label: 'Upload Video / Photo', icon: Upload },
             ] as const
           ).map((tab) => {
@@ -491,13 +699,42 @@ export function BluetoothScannerModal({
         </div>
 
         <div className="p-5 overflow-y-auto space-y-4">
-          {/* TAB 1: WI-FI CCTV CAMERA */}
+          {/* TAB 1: WI-FI CCTV CAMERA (ZERO-PIN COMPUTER WI-FI AUTO-DISCOVERY) */}
           {activeTab === 'wifi' ? (
             <div className="space-y-4">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {/* Computer Wi-Fi Status & Zero-PIN Explanation */}
+              <div className="bg-[#0B0C0F] border border-zinc-800 rounded-lg p-3.5 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-zinc-100">
+                    <span
+                      className={`w-2 h-2 rounded-full ${
+                        networkStatus.online ? 'bg-emerald-400' : 'bg-amber-400'
+                      }`}
+                      aria-hidden="true"
+                    />
+                    <span>
+                      {networkStatus.online
+                        ? 'Computer Wi-Fi Ready · No PIN or Password Required'
+                        : 'Computer Offline · Connect Wi-Fi in OS Menu'}
+                    </span>
+                  </div>
+                  {wifiDetectedSubnet ? (
+                    <span className="text-[11px] font-mono text-zinc-400">
+                      LAN {wifiDetectedSubnet}.*
+                    </span>
+                  ) : null}
+                </div>
+                <p className="text-xs text-zinc-400 leading-relaxed">
+                  Connect your computer&apos;s Wi-Fi to your CCTV camera&apos;s Wi-Fi network (or the same Wi-Fi router), then click{' '}
+                  <strong className="text-zinc-200">Scan Computer Wi-Fi</strong>. Discovered cameras connect in one click without entering a PIN code, IP address, or password.
+                </p>
+              </div>
+
+              {/* Optional Zone Name + One-Click Scan Actions */}
+              <div className="space-y-3">
                 <div>
-                  <label htmlFor="wifi-room-input" className="block text-xs font-medium text-slate-300 mb-1">
-                    Zone / Classroom Name
+                  <label htmlFor="wifi-room-input" className="block text-xs font-medium text-zinc-300 mb-1">
+                    Zone / Room Name <span className="text-zinc-500 font-normal">(optional — auto-named if blank)</span>
                   </label>
                   <input
                     id="wifi-room-input"
@@ -505,105 +742,157 @@ export function BluetoothScannerModal({
                     value={wifiRoomName}
                     onChange={(e) => setWifiRoomName(e.target.value)}
                     placeholder="e.g., Main Corridor Wi-Fi Cam"
-                    className="w-full text-sm px-3 py-2 border border-slate-700 rounded-lg bg-[#0A0E14] text-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500"
+                    className="w-full text-sm px-3 py-2 border border-zinc-700 rounded-lg bg-[#09090B] text-zinc-100 focus-visible:outline-2 focus-visible:outline-zinc-400"
                   />
                 </div>
-                <div>
-                  <label htmlFor="wifi-brand-select" className="block text-xs font-medium text-slate-300 mb-1">
-                    Wi-Fi Camera Type / Brand
-                  </label>
-                  <select
-                    id="wifi-brand-select"
-                    value={wifiBrandId}
-                    onChange={(e) => handleSelectWifiBrand(e.target.value)}
-                    className="w-full text-xs px-2.5 py-2.5 border border-slate-700 rounded-lg bg-[#0A0E14] text-slate-100"
+
+                <div className="flex flex-wrap items-center gap-2">
+                  {isScanningWifi ? (
+                    <button
+                      type="button"
+                      onClick={handleStopWifiScan}
+                      className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-md bg-zinc-200 text-zinc-950 hover:bg-white cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>Stop Scan</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => void handleScanComputerWifi(false)}
+                      className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white cursor-pointer"
+                    >
+                      <Wifi className="w-4 h-4" aria-hidden="true" />
+                      <span>Scan Computer Wi-Fi</span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => void handleScanComputerWifi(true)}
+                    disabled={isScanningWifi}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-md border border-zinc-800 bg-[#16181D] text-zinc-200 hover:bg-zinc-800 disabled:opacity-60 cursor-pointer"
                   >
-                    {WIFI_CAMERA_BRAND_PRESETS.map((preset) => (
-                      <option key={preset.id} value={preset.id}>
-                        {preset.label}
-                      </option>
+                    <Radio className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>Detect Wireless Phone / Cam Bridges</span>
+                  </button>
+                </div>
+
+                {/* Live Scan Progress */}
+                {isScanningWifi && wifiScanProgress ? (
+                  <div className="bg-[#0B0C0F] border border-zinc-800 rounded-lg p-3 space-y-2">
+                    <div className="flex items-center justify-between gap-2 text-xs">
+                      <span className="text-zinc-200 flex items-center gap-1.5">
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-zinc-300" aria-hidden="true" />
+                        <span>{wifiScanProgress.label}</span>
+                      </span>
+                      <span className="font-mono text-[11px] text-zinc-400">
+                        {wifiScanProgress.checked}/{wifiScanProgress.total}
+                      </span>
+                    </div>
+                    <div className="w-full h-1.5 bg-zinc-900 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-emerald-500 transition-all duration-200"
+                        style={{
+                          width: `${Math.min(
+                            100,
+                            Math.round(
+                              (wifiScanProgress.checked / Math.max(1, wifiScanProgress.total)) * 100
+                            )
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+
+              {/* Discovered Wi-Fi Cameras (Zero-PIN 1-Click Connect) */}
+              {discoveredWifiCameras.length > 0 ? (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-xs font-semibold text-zinc-200">
+                      Found on Computer Wi-Fi ({discoveredWifiCameras.length})
+                    </h3>
+                    <span className="text-[11px] text-emerald-400">Zero-PIN Direct Connect</span>
+                  </div>
+                  <div className="divide-y divide-zinc-800 border border-zinc-800 rounded-lg overflow-hidden">
+                    {discoveredWifiCameras.map((cam) => (
+                      <div
+                        key={cam.id}
+                        className="p-3 bg-[#0B0C0F] flex items-center justify-between gap-3"
+                      >
+                        <div className="flex items-center gap-3 min-w-0">
+                          {cam.previewUrl ? (
+                            <img
+                              src={cam.previewUrl}
+                              alt={`Live preview from ${cam.name}`}
+                              className="w-16 h-10 object-cover rounded border border-zinc-700 shrink-0 bg-black"
+                            />
+                          ) : (
+                            <div className="w-10 h-10 rounded bg-[#14161B] border border-zinc-800 flex items-center justify-center shrink-0">
+                              <Wifi className="w-4 h-4 text-emerald-400" aria-hidden="true" />
+                            </div>
+                          )}
+                          <div className="min-w-0">
+                            <div className="text-xs font-semibold text-zinc-100 truncate">
+                              {cam.name}
+                            </div>
+                            <div className="text-[11px] text-zinc-400 font-mono truncate mt-0.5">
+                              {cam.hostLabel}
+                              {cam.latencyMs ? ` · ${cam.latencyMs}ms` : ''} · No PIN
+                            </div>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => void handleConnectDiscoveredWifiCamera(cam)}
+                          disabled={connectingWifiId === cam.id}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white disabled:opacity-60 shrink-0 cursor-pointer"
+                        >
+                          <Plus className="w-3.5 h-3.5" aria-hidden="true" />
+                          <span>{connectingWifiId === cam.id ? 'Connecting...' : 'Connect'}</span>
+                        </button>
+                      </div>
                     ))}
-                  </select>
+                  </div>
+                </div>
+              ) : wifiScanCompleted ? (
+                <div className="border border-zinc-800 bg-[#0B0C0F] rounded-lg p-3.5 space-y-2">
+                  <p className="text-xs font-medium text-zinc-200">
+                    No open Wi-Fi CCTV cameras answered automatically on this network.
+                  </p>
+                  <p className="text-[11px] text-zinc-400 leading-relaxed">
+                    Make sure your computer&apos;s Wi-Fi is connected to your camera&apos;s Wi-Fi network (or use{' '}
+                    <strong className="text-zinc-300">Direct Camera Wi-Fi Quick Connect</strong> below with zero IP/PIN typing).
+                    {networkStatus.isHttpsMixedContentRisk
+                      ? ' On HTTPS pages, browsers may block automatic scanning of local http://192.168.x.x cameras — wireless camera bridges (Phone Link, Continuity Camera, DroidCam, Iriun) connect directly without restrictions.'
+                      : ''}
+                  </p>
+                </div>
+              ) : null}
+
+              {/* 1-Click Direct Camera Wi-Fi Hotspot Presets (Zero IP / Zero PIN) */}
+              <div className="space-y-2">
+                <div className="text-xs font-medium text-zinc-300">
+                  Direct Camera Wi-Fi Quick Connect <span className="text-zinc-500 font-normal">(1 click · no PIN or IP typing)</span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  {WIFI_HOTSPOT_QUICK_PRESETS.map((preset) => (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      onClick={() => handleConnectHotspotPreset(preset)}
+                      className="text-left p-2.5 rounded-lg border border-zinc-800 bg-[#14161B] hover:bg-[#1A1D24] hover:border-zinc-600 transition-colors cursor-pointer"
+                    >
+                      <div className="text-xs font-semibold text-zinc-100">{preset.label}</div>
+                      <div className="text-[11px] font-mono text-zinc-400 mt-0.5">
+                        {preset.subtitle}
+                      </div>
+                    </button>
+                  ))}
                 </div>
               </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div className="sm:col-span-2">
-                  <label htmlFor="wifi-host-input" className="block text-xs font-medium text-slate-300 mb-1">
-                    Wi-Fi IP Address or Snapshot / MJPEG URL
-                  </label>
-                  <input
-                    id="wifi-host-input"
-                    type="text"
-                    value={wifiHostOrUrl}
-                    onChange={(e) => {
-                      setWifiHostOrUrl(e.target.value);
-                      setWifiTestResult(null);
-                    }}
-                    placeholder={selectedWifiPreset.exampleHost}
-                    className="w-full text-sm font-mono px-3 py-2 border border-slate-700 rounded-lg bg-[#0A0E14] text-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500"
-                  />
-                </div>
-                <div>
-                  <label htmlFor="wifi-port-input" className="block text-xs font-medium text-slate-300 mb-1">
-                    Port (optional)
-                  </label>
-                  <input
-                    id="wifi-port-input"
-                    type="text"
-                    value={wifiPort}
-                    onChange={(e) => setWifiPort(e.target.value)}
-                    placeholder={selectedWifiPreset.defaultPort || '80'}
-                    className="w-full text-sm font-mono px-3 py-2 border border-slate-700 rounded-lg bg-[#0A0E14] text-slate-100"
-                  />
-                </div>
-              </div>
-
-              <p className="text-xs text-slate-400">{selectedWifiPreset.notes}</p>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label htmlFor="wifi-user-input" className="block text-xs font-medium text-slate-400 mb-1">
-                    Camera Username (optional)
-                  </label>
-                  <input
-                    id="wifi-user-input"
-                    type="text"
-                    value={wifiUsername}
-                    onChange={(e) => setWifiUsername(e.target.value)}
-                    placeholder="admin"
-                    className="w-full text-xs px-3 py-2 border border-slate-700 rounded-lg bg-[#0A0E14] text-slate-100"
-                  />
-                </div>
-                <div>
-                  <label htmlFor="wifi-pass-input" className="block text-xs font-medium text-slate-400 mb-1">
-                    Camera Password (optional)
-                  </label>
-                  <input
-                    id="wifi-pass-input"
-                    type="password"
-                    value={wifiPassword}
-                    onChange={(e) => setWifiPassword(e.target.value)}
-                    placeholder="••••••••"
-                    className="w-full text-xs px-3 py-2 border border-slate-700 rounded-lg bg-[#0A0E14] text-slate-100"
-                  />
-                </div>
-              </div>
-
-              <label className="flex items-start gap-2.5 text-xs text-slate-300 cursor-pointer select-none pt-1">
-                <input
-                  type="checkbox"
-                  checked={wifiDirectMode}
-                  onChange={(e) => {
-                    setWifiDirectMode(e.target.checked);
-                    setWifiTestResult(null);
-                  }}
-                  className="mt-0.5 accent-blue-500 rounded cursor-pointer"
-                />
-                <span>
-                  <strong className="text-slate-100">Direct Local Wi-Fi Mode</strong> — Load camera directly from your browser on the same Wi-Fi LAN (use if camera IP is private like <code className="font-mono text-slate-200">192.168.x.x</code> and this app is hosted remotely).
-                </span>
-              </label>
 
               {wifiError ? (
                 <p role="alert" className="text-xs text-red-300 bg-red-950/50 border border-red-500/40 rounded-lg p-3">
@@ -611,46 +900,163 @@ export function BluetoothScannerModal({
                 </p>
               ) : null}
 
-              {wifiTestResult ? (
-                <div className="bg-emerald-950/35 border border-emerald-500/40 rounded-lg p-3 flex items-center gap-3">
-                  {wifiTestResult.previewDataUrl ? (
-                    <img
-                      src={wifiTestResult.previewDataUrl}
-                      alt="Verified Wi-Fi CCTV frame"
-                      className="w-24 h-14 object-cover rounded border border-emerald-500/40 shrink-0"
-                    />
-                  ) : null}
-                  <div className="min-w-0 text-xs">
-                    <div className="font-semibold text-emerald-300 flex items-center gap-1.5">
-                      <CheckCircle2 className="w-4 h-4 shrink-0" aria-hidden="true" />
-                      <span>Wi-Fi Camera Connected ({wifiTestResult.latencyMs}ms)</span>
-                    </div>
-                    <div className="text-slate-300 font-mono truncate mt-0.5">
-                      {wifiTestResult.resolvedUrl}
-                    </div>
-                    <div className="text-slate-400 mt-0.5">{wifiTestResult.note}</div>
-                  </div>
-                </div>
-              ) : null}
+              {/* Collapsible Advanced Manual IP / Credentials (hidden by default so user never sees PIN/password forms) */}
+              <div className="border-t border-zinc-800/90 pt-3">
+                <button
+                  type="button"
+                  onClick={() => setShowAdvancedWifi((prev) => !prev)}
+                  aria-expanded={showAdvancedWifi}
+                  className="inline-flex items-center gap-1.5 text-xs font-medium text-zinc-400 hover:text-zinc-200 cursor-pointer"
+                >
+                  {showAdvancedWifi ? (
+                    <ChevronUp className="w-3.5 h-3.5" aria-hidden="true" />
+                  ) : (
+                    <ChevronDown className="w-3.5 h-3.5" aria-hidden="true" />
+                  )}
+                  <span>Manual IP / Camera Login (Optional Advanced)</span>
+                </button>
 
-              <div className="flex flex-wrap items-center gap-2 pt-1">
-                <button
-                  type="button"
-                  onClick={() => void handleTestWifiCamera()}
-                  disabled={wifiTesting}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-md border border-zinc-800 bg-[#16181D] text-zinc-200 hover:bg-zinc-800 disabled:opacity-60 cursor-pointer"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${wifiTesting ? 'animate-spin' : ''}`} aria-hidden="true" />
-                  <span>{wifiTesting ? 'Testing Connection...' : 'Test Wi-Fi Feed'}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={handleSubmitWifiCamera}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white cursor-pointer"
-                >
-                  <Wifi className="w-4 h-4" aria-hidden="true" />
-                  <span>Add Wi-Fi CCTV Camera</span>
-                </button>
+                {showAdvancedWifi ? (
+                  <div className="mt-3 space-y-3 bg-[#0B0C0F] border border-zinc-800 rounded-lg p-3.5">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label htmlFor="wifi-brand-select" className="block text-xs font-medium text-zinc-300 mb-1">
+                          Wi-Fi Camera Brand / Type
+                        </label>
+                        <select
+                          id="wifi-brand-select"
+                          value={wifiBrandId}
+                          onChange={(e) => handleSelectWifiBrand(e.target.value)}
+                          className="w-full text-xs px-2.5 py-2.5 border border-zinc-700 rounded-lg bg-[#09090B] text-zinc-100"
+                        >
+                          {WIFI_CAMERA_BRAND_PRESETS.map((preset) => (
+                            <option key={preset.id} value={preset.id}>
+                              {preset.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <label htmlFor="wifi-port-input" className="block text-xs font-medium text-zinc-300 mb-1">
+                          Port (optional)
+                        </label>
+                        <input
+                          id="wifi-port-input"
+                          type="text"
+                          value={wifiPort}
+                          onChange={(e) => setWifiPort(e.target.value)}
+                          placeholder={selectedWifiPreset.defaultPort || '80'}
+                          className="w-full text-sm font-mono px-3 py-2 border border-zinc-700 rounded-lg bg-[#09090B] text-zinc-100"
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <label htmlFor="wifi-host-input" className="block text-xs font-medium text-zinc-300 mb-1">
+                        Wi-Fi IP Address or Snapshot / MJPEG URL
+                      </label>
+                      <input
+                        id="wifi-host-input"
+                        type="text"
+                        value={wifiHostOrUrl}
+                        onChange={(e) => {
+                          setWifiHostOrUrl(e.target.value);
+                          setWifiTestResult(null);
+                        }}
+                        placeholder={selectedWifiPreset.exampleHost}
+                        className="w-full text-sm font-mono px-3 py-2 border border-zinc-700 rounded-lg bg-[#09090B] text-zinc-100 focus-visible:outline-2 focus-visible:outline-zinc-400"
+                      />
+                    </div>
+
+                    <p className="text-xs text-zinc-400">{selectedWifiPreset.notes}</p>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label htmlFor="wifi-user-input" className="block text-xs font-medium text-zinc-400 mb-1">
+                          Camera Username (optional)
+                        </label>
+                        <input
+                          id="wifi-user-input"
+                          type="text"
+                          value={wifiUsername}
+                          onChange={(e) => setWifiUsername(e.target.value)}
+                          placeholder="admin"
+                          className="w-full text-xs px-3 py-2 border border-zinc-700 rounded-lg bg-[#09090B] text-zinc-100"
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="wifi-pass-input" className="block text-xs font-medium text-zinc-400 mb-1">
+                          Camera Password (optional)
+                        </label>
+                        <input
+                          id="wifi-pass-input"
+                          type="password"
+                          value={wifiPassword}
+                          onChange={(e) => setWifiPassword(e.target.value)}
+                          placeholder="••••••••"
+                          className="w-full text-xs px-3 py-2 border border-zinc-700 rounded-lg bg-[#09090B] text-zinc-100"
+                        />
+                      </div>
+                    </div>
+
+                    <label className="flex items-start gap-2.5 text-xs text-zinc-300 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={wifiDirectMode}
+                        onChange={(e) => {
+                          setWifiDirectMode(e.target.checked);
+                          setWifiTestResult(null);
+                        }}
+                        className="mt-0.5 accent-zinc-200 rounded cursor-pointer"
+                      />
+                      <span>
+                        <strong className="text-zinc-100">Direct Computer Wi-Fi Mode</strong> — Load camera directly over your computer&apos;s Wi-Fi LAN without cloud routing.
+                      </span>
+                    </label>
+
+                    {wifiTestResult ? (
+                      <div className="bg-emerald-950/35 border border-emerald-500/40 rounded-lg p-3 flex items-center gap-3">
+                        {wifiTestResult.previewDataUrl ? (
+                          <img
+                            src={wifiTestResult.previewDataUrl}
+                            alt="Verified Wi-Fi CCTV frame"
+                            className="w-24 h-14 object-cover rounded border border-emerald-500/40 shrink-0"
+                          />
+                        ) : null}
+                        <div className="min-w-0 text-xs">
+                          <div className="font-semibold text-emerald-300 flex items-center gap-1.5">
+                            <CheckCircle2 className="w-4 h-4 shrink-0" aria-hidden="true" />
+                            <span>Wi-Fi Camera Connected ({wifiTestResult.latencyMs}ms)</span>
+                          </div>
+                          <div className="text-zinc-300 font-mono truncate mt-0.5">
+                            {wifiTestResult.resolvedUrl}
+                          </div>
+                          <div className="text-zinc-400 mt-0.5">{wifiTestResult.note}</div>
+                        </div>
+                      </div>
+                    ) : null}
+
+                    <div className="flex flex-wrap items-center gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => void handleTestWifiCamera()}
+                        disabled={wifiTesting}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-md border border-zinc-800 bg-[#16181D] text-zinc-200 hover:bg-zinc-800 disabled:opacity-60 cursor-pointer"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${wifiTesting ? 'animate-spin' : ''}`} aria-hidden="true" />
+                        <span>{wifiTesting ? 'Testing Connection...' : 'Test Wi-Fi Feed'}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleSubmitWifiCamera}
+                        className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white cursor-pointer"
+                      >
+                        <Wifi className="w-4 h-4" aria-hidden="true" />
+                        <span>Add Manual Wi-Fi Camera</span>
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
               </div>
             </div>
           ) : null}
@@ -924,7 +1330,89 @@ export function BluetoothScannerModal({
             </div>
           ) : null}
 
-          {/* TAB 4: UPLOAD SECURITY FOOTAGE */}
+          {/* TAB 4: MICROPHONE ONLY (AUDIO-ONLY ACOUSTIC MONITOR) */}
+          {activeTab === 'microphone' ? (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs text-zinc-400">
+                  Monitor any room purely by microphone (no camera required). Tracks live dB SPL (&gt;90.1 dB for 3s alerts teacher) and real-time voice recognition for distress, bullying, beating, or fighting cues.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => void refreshMediaDevices(true)}
+                  disabled={isLoadingDevices}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md border border-zinc-800 bg-[#16181D] text-zinc-200 hover:bg-zinc-800 cursor-pointer shrink-0"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" aria-hidden="true" />
+                  <span>Detect Mics</span>
+                </button>
+              </div>
+
+              <div>
+                <label htmlFor="mic-room-input" className="block text-xs font-medium text-zinc-300 mb-1">
+                  Zone / Classroom Name
+                </label>
+                <input
+                  id="mic-room-input"
+                  type="text"
+                  value={micRoomName}
+                  onChange={(e) => setMicRoomName(e.target.value)}
+                  placeholder="e.g., Hallway West Mic or Restroom Corridor"
+                  className="w-full text-sm px-3 py-2 border border-zinc-700 rounded-lg bg-[#09090B] text-zinc-100 focus-visible:outline-2 focus-visible:outline-zinc-400"
+                />
+              </div>
+
+              <div>
+                <label htmlFor="mic-audio-select" className="block text-xs font-medium text-zinc-300 mb-1">
+                  Microphone Input (Built-in, USB, or Bluetooth Mic)
+                </label>
+                <select
+                  id="mic-audio-select"
+                  value={selectedAudioId}
+                  onChange={(e) => setSelectedAudioId(e.target.value)}
+                  className="w-full text-xs px-2.5 py-2.5 border border-zinc-700 rounded-lg bg-[#09090B] text-zinc-100"
+                >
+                  {audioDevices.length === 0 ? (
+                    <option value="">Default system microphone</option>
+                  ) : (
+                    audioDevices.map((d, idx) => (
+                      <option key={d.deviceId || idx} value={d.deviceId}>
+                        {d.label || `Microphone ${idx + 1}`}
+                      </option>
+                    ))
+                  )}
+                </select>
+              </div>
+
+              {micOnlyError ? (
+                <p role="alert" className="text-xs text-red-300 bg-red-950/50 border border-red-500/40 rounded-lg p-3">
+                  {micOnlyError}
+                </p>
+              ) : null}
+
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => void handleConnectMicrophoneOnly(true)}
+                  disabled={isConnectingMic}
+                  className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white disabled:opacity-60 transition-colors cursor-pointer"
+                >
+                  <Mic className="w-4 h-4" aria-hidden="true" />
+                  <span>{isConnectingMic ? 'Connecting Mic...' : 'Connect Live Microphone'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleConnectMicrophoneOnly(false)}
+                  disabled={isConnectingMic}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-md border border-zinc-800 bg-[#16181D] text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer"
+                >
+                  <span>Add Standby Mic Zone</span>
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          {/* TAB 5: UPLOAD SECURITY FOOTAGE */}
           {activeTab === 'upload' ? (
             <div className="space-y-3">
               <p className="text-xs text-slate-400">

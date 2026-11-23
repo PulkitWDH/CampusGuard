@@ -2,6 +2,7 @@ export type CameraSourceKind =
   | 'wifi-cctv'
   | 'bluetooth-cctv'
   | 'device-camera'
+  | 'microphone-only'
   | 'stream-url'
   | 'uploaded-media';
 

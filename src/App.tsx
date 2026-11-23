@@ -5,6 +5,7 @@ import {
   Columns2,
   Grid3X3,
   LayoutGrid,
+  Mic,
   Square,
   Upload,
   Wifi,
@@ -707,8 +708,10 @@ export default function App() {
 
       if (!frameBase64 && !transcriptToSend) {
         if (!isAutoTrigger) {
-          const noSignalMsg =
-            'Camera video feed is offline (NO SIGNAL) and no audio transcript is present. Reconnect the camera or verify stream URL before scanning.';
+          const isMicOnly = target.sourceKind === 'microphone-only' || !target.hasVideo;
+          const noSignalMsg = isMicOnly
+            ? 'No speech cue captured yet for this microphone-only zone. Click Connect Live Mic or Inspect → Edit cue to analyze audio.'
+            : 'Camera video feed is offline (NO SIGNAL) and no audio transcript is present. Reconnect the camera or verify stream URL before scanning.';
           setGlobalError(`${target.classroomName}: ${noSignalMsg}`);
           setCameras((prev) =>
             prev.map((cam) =>
@@ -1178,8 +1181,24 @@ export default function App() {
                           threatScore: voiceThreatAlert.threatScore,
                           voiceAnalysis: voiceThreatAlert.voiceCue,
                           fightReason: voiceThreatAlert.details,
+                          summary: voiceThreatAlert.headline,
                         }
-                      : cam.lastAnalysis,
+                      : {
+                          studentCount: cam.studentCount,
+                          detectedPeople: [],
+                          detectedObjects: [],
+                          isFighting: true,
+                          severity: 'critical',
+                          threatCategory: voiceThreatAlert.threatCategory,
+                          threatScore: voiceThreatAlert.threatScore,
+                          detectedBehaviors: voiceThreatAlert.detectedBehaviors,
+                          recommendedAction: voiceThreatAlert.recommendedAction,
+                          voiceAnalysis: voiceThreatAlert.voiceCue,
+                          fightReason: voiceThreatAlert.details,
+                          summary: voiceThreatAlert.headline,
+                          confidence: 92,
+                          analyzedAt: voiceThreatAlert.timestamp,
+                        },
                   }
                 : cam
             )
@@ -1266,16 +1285,26 @@ export default function App() {
   const handleReconnectStream = useCallback(async (cameraId: string) => {
     const target = camerasRef.current.find((c) => c.id === cameraId);
     if (!target) return;
+    const isMicOnly = target.sourceKind === 'microphone-only' || !target.hasVideo;
     try {
       const stream = await openRawMediaStream({
-        includeVideo: true,
-        videoDeviceId: target.videoDeviceId,
+        includeVideo: !isMicOnly,
+        videoDeviceId: isMicOnly ? undefined : target.videoDeviceId,
         audioDeviceId: target.audioDeviceId,
       });
       mediaStreamsRef.current[cameraId] = stream;
       setStreamRevision((v) => v + 1);
+      setStatusNotice(
+        isMicOnly
+          ? `Live microphone connected for "${target.classroomName}".`
+          : `Live camera reconnected for "${target.classroomName}".`
+      );
     } catch {
-      setGlobalError(`Unable to reconnect camera stream for ${target.classroomName}.`);
+      setGlobalError(
+        isMicOnly
+          ? `Unable to access microphone for ${target.classroomName}. Allow browser mic permissions and retry.`
+          : `Unable to reconnect camera stream for ${target.classroomName}.`
+      );
     }
   }, []);
 
@@ -1360,19 +1389,76 @@ export default function App() {
     [persistZoneAsync, selectedAiModel]
   );
 
+  const handleAddMicrophoneZone = useCallback(
+    (
+      classroomName: string,
+      stream: MediaStream | null,
+      audioDeviceId?: string,
+      deviceLabel?: string
+    ) => {
+      const newZoneId = `mic-${Date.now()}`;
+      if (stream) {
+        mediaStreamsRef.current[newZoneId] = stream;
+        setStreamRevision((v) => v + 1);
+      }
+
+      const micCount =
+        camerasRef.current.filter((c) => c.sourceKind === 'microphone-only').length + 1;
+      const newZone: ClassroomCamera = {
+        id: newZoneId,
+        cameraCode: `MIC-${micCount}`,
+        classroomName,
+        bluetoothDeviceName: deviceLabel || 'Acoustic Microphone',
+        bluetoothAddress: audioDeviceId ? audioDeviceId.slice(0, 12) : 'AUDIO-MIC',
+        sourceKind: 'microphone-only',
+        hasVideo: false,
+        hasVoice: true,
+        voiceListeningEnabled: true,
+        autoAiEnabled: true,
+        aiModel: selectedAiModel,
+        audioDeviceId,
+        liveTranscript: '',
+        audioLevel: 0,
+        status: 'normal',
+        studentCount: 0,
+        lastAnalysis: null,
+        isAnalyzing: false,
+      };
+
+      setCameras((prev) => [...prev, newZone]);
+      void persistZoneAsync(newZone);
+      setActiveView('grid');
+      setStatusNotice(
+        stream
+          ? `Live microphone monitor "${classroomName}" is armed (>90.1 dB & distress voice AI).`
+          : `Microphone-only zone "${classroomName}" added in standby mode.`
+      );
+    },
+    [persistZoneAsync, selectedAiModel]
+  );
+
   const handleAddWifiCamera = useCallback(
     (params: {
       classroomName: string;
-      streamUrl: string;
+      streamUrl?: string;
       wifiBrand: string;
       wifiDirectMode: boolean;
+      stream?: MediaStream;
+      videoDeviceId?: string;
+      audioDeviceId?: string;
     }) => {
       const newCamId = `cam-wifi-${Date.now()}`;
-      let hostAddress = 'WIFI-CCTV';
-      try {
-        hostAddress = new URL(params.streamUrl).hostname || 'WIFI-CCTV';
-      } catch {
-        hostAddress = 'WIFI-CCTV';
+      if (params.stream) {
+        mediaStreamsRef.current[newCamId] = params.stream;
+      }
+
+      let hostAddress = params.stream ? 'WIFI-BRIDGE' : 'WIFI-CCTV';
+      if (params.streamUrl) {
+        try {
+          hostAddress = new URL(params.streamUrl).hostname || 'WIFI-CCTV';
+        } catch {
+          hostAddress = 'WIFI-CCTV';
+        }
       }
 
       const newCamera: ClassroomCamera = {
@@ -1390,6 +1476,8 @@ export default function App() {
         autoAiEnabled: true,
         aiModel: selectedAiModel,
         streamUrl: params.streamUrl,
+        videoDeviceId: params.videoDeviceId,
+        audioDeviceId: params.audioDeviceId,
         liveTranscript: '',
         audioLevel: 0,
         status: 'normal',
@@ -1402,9 +1490,7 @@ export default function App() {
       void persistZoneAsync(newCamera);
       setActiveView('grid');
       setStatusNotice(
-        `Wi-Fi CCTV camera "${params.classroomName}" (${params.wifiBrand}) connected${
-          params.wifiDirectMode ? ' in Direct Local Wi-Fi Mode' : ''
-        }.`
+        `Wi-Fi CCTV camera "${params.classroomName}" (${params.wifiBrand}) connected via computer Wi-Fi (no PIN required).`
       );
     },
     [persistZoneAsync, selectedAiModel]
@@ -1959,8 +2045,8 @@ export default function App() {
                         Select a camera source to bring the surveillance wall online. Real-time on-device vision tracks people through face occlusion while filtering normal movement to prevent false fight alarms.
                       </p>
 
-                      {/* 4 Direct Quick-Connect Source Tiles */}
-                      <div className="pt-5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5 text-left">
+                      {/* 5 Direct Quick-Connect Source Tiles */}
+                      <div className="pt-5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5 text-left">
                         <button
                           type="button"
                           onClick={() => openScannerOnTab('wifi')}
@@ -1970,7 +2056,7 @@ export default function App() {
                           <div>
                             <div className="text-xs font-semibold text-zinc-100">Wi-Fi CCTV</div>
                             <div className="text-[11px] text-zinc-500 mt-0.5 leading-snug">
-                              IP Webcam, ESP32-CAM, Hikvision, ONVIF
+                              Auto-scan computer Wi-Fi · No PIN needed
                             </div>
                           </div>
                         </button>
@@ -1985,6 +2071,20 @@ export default function App() {
                             <div className="text-xs font-semibold text-zinc-100">USB / Webcam</div>
                             <div className="text-[11px] text-zinc-500 mt-0.5 leading-snug">
                               Local laptop webcam or USB security cam
+                            </div>
+                          </div>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => openScannerOnTab('microphone')}
+                          className="group bg-[#14161B] hover:bg-[#1A1D24] border border-zinc-800 hover:border-zinc-600 rounded-lg p-3.5 transition-colors cursor-pointer flex flex-col gap-2"
+                        >
+                          <Mic className="w-4 h-4 text-zinc-100" aria-hidden="true" />
+                          <div>
+                            <div className="text-xs font-semibold text-zinc-100">Mic Only</div>
+                            <div className="text-[11px] text-zinc-500 mt-0.5 leading-snug">
+                              Audio-only dB &amp; voice distress monitor
                             </div>
                           </div>
                         </button>
@@ -2295,6 +2395,7 @@ export default function App() {
         onAddWifiCamera={handleAddWifiCamera}
         onAddBluetoothCamera={handleAddBluetoothCamera}
         onAddHardwareCamera={handleAddHardwareCamera}
+        onAddMicrophoneZone={handleAddMicrophoneZone}
         onAddStreamUrlCamera={handleAddStreamUrlCamera}
         onAddUploadedCamera={handleAddUploadedCamera}
       />

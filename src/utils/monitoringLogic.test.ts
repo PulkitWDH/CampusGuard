@@ -4,11 +4,13 @@ import {
   DEFAULT_DB_CALIBRATION_OFFSET,
   SOUND_ALERT_THRESHOLD_DB,
   classifyBluetoothCamera,
+  computeAspectPreservingSize,
   computeBoxIoU,
   computeCalibratedOffsetFromDbfs,
   computeCameraCycleStep,
   computeCampusSummary,
   computeClassAttendance,
+  computeContainDrawRect,
   computeFrameDeltaPercent,
   computeSplDecibels,
   computeTorsoPatchSimilarity,
@@ -27,6 +29,7 @@ import {
   formatAlertCategoryBadge,
   formatCameraAttendanceLabel,
   formatFacilityLabels,
+  mapNormalizedBoxToRect,
   mergeTiledPersonDetections,
   parseSafeJsonText,
   shouldRunScheduledAttendance,
@@ -1046,4 +1049,91 @@ test('mergeTiledPersonDetections and stepPersonTracker never hallucinate a phant
   );
   assert.equal(s3.people.length, 1);
 });
+
+test('computeAspectPreservingSize preserves portrait phone and landscape aspect ratios for cross-device AI detection', () => {
+  // Portrait smartphone camera (720x1280) stays portrait (360x640) instead of squashing into 640x360
+  assert.deepEqual(computeAspectPreservingSize(720, 1280, 640), { width: 360, height: 640 });
+
+  // Landscape 1080p webcam scales cleanly to 640x360
+  assert.deepEqual(computeAspectPreservingSize(1920, 1080, 640), { width: 640, height: 360 });
+
+  // Low-res secondary webcam (320x240) is never upscaled beyond native resolution
+  assert.deepEqual(computeAspectPreservingSize(320, 240, 640), { width: 320, height: 240 });
+
+  // Invalid dimensions fall back safely
+  assert.deepEqual(computeAspectPreservingSize(0, 0, 640), { width: 640, height: 360 });
+});
+
+test('computeContainDrawRect and mapNormalizedBoxToRect align bounding boxes accurately on portrait mobile feeds', () => {
+  // Portrait 360x640 video rendered inside 640x360 16:9 display canvas -> pillarboxed at center
+  const rect = computeContainDrawRect(360, 640, 640, 360);
+  assert.equal(rect.height, 360);
+  assert.equal(rect.width, 203);
+  assert.equal(rect.x, 219);
+  assert.equal(rect.y, 0);
+
+  // Person occupying full portrait width (100..900) and mid-height (200..800) maps inside pillarbox rect
+  const mapped = mapNormalizedBoxToRect([200, 100, 800, 900], rect);
+  assert.equal(mapped.x, Math.round(219 + 0.1 * 203));
+  assert.equal(mapped.y, Math.round(0.2 * 360));
+  assert.equal(mapped.width, Math.round(0.8 * 203));
+  assert.equal(mapped.height, Math.round(0.6 * 360));
+});
+
+test('stepPersonTracker detects dim secondary-device humans at 40% confidence in 2 frames while rejecting 1-frame noise', () => {
+  const dimPerson = {
+    label: 'Person (center)',
+    box_2d: [140, 240, 880, 720] as [number, number, number, number],
+    confidence: 40,
+  };
+
+  // Single-frame 40% glitch must stay pending (0 confirmed -> zero false positives)
+  const noiseFrame = stepPersonTracker({ confirmed: [], pending: [] }, [dimPerson]);
+  assert.equal(noiseFrame.people.length, 0);
+
+  // If glitch disappears on frame 2, stays 0
+  const clearedNoise = stepPersonTracker(noiseFrame.nextState, []);
+  assert.equal(clearedNoise.people.length, 0);
+
+  // Real human on dim secondary laptop/phone seen 2 consecutive frames at 40% -> confirmed cleanly!
+  const confirmedFrame = stepPersonTracker(noiseFrame.nextState, [dimPerson]);
+  assert.equal(confirmedFrame.people.length, 1);
+});
+
+test('microphone-only zones trigger voice-cue beating alerts and >90.1 dB sound threshold alerts with zero video', () => {
+  const micZone = {
+    id: 'mic-1',
+    cameraCode: 'MIC-1',
+    classroomName: 'Hallway West Mic',
+    studentCount: 0,
+    lastAnalysis: null,
+  };
+
+  const voiceAlert = evaluateVoiceCueThreatAlert(
+    micZone,
+    'help stop hitting me',
+    76.5,
+    'school',
+    { nowMs: 50000, lastAlertAtMs: 0 }
+  );
+  assert.ok(voiceAlert);
+  assert.equal(voiceAlert.severity, 'critical');
+  assert.equal(voiceAlert.threatCategory, 'beating');
+  assert.match(voiceAlert.headline, /BEATING ALERT/i);
+
+  // Sound threshold (>90.1 dB) fires alert on mic-only zone, while <=90.1 dB stays quiet
+  const atThreshold = evaluateSoundThresholdAlert(micZone, 90.1, { nowMs: 60000 });
+  assert.equal(atThreshold, null);
+
+  const sustainedLoud = evaluateSoundThresholdAlert(micZone, 93.4, {
+    nowMs: 60000,
+    sustainedSeconds: 3,
+    liveTranscript: 'loud screaming in hallway',
+  });
+  assert.ok(sustainedLoud);
+  assert.equal(sustainedLoud.alertType, 'sound-threshold');
+  assert.equal(sustainedLoud.severity, 'critical');
+  assert.equal(sustainedLoud.measuredDb, 93.4);
+});
+
 

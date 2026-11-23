@@ -91,7 +91,7 @@ export function Sidebar({
 
           {cameras.length === 0 ? (
             <p className="px-1 text-xs text-zinc-500 leading-relaxed">
-              No active feeds. Connect a Wi-Fi CCTV camera, webcam, or Bluetooth unit.
+              No active feeds. Connect a Wi-Fi CCTV camera, webcam, microphone, or Bluetooth unit.
             </p>
           ) : (
             <ul className="space-y-0.5">
@@ -144,10 +144,13 @@ export function Sidebar({
                         </div>
                       </div>
                       <span className="font-mono text-xs text-zinc-300 tabular-nums shrink-0">
-                        {cam.studentCount}
-                        {typeof cam.expectedTotalCount === 'number' && cam.expectedTotalCount > 0
-                          ? `/${cam.expectedTotalCount}`
-                          : ''}
+                        {cam.sourceKind === 'microphone-only' || !cam.hasVideo
+                          ? `${cam.audioLevel.toFixed(0)} dB`
+                          : `${cam.studentCount}${
+                              typeof cam.expectedTotalCount === 'number' && cam.expectedTotalCount > 0
+                                ? `/${cam.expectedTotalCount}`
+                                : ''
+                            }`}
                       </span>
                     </button>
                   </li>

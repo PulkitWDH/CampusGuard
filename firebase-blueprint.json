@@ -87,7 +87,14 @@
         },
         "sourceKind": {
           "type": "string",
-          "enum": ["bluetooth-cctv", "device-camera", "stream-url", "uploaded-media"]
+          "enum": [
+            "wifi-cctv",
+            "bluetooth-cctv",
+            "device-camera",
+            "microphone-only",
+            "stream-url",
+            "uploaded-media"
+          ]
         },
         "hasVideo": {
           "type": "boolean"
@@ -128,7 +135,7 @@
     },
     "SafetyIncident": {
       "title": "SafetyIncident",
-      "description": "Safety incident, AI vision alert, or >81.1 dB sound threshold teacher alert.",
+      "description": "Safety incident, AI vision alert, or >90.1 dB sound threshold teacher alert.",
       "type": "object",
       "properties": {
         "id": {
@@ -160,7 +167,7 @@
         },
         "alertType": {
           "type": "string",
-          "enum": ["ai-vision", "sound-threshold"]
+          "enum": ["ai-vision", "sound-threshold", "attendance"]
         },
         "severity": {
           "type": "string",
@@ -168,7 +175,7 @@
         },
         "threatCategory": {
           "type": "string",
-          "enum": ["none", "fight", "robbery_or_weapon", "intrusion", "disturbance"]
+          "enum": ["none", "fight", "beating", "bullying", "robbery_or_weapon", "intrusion", "disturbance"]
         },
         "modelUsed": {
           "type": "string",

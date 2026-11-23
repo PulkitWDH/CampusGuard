@@ -123,45 +123,78 @@ export function DedicatedCameraPanel({
         </span>
       </div>
 
-      {/* Live Present vs Absent vs Custom Total (flat hairline row) */}
-      <div className="grid grid-cols-3 border border-zinc-800 rounded-lg divide-x divide-zinc-800 bg-[#101114]">
-        <div className="p-3">
-          <div className="text-[11px] font-medium text-zinc-400">Present</div>
-          <div
-            className="text-xl font-bold font-mono tabular-nums text-emerald-400 mt-0.5"
-            data-testid="dedicated-live-count"
-          >
-            {attendance.presentCount}
+      {/* Live Acoustic Metrics (Mic-Only) vs Occupancy / Attendance Row (Video) */}
+      {camera.sourceKind === 'microphone-only' || !camera.hasVideo ? (
+        <div className="grid grid-cols-3 border border-zinc-800 rounded-lg divide-x divide-zinc-800 bg-[#101114]">
+          <div className="p-3">
+            <div className="text-[11px] font-medium text-zinc-400">Live dB</div>
+            <div
+              className={`text-xl font-bold font-mono tabular-nums mt-0.5 ${
+                camera.audioLevel > SOUND_ALERT_THRESHOLD_DB ? 'text-red-400' : 'text-emerald-400'
+              }`}
+              data-testid="dedicated-live-count"
+            >
+              {camera.audioLevel.toFixed(1)}
+            </div>
+            <div className="text-[10px] text-zinc-500 mt-0.5">SPL meter</div>
           </div>
-          <div className="text-[10px] text-zinc-500 mt-0.5">Live count</div>
-        </div>
 
-        <div className="p-3">
-          <div className="text-[11px] font-medium text-zinc-400">Absent</div>
-          <div
-            className="text-xl font-bold font-mono tabular-nums text-amber-400 mt-0.5"
-            data-testid="dedicated-absent-count"
-          >
-            {expectedTotal !== null ? attendance.absentCount : '—'}
+          <div className="p-3">
+            <div className="text-[11px] font-medium text-zinc-400">Threshold</div>
+            <div className="text-xl font-bold font-mono tabular-nums text-zinc-100 mt-0.5">
+              {SOUND_ALERT_THRESHOLD_DB.toFixed(1)}
+            </div>
+            <div className="text-[10px] text-zinc-500 mt-0.5">3s trigger</div>
           </div>
-          <div className="text-[10px] text-zinc-500 mt-0.5">
-            {expectedTotal !== null
-              ? `${attendance.attendanceRatePercent}% present`
-              : 'Set total'}
-          </div>
-        </div>
 
-        <div className="p-3">
-          <div className="text-[11px] font-medium text-zinc-400">Class Total</div>
-          <div
-            className="text-xl font-bold font-mono tabular-nums text-zinc-100 mt-0.5"
-            data-testid="dedicated-expected-total"
-          >
-            {expectedTotal ?? '—'}
+          <div className="p-3">
+            <div className="text-[11px] font-medium text-zinc-400">Mode</div>
+            <div className="text-sm font-semibold font-mono text-zinc-100 mt-1.5">
+              MIC ONLY
+            </div>
+            <div className="text-[10px] text-zinc-500 mt-0.5">No video</div>
           </div>
-          <div className="text-[10px] text-zinc-500 mt-0.5">Configured</div>
         </div>
-      </div>
+      ) : (
+        <div className="grid grid-cols-3 border border-zinc-800 rounded-lg divide-x divide-zinc-800 bg-[#101114]">
+          <div className="p-3">
+            <div className="text-[11px] font-medium text-zinc-400">Present</div>
+            <div
+              className="text-xl font-bold font-mono tabular-nums text-emerald-400 mt-0.5"
+              data-testid="dedicated-live-count"
+            >
+              {attendance.presentCount}
+            </div>
+            <div className="text-[10px] text-zinc-500 mt-0.5">Live count</div>
+          </div>
+
+          <div className="p-3">
+            <div className="text-[11px] font-medium text-zinc-400">Absent</div>
+            <div
+              className="text-xl font-bold font-mono tabular-nums text-amber-400 mt-0.5"
+              data-testid="dedicated-absent-count"
+            >
+              {expectedTotal !== null ? attendance.absentCount : '—'}
+            </div>
+            <div className="text-[10px] text-zinc-500 mt-0.5">
+              {expectedTotal !== null
+                ? `${attendance.attendanceRatePercent}% present`
+                : 'Set total'}
+            </div>
+          </div>
+
+          <div className="p-3">
+            <div className="text-[11px] font-medium text-zinc-400">Class Total</div>
+            <div
+              className="text-xl font-bold font-mono tabular-nums text-zinc-100 mt-0.5"
+              data-testid="dedicated-expected-total"
+            >
+              {expectedTotal ?? '—'}
+            </div>
+            <div className="text-[10px] text-zinc-500 mt-0.5">Configured</div>
+          </div>
+        </div>
+      )}
 
       {/* Scheduled Attendance Check */}
       <div className="border-t border-zinc-800/90 pt-4 space-y-3">

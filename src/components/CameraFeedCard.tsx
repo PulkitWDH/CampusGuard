@@ -25,15 +25,19 @@ import { captureCanvasJpegBase64 } from '../utils/mediaCapture';
 import {
   detectPeopleLocallyOnCanvas,
   ensureLocalPersonDetector,
+  getLocalDetectorStatus,
 } from '../utils/localPersonDetector';
 import {
   DEFAULT_DB_CALIBRATION_OFFSET,
   INSTANT_CHANGE_THRESHOLD_PERCENT,
   SOUND_ALERT_SUSTAINED_MS,
   SOUND_ALERT_THRESHOLD_DB,
+  type ContainDrawRect,
   type EdgeThreatTrackerState,
   type PersonTrackerState,
   type SpeechResultLike,
+  computeAspectPreservingSize,
+  computeContainDrawRect,
   computeFrameDeltaPercent,
   computeSplDecibels,
   createInitialEdgeThreatState,
@@ -41,6 +45,7 @@ import {
   extractLatestSpeechUtterance,
   formatAiModelLabel,
   formatFacilityLabels,
+  mapNormalizedBoxToRect,
   shouldTriggerInstantContinuousScan,
   stepPersonTracker,
 } from '../utils/monitoringLogic';
@@ -145,14 +150,22 @@ export function CameraFeedCard({
       ? String(camera.expectedTotalCount)
       : ''
   );
+  const isAudioOnly = camera.sourceKind === 'microphone-only' || !camera.hasVideo;
+
   const [liveMotionPercent, setLiveMotionPercent] = useState(0);
   const [contactPairsCount, setContactPairsCount] = useState(0);
-  const [scanModeLabel, setScanModeLabel] = useState('Edge AI · Loading model');
-  const [localEdgeState, setLocalEdgeState] = useState<'loading' | 'ready' | 'fallback'>('loading');
+  const [scanModeLabel, setScanModeLabel] = useState(
+    isAudioOnly ? 'Acoustic AI · Standby' : 'Edge AI · Loading model'
+  );
+  const [localEdgeState, setLocalEdgeState] = useState<'loading' | 'ready' | 'fallback'>(
+    isAudioOnly ? 'fallback' : 'loading'
+  );
   const [streamError, setStreamError] = useState<string | null>(null);
 
   const rawCaptureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const motionCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const lastDrawRectRef = useRef<ContainDrawRect>({ x: 0, y: 0, width: 640, height: 360 });
+  const waveformBinsRef = useRef<number[]>(new Array<number>(48).fill(0.06));
   const lastScannedThumbRef = useRef<Uint8ClampedArray | null>(null);
   const prevEdgeThumbRef = useRef<Uint8ClampedArray | null>(null);
   const liveMotionPercentRef = useRef<number>(0);
@@ -162,6 +175,7 @@ export function CameraFeedCard({
   const localEdgeReadyRef = useRef<boolean>(false);
   const localPeopleCountRef = useRef<number>(camera.studentCount);
   const lastLocalBoxSigRef = useRef<string>('__INIT__');
+  const consecutiveEdgeErrorsRef = useRef<number>(0);
   const personTrackerStateRef = useRef<PersonTrackerState>({
     confirmed: [],
     pending: [],
@@ -192,16 +206,11 @@ export function CameraFeedCard({
   const onUpdateTranscriptRef = useRef(onUpdateTranscript);
 
   const captureCleanFrame = (): { base64: string; dataUrl: string } | null => {
-    if (!hasLiveFrameRef.current) return null;
+    if (isAudioOnly || !hasLiveFrameRef.current) return null;
     if (!rawCaptureCanvasRef.current) {
-      const offscreen = document.createElement('canvas');
-      offscreen.width = 640;
-      offscreen.height = 360;
-      rawCaptureCanvasRef.current = offscreen;
+      rawCaptureCanvasRef.current = document.createElement('canvas');
     }
     const targetCanvas = rawCaptureCanvasRef.current;
-    const ctx = targetCanvas.getContext('2d');
-    if (!ctx) return null;
 
     const video = videoRef.current;
     const hasVideoFeed =
@@ -211,23 +220,51 @@ export function CameraFeedCard({
       (Boolean(liveMediaStream) ||
         (camera.customMediaType === 'video' && Boolean(camera.customMediaUrl)));
 
+    let srcW = 640;
+    let srcH = 360;
+    let sourceEl: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement | null = null;
+
     if (hasVideoFeed && video) {
-      ctx.drawImage(video, 0, 0, targetCanvas.width, targetCanvas.height);
+      srcW = video.videoWidth;
+      srcH = video.videoHeight;
+      sourceEl = video;
     } else if (
       loadedImageRef.current &&
       loadedImageRef.current.complete &&
       loadedImageRef.current.naturalWidth > 0
     ) {
-      ctx.drawImage(loadedImageRef.current, 0, 0, targetCanvas.width, targetCanvas.height);
+      srcW = loadedImageRef.current.naturalWidth;
+      srcH = loadedImageRef.current.naturalHeight;
+      sourceEl = loadedImageRef.current;
     } else if (canvasRef.current) {
-      ctx.drawImage(canvasRef.current, 0, 0, targetCanvas.width, targetCanvas.height);
+      srcW = canvasRef.current.width;
+      srcH = canvasRef.current.height;
+      sourceEl = canvasRef.current;
     } else {
       return null;
     }
 
-    const dataUrl = targetCanvas.toDataURL('image/jpeg', 0.85);
+    // Preserve true camera aspect ratio (e.g. portrait phone 360x640 vs landscape laptop 640x360)
+    // so humans on mobile/tablet cameras are NEVER stretched horizontally before COCO-SSD inference!
+    const fitted = computeAspectPreservingSize(srcW, srcH, 640);
+    if (targetCanvas.width !== fitted.width) targetCanvas.width = fitted.width;
+    if (targetCanvas.height !== fitted.height) targetCanvas.height = fitted.height;
+
+    const ctx = targetCanvas.getContext('2d');
+    if (!ctx) return null;
+    ctx.drawImage(sourceEl, 0, 0, targetCanvas.width, targetCanvas.height);
+
+    let dataUrl = '';
+    let base64 = '';
+    try {
+      dataUrl = targetCanvas.toDataURL('image/jpeg', 0.85);
+      base64 = captureCanvasJpegBase64(targetCanvas);
+    } catch {
+      // Cross-origin image without CORS headers: keep canvas intact if readable, avoid aborting frame draw
+    }
+
     return {
-      base64: captureCanvasJpegBase64(targetCanvas),
+      base64,
       dataUrl,
     };
   };
@@ -341,30 +378,43 @@ export function CameraFeedCard({
     );
   }, [camera.expectedTotalCount]);
 
-  // Preload zero-quota on-device TensorFlow.js COCO-SSD person + weapon detector
+  // Preload zero-quota on-device TensorFlow.js COCO-SSD person + weapon detector once video signal is active
   useEffect(() => {
+    if (isAudioOnly) {
+      localEdgeReadyRef.current = false;
+      setLocalEdgeState('fallback');
+      return;
+    }
+    if (!hasLiveSignal && !liveMediaStream) {
+      return;
+    }
     let cancelled = false;
     ensureLocalPersonDetector()
       .then(() => {
         if (!cancelled) {
           localEdgeReadyRef.current = true;
           setLocalEdgeState('ready');
+          const { backend } = getLocalDetectorStatus();
+          setScanModeLabel(
+            backend === 'cpu' ? 'Edge AI (CPU) · Armed' : 'Edge AI (WebGL) · Armed'
+          );
         }
       })
       .catch(() => {
         if (!cancelled) {
           localEdgeReadyRef.current = false;
           setLocalEdgeState('fallback');
+          setScanModeLabel('Cloud AI fallback · Edge model unavailable');
         }
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [hasLiveSignal, isAudioOnly, liveMediaStream]);
 
   // Real-time zero-quota on-device Edge AI person + weapon + visual threat engine (runs every 300ms)
   useEffect(() => {
-    if (!isAutoAiOn || !hasLiveSignal || localEdgeState !== 'ready') {
+    if (isAudioOnly || !isAutoAiOn || !hasLiveSignal || localEdgeState !== 'ready') {
       return;
     }
 
@@ -395,10 +445,12 @@ export function CameraFeedCard({
           dangerousObjects,
           occluderObjects,
           inferenceMs,
-        } = await detectPeopleLocallyOnCanvas(rawCanvas, 48, {
+          backend,
+        } = await detectPeopleLocallyOnCanvas(rawCanvas, 36, {
           hadTrackedPeople: personTrackerStateRef.current.confirmed.length > 0,
         });
         if (cancelled) return;
+        consecutiveEdgeErrorsRef.current = 0;
 
         // Lightweight 6x4 lower-torso patch sampler (shoulders/chest below face) for occlusion resilience
         const sampleTorsoSignature = (
@@ -435,8 +487,8 @@ export function CameraFeedCard({
           personTrackerStateRef.current,
           rawPeople,
           {
-            instantConfidence: 62,
-            minConfidence: 48,
+            instantConfidence: 58,
+            minConfidence: 36,
             maxMissedFrames: 2,
             maxOccludedFrames: 35,
             weakDetections: weakPeople,
@@ -488,14 +540,23 @@ export function CameraFeedCard({
         }
 
         if (!isAnalyzingRef.current) {
+          const backendTag = backend === 'cpu' ? 'CPU' : 'WebGL';
           setScanModeLabel(
             cloudQuotaExhaustedRef.current
-              ? `Edge AI · ${inferenceMs}ms (On-device armed)`
-              : `Edge + Cloud AI · ${inferenceMs}ms`
+              ? `Edge AI (${backendTag}) · ${inferenceMs}ms`
+              : `Edge (${backendTag}) + Cloud · ${inferenceMs}ms`
           );
         }
-      } catch {
-        // Keep last valid state on transient frame read error
+      } catch (err) {
+        consecutiveEdgeErrorsRef.current += 1;
+        if (consecutiveEdgeErrorsRef.current >= 4) {
+          const msg = err instanceof Error ? err.message : '';
+          setScanModeLabel(
+            /tainted|security/i.test(msg)
+              ? 'Edge AI blocked by stream CORS'
+              : 'Edge AI retrying on device...'
+          );
+        }
       } finally {
         localDetectInFlightRef.current = false;
       }
@@ -510,10 +571,22 @@ export function CameraFeedCard({
       cancelled = true;
       clearInterval(edgeTimer);
     };
-  }, [camera.id, hasLiveSignal, isAutoAiOn, localEdgeState]);
+  }, [camera.id, hasLiveSignal, isAudioOnly, isAutoAiOn, localEdgeState]);
 
   // Cloud multimodal threat verification loop (complements on-device Edge AI when cloud quota is available)
   useEffect(() => {
+    if (isAudioOnly) {
+      const hasLiveAudio = Boolean(liveMediaStream?.getAudioTracks().length) || micActive;
+      setScanModeLabel(
+        !isAutoAiOn
+          ? 'Acoustic AI paused'
+          : hasLiveAudio
+            ? 'Acoustic AI · Live Mic Armed'
+            : 'Acoustic AI · Standby'
+      );
+      setLiveMotionPercent(0);
+      return;
+    }
     if (!isAutoAiOn) {
       setScanModeLabel('Threat AI paused');
       setLiveMotionPercent(0);
@@ -584,7 +657,16 @@ export function CameraFeedCard({
     }, 350);
 
     return () => clearInterval(timer);
-  }, [camera.id, cloudQuotaExhausted, hasAiFeedSignal, isAutoAiOn, localEdgeState]);
+  }, [
+    camera.id,
+    cloudQuotaExhausted,
+    hasAiFeedSignal,
+    isAudioOnly,
+    isAutoAiOn,
+    liveMediaStream,
+    localEdgeState,
+    micActive,
+  ]);
 
   useEffect(() => {
     onUpdateTranscriptRef.current = onUpdateTranscript;
@@ -734,11 +816,26 @@ export function CameraFeedCard({
       const source = ctx.createMediaStreamSource(streamToMeter);
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.72;
       source.connect(analyser);
       const timeData = new Float32Array(analyser.fftSize);
+      const freqData = new Uint8Array(analyser.frequencyBinCount);
 
       sampleTimer = window.setInterval(() => {
         analyser.getFloatTimeDomainData(timeData);
+        analyser.getByteFrequencyData(freqData);
+        const bins = waveformBinsRef.current;
+        const binCount = bins.length;
+        const stride = Math.max(1, Math.floor(freqData.length / (binCount * 2)));
+        for (let b = 0; b < binCount; b += 1) {
+          let sum = 0;
+          for (let k = 0; k < stride; k += 1) {
+            sum += freqData[Math.min(freqData.length - 1, b * stride + k)] ?? 0;
+          }
+          const normalized = Math.min(1, sum / (stride * 210));
+          bins[b] = Math.max(0.05, bins[b] * 0.45 + normalized * 0.55);
+        }
+
         const instantDb = computeSplDecibels(timeData, dbCalibrationOffset);
         if (instantDb > peakDbInWindow) {
           peakDbInWindow = instantDb;
@@ -772,6 +869,7 @@ export function CameraFeedCard({
 
     return () => {
       if (sampleTimer) clearInterval(sampleTimer);
+      waveformBinsRef.current = new Array<number>(48).fill(0.06);
       loudHoldStartRef.current = null;
       setLoudHoldSeconds(0);
       if (ctx) void ctx.close().catch(() => {});
@@ -780,14 +878,7 @@ export function CameraFeedCard({
 
   // Draw live video/image frame + grounded person & weapon bounding boxes onto display canvas
   useEffect(() => {
-    let rafId = 0;
-    let lastDraw = 0;
-
     const drawFrame = (timestamp: number) => {
-      rafId = requestAnimationFrame(drawFrame);
-      if (timestamp - lastDraw < 100) return;
-      lastDraw = timestamp;
-
       const canvas = canvasRef.current;
       if (!canvas) return;
       const ctx = canvas.getContext('2d');
@@ -798,159 +889,266 @@ export function CameraFeedCard({
       ctx.fillStyle = '#070A0F';
       ctx.fillRect(0, 0, width, height);
 
-      const video = videoRef.current;
-      const hasVideoFeed =
-        (Boolean(liveMediaStream) ||
-          (camera.customMediaType === 'video' && Boolean(camera.customMediaUrl))) &&
-        video &&
-        video.readyState >= 2 &&
-        video.videoWidth > 0;
-
-      if (hasVideoFeed && video) {
-        ctx.drawImage(video, 0, 0, width, height);
-        if (!hasLiveFrameRef.current) {
-          hasLiveFrameRef.current = true;
-          setHasLiveSignal(true);
-        }
-      } else if (
-        loadedImageRef.current &&
-        loadedImageRef.current.complete &&
-        loadedImageRef.current.naturalWidth > 0
-      ) {
-        ctx.drawImage(loadedImageRef.current, 0, 0, width, height);
-        if (!hasLiveFrameRef.current) {
-          hasLiveFrameRef.current = true;
-          setHasLiveSignal(true);
-        }
-      } else {
-        if (hasLiveFrameRef.current) {
-          hasLiveFrameRef.current = false;
-          setHasLiveSignal(false);
-        }
-        ctx.fillStyle = '#0D131D';
-        ctx.fillRect(0, 0, width, height);
-        ctx.fillStyle = '#94a3b8';
-        ctx.font = '500 13px "DM Sans", sans-serif';
-        const message =
-          camera.sourceKind === 'wifi-cctv'
-            ? 'Connecting to Wi-Fi CCTV stream...'
-            : camera.sourceKind === 'stream-url'
-              ? 'Connecting to IP camera stream...'
-              : 'Feed offline · Click Reconnect Live Camera';
-        const m = ctx.measureText(message);
-        ctx.fillText(message, Math.max(20, (width - m.width) / 2), height / 2);
-      }
-
-      // Draw grounded AI person bounding boxes (including face-occluded tracking state)
-      const boxes = detectedPeopleRef.current;
-      if (hasLiveFrameRef.current && Array.isArray(boxes) && boxes.length > 0) {
+      if (isAudioOnly) {
+        const audioConnected =
+          Boolean(liveMediaStream?.getAudioTracks().length) || micActiveRef.current;
+        const dbVal = audioLevelRef.current || 0;
         const isCritical = cameraStatusRef.current === 'fighting';
-        const isBullying = threatCategoryRef.current === 'bullying';
+        const isLoud = dbVal > SOUND_ALERT_THRESHOLD_DB;
 
-        boxes.forEach((person, idx) => {
-          const [ymin, xmin, ymax, xmax] = person.box_2d;
-          const x = Math.max(2, Math.min(width - 18, Math.round((xmin / 1000) * width)));
-          const y = Math.max(32, Math.min(height - 38, Math.round((ymin / 1000) * height)));
-          const bw = Math.max(16, Math.min(width - x - 2, Math.round(((xmax - xmin) / 1000) * width)));
-          const bh = Math.max(16, Math.min(height - y - 2, Math.round(((ymax - ymin) / 1000) * height)));
+        // Subtle acoustic monitor grid
+        ctx.fillStyle = '#0A0C10';
+        ctx.fillRect(0, 0, width, height);
 
-          const isOccluded = Boolean(person.faceOccluded);
-          const strokeColor = isBullying
-            ? '#f97316'
-            : isCritical
-              ? '#ef4444'
-              : isOccluded
-                ? '#38bdf8'
-                : '#10b981';
-          const fillTint = isBullying
-            ? 'rgba(249, 115, 22, 0.14)'
-            : isCritical
-              ? 'rgba(239, 68, 68, 0.14)'
-              : isOccluded
-                ? 'rgba(56, 189, 248, 0.12)'
-                : 'rgba(16, 185, 129, 0.10)';
-          const tagBg = isBullying
-            ? 'rgba(194, 65, 12, 0.92)'
-            : isCritical
-              ? 'rgba(185, 28, 28, 0.92)'
-              : isOccluded
-                ? 'rgba(3, 105, 161, 0.92)'
-                : 'rgba(6, 95, 70, 0.90)';
+        const chartLeft = 36;
+        const chartRight = width - 24;
+        const chartTop = 98;
+        const chartBottom = height - 66;
+        const chartW = chartRight - chartLeft;
+        const chartH = chartBottom - chartTop;
 
-          ctx.fillStyle = fillTint;
-          ctx.fillRect(x, y, bw, bh);
-
-          ctx.strokeStyle = strokeColor;
-          ctx.lineWidth = 2;
-          if (isOccluded && !isCritical) {
-            ctx.setLineDash([6, 4]);
-          }
-          ctx.strokeRect(x, y, bw, bh);
-          ctx.setLineDash([]);
-
-          const corner = Math.min(12, Math.floor(Math.min(bw, bh) / 3));
-          ctx.lineWidth = 3.5;
+        ctx.strokeStyle = 'rgba(63, 63, 70, 0.45)';
+        ctx.lineWidth = 1;
+        for (const dbMark of [40, 60, 80, 100]) {
+          const yLine = chartBottom - ((dbMark - 20) / 100) * chartH;
           ctx.beginPath();
-          ctx.moveTo(x, y + corner);
-          ctx.lineTo(x, y);
-          ctx.lineTo(x + corner, y);
-          ctx.moveTo(x + bw - corner, y);
-          ctx.lineTo(x + bw, y);
-          ctx.lineTo(x + bw, y + corner);
-          ctx.moveTo(x, y + bh - corner);
-          ctx.lineTo(x, y + bh);
-          ctx.lineTo(x + corner, y + bh);
-          ctx.moveTo(x + bw - corner, y + bh);
-          ctx.lineTo(x + bw, y + bh);
-          ctx.lineTo(x + bw, y + bh - corner);
+          ctx.moveTo(chartLeft, yLine);
+          ctx.lineTo(chartRight, yLine);
           ctx.stroke();
+          ctx.fillStyle = '#52525b';
+          ctx.font = '500 10px "JetBrains Mono", monospace';
+          ctx.fillText(`${dbMark}`, 8, yLine + 3);
+        }
 
-          const tagText = isOccluded
-            ? `#${idx + 1} ${person.label}`
-            : `#${idx + 1} ${person.label} ${person.confidence}%`;
-          ctx.font = '600 11px "JetBrains Mono", monospace';
-          const textW = ctx.measureText(tagText).width;
-          const tagW = Math.min(width - 8, Math.ceil(textW) + 12);
-          const tagX = Math.max(4, Math.min(x, width - tagW - 4));
-          const rawTagY = y >= 54 ? y - 20 : Math.min(height - 54, y + 4);
-          let tagY = Math.max(34, Math.min(height - 54, rawTagY));
-          if (tagY < 88 && tagX + tagW > width - 150) {
-            tagY = Math.min(height - 54, Math.max(90, y + 6));
+        // Red dashed 90.1 dB alert threshold line
+        const thresholdY = chartBottom - ((SOUND_ALERT_THRESHOLD_DB - 20) / 100) * chartH;
+        ctx.save();
+        ctx.strokeStyle = 'rgba(239, 68, 68, 0.75)';
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo(chartLeft, thresholdY);
+        ctx.lineTo(chartRight, thresholdY);
+        ctx.stroke();
+        ctx.restore();
+        ctx.fillStyle = '#f87171';
+        ctx.font = '600 10px "JetBrains Mono", monospace';
+        ctx.fillText('90.1 dB ALERT', chartRight - 84, thresholdY - 5);
+
+        // Live 48-bar acoustic spectrum
+        const bins = waveformBinsRef.current;
+        const barGap = 3;
+        const barW = Math.max(4, Math.floor((chartW - barGap * (bins.length - 1)) / bins.length));
+        for (let i = 0; i < bins.length; i += 1) {
+          const amp = audioConnected
+            ? bins[i]
+            : 0.04 + 0.02 * Math.sin(timestamp / 500 + i * 0.35);
+          const barH = Math.max(4, Math.round(amp * chartH));
+          const bx = chartLeft + i * (barW + barGap);
+          const by = chartBottom - barH;
+          ctx.fillStyle =
+            isCritical || isLoud
+              ? '#ef4444'
+              : amp > 0.65
+                ? '#f59e0b'
+                : audioConnected
+                  ? '#10b981'
+                  : '#3f3f46';
+          ctx.fillRect(bx, by, barW, barH);
+        }
+
+        // Large monospace dB readout
+        ctx.fillStyle = isCritical || isLoud ? '#f87171' : audioConnected ? '#34d399' : '#e4e4e7';
+        ctx.font = '700 34px "JetBrains Mono", monospace';
+        ctx.fillText(`${dbVal.toFixed(1)} dB`, chartLeft, 76);
+
+        ctx.fillStyle = '#a1a1aa';
+        ctx.font = '500 11px "JetBrains Mono", monospace';
+        const modeText = audioConnected
+          ? 'MICROPHONE ONLY · LIVE ACOUSTIC & VOICE AI'
+          : 'MICROPHONE ONLY · STANDBY (CLICK CONNECT MIC OR INSPECT)';
+        ctx.fillText(modeText, chartLeft + 180, 68);
+
+        // Live speech cue line
+        const transcript = liveTranscriptRef.current.trim();
+        ctx.fillStyle = transcript ? '#f4f4f5' : '#71717a';
+        ctx.font = '500 12px "DM Sans", sans-serif';
+        const cueLine = transcript
+          ? `Speech: "${transcript.slice(0, 74)}"`
+          : audioConnected
+            ? 'Listening for fight, beating, bullying, and distress speech...'
+            : 'Ready to monitor acoustic spikes (>90.1 dB) & distress speech.';
+        ctx.fillText(cueLine, chartLeft, height - 38);
+      } else {
+        const video = videoRef.current;
+        const hasVideoFeed =
+          (Boolean(liveMediaStream) ||
+            (camera.customMediaType === 'video' && Boolean(camera.customMediaUrl))) &&
+          video &&
+          video.readyState >= 2 &&
+          video.videoWidth > 0;
+
+        if (hasVideoFeed && video) {
+          const drawRect = computeContainDrawRect(video.videoWidth, video.videoHeight, width, height);
+          lastDrawRectRef.current = drawRect;
+          ctx.drawImage(video, drawRect.x, drawRect.y, drawRect.width, drawRect.height);
+          if (!hasLiveFrameRef.current) {
+            hasLiveFrameRef.current = true;
+            setHasLiveSignal(true);
           }
-          ctx.fillStyle = tagBg;
-          ctx.fillRect(tagX, tagY, tagW, 18);
-          ctx.fillStyle = '#ffffff';
-          ctx.fillText(tagText, tagX + 6, tagY + 13, tagW - 12);
-        });
-      }
+        } else if (
+          loadedImageRef.current &&
+          loadedImageRef.current.complete &&
+          loadedImageRef.current.naturalWidth > 0
+        ) {
+          const drawRect = computeContainDrawRect(
+            loadedImageRef.current.naturalWidth,
+            loadedImageRef.current.naturalHeight,
+            width,
+            height
+          );
+          lastDrawRectRef.current = drawRect;
+          ctx.drawImage(
+            loadedImageRef.current,
+            drawRect.x,
+            drawRect.y,
+            drawRect.width,
+            drawRect.height
+          );
+          if (!hasLiveFrameRef.current) {
+            hasLiveFrameRef.current = true;
+            setHasLiveSignal(true);
+          }
+        } else {
+          if (hasLiveFrameRef.current) {
+            hasLiveFrameRef.current = false;
+            setHasLiveSignal(false);
+          }
+          ctx.fillStyle = '#0D131D';
+          ctx.fillRect(0, 0, width, height);
+          ctx.fillStyle = '#94a3b8';
+          ctx.font = '500 13px "DM Sans", sans-serif';
+          const message =
+            camera.sourceKind === 'wifi-cctv'
+              ? 'Connecting to Wi-Fi CCTV stream...'
+              : camera.sourceKind === 'stream-url'
+                ? 'Connecting to IP camera stream...'
+                : 'Feed offline · Click Reconnect Live Camera';
+          const m = ctx.measureText(message);
+          ctx.fillText(message, Math.max(20, (width - m.width) / 2), height / 2);
+        }
 
-      // Draw crimson bounding boxes for any detected weapon objects
-      const weapons = detectedObjectsRef.current;
-      if (hasLiveFrameRef.current && Array.isArray(weapons) && weapons.length > 0) {
-        weapons.forEach((weapon) => {
-          const [ymin, xmin, ymax, xmax] = weapon.box_2d;
-          const x = Math.max(2, Math.min(width - 18, Math.round((xmin / 1000) * width)));
-          const y = Math.max(32, Math.min(height - 38, Math.round((ymin / 1000) * height)));
-          const bw = Math.max(16, Math.min(width - x - 2, Math.round(((xmax - xmin) / 1000) * width)));
-          const bh = Math.max(16, Math.min(height - y - 2, Math.round(((ymax - ymin) / 1000) * height)));
+        // Draw grounded AI person bounding boxes aligned to the aspect-preserved video rect
+        const boxes = detectedPeopleRef.current;
+        const activeRect = lastDrawRectRef.current;
+        if (hasLiveFrameRef.current && Array.isArray(boxes) && boxes.length > 0) {
+          const isCritical = cameraStatusRef.current === 'fighting';
+          const isBullying = threatCategoryRef.current === 'bullying';
 
-          ctx.fillStyle = 'rgba(220, 38, 38, 0.24)';
-          ctx.fillRect(x, y, bw, bh);
-          ctx.strokeStyle = '#ef4444';
-          ctx.lineWidth = 3;
-          ctx.strokeRect(x, y, bw, bh);
+          boxes.forEach((person, idx) => {
+            const mapped = mapNormalizedBoxToRect(person.box_2d, activeRect);
+            const x = Math.max(2, Math.min(width - 18, mapped.x));
+            const y = Math.max(32, Math.min(height - 38, mapped.y));
+            const bw = Math.max(16, Math.min(width - x - 2, mapped.width));
+            const bh = Math.max(16, Math.min(height - y - 2, mapped.height));
 
-          const tagText = `WEAPON: ${weapon.label.toUpperCase()} ${weapon.confidence}%`;
-          ctx.font = '700 11px "JetBrains Mono", monospace';
-          const textW = ctx.measureText(tagText).width;
-          const tagW = Math.min(width - 8, Math.ceil(textW) + 12);
-          const tagX = Math.max(4, Math.min(x, width - tagW - 4));
-          const tagY = Math.max(34, y >= 54 ? y - 20 : y + 4);
-          ctx.fillStyle = '#dc2626';
-          ctx.fillRect(tagX, tagY, tagW, 18);
-          ctx.fillStyle = '#ffffff';
-          ctx.fillText(tagText, tagX + 6, tagY + 13, tagW - 12);
-        });
+            const isOccluded = Boolean(person.faceOccluded);
+            const strokeColor = isBullying
+              ? '#f97316'
+              : isCritical
+                ? '#ef4444'
+                : isOccluded
+                  ? '#38bdf8'
+                  : '#10b981';
+            const fillTint = isBullying
+              ? 'rgba(249, 115, 22, 0.14)'
+              : isCritical
+                ? 'rgba(239, 68, 68, 0.14)'
+                : isOccluded
+                  ? 'rgba(56, 189, 248, 0.12)'
+                  : 'rgba(16, 185, 129, 0.10)';
+            const tagBg = isBullying
+              ? 'rgba(194, 65, 12, 0.92)'
+              : isCritical
+                ? 'rgba(185, 28, 28, 0.92)'
+                : isOccluded
+                  ? 'rgba(3, 105, 161, 0.92)'
+                  : 'rgba(6, 95, 70, 0.90)';
+
+            ctx.fillStyle = fillTint;
+            ctx.fillRect(x, y, bw, bh);
+
+            ctx.strokeStyle = strokeColor;
+            ctx.lineWidth = 2;
+            if (isOccluded && !isCritical) {
+              ctx.setLineDash([6, 4]);
+            }
+            ctx.strokeRect(x, y, bw, bh);
+            ctx.setLineDash([]);
+
+            const corner = Math.min(12, Math.floor(Math.min(bw, bh) / 3));
+            ctx.lineWidth = 3.5;
+            ctx.beginPath();
+            ctx.moveTo(x, y + corner);
+            ctx.lineTo(x, y);
+            ctx.lineTo(x + corner, y);
+            ctx.moveTo(x + bw - corner, y);
+            ctx.lineTo(x + bw, y);
+            ctx.lineTo(x + bw, y + corner);
+            ctx.moveTo(x, y + bh - corner);
+            ctx.lineTo(x, y + bh);
+            ctx.lineTo(x + corner, y + bh);
+            ctx.moveTo(x + bw - corner, y + bh);
+            ctx.lineTo(x + bw, y + bh);
+            ctx.lineTo(x + bw, y + bh - corner);
+            ctx.stroke();
+
+            const tagText = isOccluded
+              ? `#${idx + 1} ${person.label}`
+              : `#${idx + 1} ${person.label} ${person.confidence}%`;
+            ctx.font = '600 11px "JetBrains Mono", monospace';
+            const textW = ctx.measureText(tagText).width;
+            const tagW = Math.min(width - 8, Math.ceil(textW) + 12);
+            const tagX = Math.max(4, Math.min(x, width - tagW - 4));
+            const rawTagY = y >= 54 ? y - 20 : Math.min(height - 54, y + 4);
+            let tagY = Math.max(34, Math.min(height - 54, rawTagY));
+            if (tagY < 88 && tagX + tagW > width - 150) {
+              tagY = Math.min(height - 54, Math.max(90, y + 6));
+            }
+            ctx.fillStyle = tagBg;
+            ctx.fillRect(tagX, tagY, tagW, 18);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText(tagText, tagX + 6, tagY + 13, tagW - 12);
+          });
+        }
+
+        // Draw crimson bounding boxes for any detected weapon objects
+        const weapons = detectedObjectsRef.current;
+        if (hasLiveFrameRef.current && Array.isArray(weapons) && weapons.length > 0) {
+          weapons.forEach((weapon) => {
+            const mapped = mapNormalizedBoxToRect(weapon.box_2d, activeRect);
+            const x = Math.max(2, Math.min(width - 18, mapped.x));
+            const y = Math.max(32, Math.min(height - 38, mapped.y));
+            const bw = Math.max(16, Math.min(width - x - 2, mapped.width));
+            const bh = Math.max(16, Math.min(height - y - 2, mapped.height));
+
+            ctx.fillStyle = 'rgba(220, 38, 38, 0.24)';
+            ctx.fillRect(x, y, bw, bh);
+            ctx.strokeStyle = '#ef4444';
+            ctx.lineWidth = 3;
+            ctx.strokeRect(x, y, bw, bh);
+
+            const tagText = `WEAPON: ${weapon.label.toUpperCase()} ${weapon.confidence}%`;
+            ctx.font = '700 11px "JetBrains Mono", monospace';
+            const textW = ctx.measureText(tagText).width;
+            const tagW = Math.min(width - 8, Math.ceil(textW) + 12);
+            const tagX = Math.max(4, Math.min(x, width - tagW - 4));
+            const tagY = Math.max(34, y >= 54 ? y - 20 : y + 4);
+            ctx.fillStyle = '#dc2626';
+            ctx.fillRect(tagX, tagY, tagW, 18);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText(tagText, tagX + 6, tagY + 13, tagW - 12);
+          });
+        }
       }
 
       // Top CCTV telemetry bar
@@ -968,14 +1166,16 @@ export function CameraFeedCard({
       ctx.fillText(timeLabel, width - timeMetrics.width - 10, 18);
     };
 
-    rafId = requestAnimationFrame(drawFrame);
-    return () => cancelAnimationFrame(rafId);
+    drawFrame(performance.now());
+    const intervalId = window.setInterval(() => drawFrame(performance.now()), 90);
+    return () => window.clearInterval(intervalId);
   }, [
     camera.bluetoothDeviceName,
     camera.cameraCode,
     camera.customMediaType,
     camera.customMediaUrl,
     camera.sourceKind,
+    isAudioOnly,
     liveMediaStream,
   ]);
 
@@ -1137,10 +1337,39 @@ export function CameraFeedCard({
     }
   };
 
+  // Auto-arm live speech recognition when a Microphone-Only zone has an active audio stream
+  useEffect(() => {
+    if (!isAudioOnly || !liveMediaStream || liveMediaStream.getAudioTracks().length === 0) return;
+    if (micActiveRef.current) return;
+
+    const SpeechCtor =
+      (window as unknown as { SpeechRecognition?: new () => SpeechRecognitionInstance })
+        .SpeechRecognition ||
+      (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognitionInstance })
+        .webkitSpeechRecognition;
+
+    micActiveRef.current = true;
+    setMicActive(true);
+    if (SpeechCtor) {
+      try {
+        startFreshSpeechSession(SpeechCtor);
+      } catch {
+        // dB metering continues even if speech API refuses auto-start
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAudioOnly, liveMediaStream]);
+
+  const isAudioStreamLive =
+    isAudioOnly && (Boolean(liveMediaStream?.getAudioTracks().length) || micActive);
+
   const needsStreamReconnect =
+    !isAudioOnly &&
     (camera.sourceKind === 'device-camera' ||
       (camera.sourceKind === 'bluetooth-cctv' && !camera.streamUrl && !camera.customMediaUrl)) &&
     !liveMediaStream;
+
+  const needsMicConnect = isAudioOnly && !isAudioStreamLive;
 
   const activeCategory = camera.lastAnalysis?.threatCategory;
   const isBullyingStatus = camera.status === 'fighting' && activeCategory === 'bullying';
@@ -1179,21 +1408,31 @@ export function CameraFeedCard({
       data-testid={`camera-card-${camera.id}`}
       className={`bg-[#101114] border rounded-lg overflow-hidden flex flex-col transition-colors ${statusBorderClass}`}
     >
-      {/* Dominant 16:9 Live CCTV Monitor */}
+      {/* Dominant 16:9 Live CCTV or Acoustic Monitor */}
       <div className="relative bg-black aspect-video w-full overflow-hidden">
-        <video
-          ref={videoRef}
-          muted
-          playsInline
-          aria-hidden="true"
-          className="absolute inset-0 w-full h-full object-cover opacity-0 pointer-events-none"
-        />
+        {!isAudioOnly ? (
+          <video
+            ref={videoRef}
+            autoPlay
+            muted
+            playsInline
+            onLoadedMetadata={(e) => {
+              void e.currentTarget.play().catch(() => {});
+            }}
+            aria-hidden="true"
+            className="absolute top-0 left-0 w-px h-px opacity-[0.01] pointer-events-none"
+          />
+        ) : null}
         <canvas
           ref={canvasRef}
           width={640}
           height={360}
           data-testid={`camera-canvas-${camera.id}`}
-          aria-label={`Live CCTV feed for ${camera.classroomName}`}
+          aria-label={
+            isAudioOnly
+              ? `Live acoustic monitor for ${camera.classroomName}`
+              : `Live CCTV feed for ${camera.classroomName}`
+          }
           className="w-full h-full object-cover block relative z-10"
         />
 
@@ -1210,8 +1449,21 @@ export function CameraFeedCard({
           </div>
         ) : null}
 
-        {/* Minimal Tactical Occupancy HUD */}
-        {hasLiveSignal ? (
+        {needsMicConnect ? (
+          <div className="pointer-events-none absolute top-9 right-2.5 z-20">
+            <button
+              type="button"
+              onClick={() => onReconnectStream(camera.id)}
+              className="pointer-events-auto inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white cursor-pointer"
+            >
+              <Mic className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>Connect Live Mic</span>
+            </button>
+          </div>
+        ) : null}
+
+        {/* Minimal Tactical Occupancy HUD (video feeds only) */}
+        {!isAudioOnly && hasLiveSignal ? (
           <div
             data-testid={`camera-hud-count-${camera.id}`}
             className={`pointer-events-none absolute top-9 right-2.5 z-20 rounded px-2 py-1 backdrop-blur-md border flex items-baseline gap-1.5 ${
@@ -1240,13 +1492,29 @@ export function CameraFeedCard({
           <div className="text-[11px] font-mono text-zinc-300 flex items-center gap-2 min-w-0">
             <span
               className={`font-semibold uppercase ${
-                hasLiveSignal ? 'text-emerald-400' : 'text-amber-400'
+                isAudioOnly
+                  ? isAudioStreamLive
+                    ? 'text-emerald-400'
+                    : 'text-amber-400'
+                  : hasLiveSignal
+                    ? 'text-emerald-400'
+                    : 'text-amber-400'
               }`}
             >
-              {hasLiveSignal ? 'LIVE' : 'OFFLINE'}
+              {isAudioOnly
+                ? isAudioStreamLive
+                  ? 'MIC LIVE'
+                  : 'STANDBY'
+                : hasLiveSignal
+                  ? 'LIVE'
+                  : 'OFFLINE'}
             </span>
-            <span aria-hidden="true" className="text-zinc-600">·</span>
-            <span className="tabular-nums">Δ{liveMotionPercent.toFixed(0)}%</span>
+            {!isAudioOnly ? (
+              <>
+                <span aria-hidden="true" className="text-zinc-600">·</span>
+                <span className="tabular-nums">Δ{liveMotionPercent.toFixed(0)}%</span>
+              </>
+            ) : null}
             <span aria-hidden="true" className="text-zinc-600">·</span>
             <span
               className={`truncate tabular-nums ${
@@ -1312,14 +1580,20 @@ export function CameraFeedCard({
             </span>
           </div>
           <p className="text-[11px] text-zinc-500 mt-0.5 truncate">
-            <span className="font-mono text-zinc-300 tabular-nums" data-testid={`camera-live-count-${camera.id}`}>
-              {camera.studentCount} {countWord}
-            </span>
+            {isAudioOnly ? (
+              <span className="font-mono text-zinc-300" data-testid={`camera-live-count-${camera.id}`}>
+                Mic Only
+              </span>
+            ) : (
+              <span className="font-mono text-zinc-300 tabular-nums" data-testid={`camera-live-count-${camera.id}`}>
+                {camera.studentCount} {countWord}
+              </span>
+            )}
             <span aria-hidden="true"> · </span>
             <span className="font-mono" data-testid={`camera-cycle-label-${camera.id}`}>
               {camera.isAnalyzing ? 'Analyzing...' : scanModeLabel}
             </span>
-            {contactPairsCount > 0 ? (
+            {!isAudioOnly && contactPairsCount > 0 ? (
               <>
                 <span aria-hidden="true"> · </span>
                 <span className="font-mono text-amber-400">{contactPairsCount} overlap</span>
