@@ -1,5 +1,11 @@
 import type { DetectedObjectBox, DetectedPersonBox } from '../types';
 import {
+  analyzeFrameExposure,
+  buildCocoModelCandidateUrls,
+  shouldPreferCpuBackend,
+  shouldTriggerSilentZeroWebglWatchdog,
+} from './crossDeviceVision';
+import {
   computeBoxIoU,
   filterVerifiedPersonDetections,
   mergeTiledPersonDetections,
@@ -47,24 +53,39 @@ let modelInstance: CocoModel | null = null;
 let modelLoadPromise: Promise<CocoModel> | null = null;
 let detectorStatus: LocalDetectorStatus = 'idle';
 let detectorBackend: LocalDetectorBackend = null;
+let detectorModelSource: 'local' | 'cdn' | null = null;
 let detectorErrorMessage: string | null = null;
 let tfModuleCache: typeof import('@tensorflow/tfjs') | null = null;
+let consecutiveSilentZeroWebglFrames = 0;
+let cpuShadowCheckDone = false;
 
-// Reusable offscreen crop canvases for square-aspect multi-person tiled & torso recovery detection
+// Reusable offscreen crop/enhancement canvases
 let leftTileCanvas: HTMLCanvasElement | null = null;
 let rightTileCanvas: HTMLCanvasElement | null = null;
 let torsoTileCanvas: HTMLCanvasElement | null = null;
+let enhancedCanvas: HTMLCanvasElement | null = null;
+let exposureProbeCanvas: HTMLCanvasElement | null = null;
 
 export function getLocalDetectorStatus(): {
   status: LocalDetectorStatus;
   backend: LocalDetectorBackend;
+  modelSource: 'local' | 'cdn' | null;
   error: string | null;
 } {
   return {
     status: detectorStatus,
     backend: detectorBackend,
+    modelSource: detectorModelSource,
     error: detectorErrorMessage,
   };
+}
+
+export function resetLocalPersonDetectorForRetry(): void {
+  if (detectorStatus === 'error') {
+    modelLoadPromise = null;
+    detectorStatus = 'idle';
+    detectorErrorMessage = null;
+  }
 }
 
 function createWarmupCanvas(): HTMLCanvasElement {
@@ -75,8 +96,34 @@ function createWarmupCanvas(): HTMLCanvasElement {
   if (ctx) {
     ctx.fillStyle = '#111827';
     ctx.fillRect(0, 0, 64, 64);
+    ctx.fillStyle = '#e5e7eb';
+    ctx.fillRect(20, 12, 24, 42);
   }
   return canvas;
+}
+
+/**
+ * Verifies WebGL produces finite, accurate MobileNetV2-style depthwiseConv2d math.
+ * Catches iOS Safari & mobile Adreno/Mali float16 WebGL precision failures that
+ * silently output NaN/0 without throwing JavaScript exceptions.
+ */
+async function runWebglNumericSelfTest(
+  tf: typeof import('@tensorflow/tfjs')
+): Promise<boolean> {
+  try {
+    const ok = tf.tidy(() => {
+      const input = tf.ones([1, 8, 8, 3], 'float32').mul(tf.scalar(128));
+      const filter = tf.ones([3, 3, 3, 1], 'float32').mul(tf.scalar(0.25));
+      const conv = tf.depthwiseConv2d(input as Parameters<typeof tf.depthwiseConv2d>[0], filter as Parameters<typeof tf.depthwiseConv2d>[1], 1, 'same');
+      const maxVal = conv.max().dataSync()[0];
+      const minVal = conv.min().dataSync()[0];
+      // Expected interior value = 9 * 128 * 0.25 = 288
+      return Number.isFinite(maxVal) && Number.isFinite(minVal) && maxVal > 200 && maxVal < 400;
+    });
+    return Boolean(ok);
+  } catch {
+    return false;
+  }
 }
 
 async function switchToCpuBackend(): Promise<boolean> {
@@ -88,6 +135,7 @@ async function switchToCpuBackend(): Promise<boolean> {
     }
     await tf.ready();
     detectorBackend = 'cpu';
+    consecutiveSilentZeroWebglFrames = 0;
     return true;
   } catch {
     return false;
@@ -114,6 +162,36 @@ async function safeModelDetect(
   }
 }
 
+async function loadCocoSsdWithSelfHostedFallback(
+  cocoSsd: typeof import('@tensorflow-models/coco-ssd')
+): Promise<{ model: CocoModel; source: 'local' | 'cdn' }> {
+  const baseUrl =
+    typeof import.meta !== 'undefined' && import.meta.env?.BASE_URL
+      ? import.meta.env.BASE_URL
+      : '/';
+  const candidateUrls = buildCocoModelCandidateUrls(baseUrl);
+
+  let lastErr: unknown = null;
+  for (let i = 0; i < candidateUrls.length; i += 1) {
+    const candidateUrl = candidateUrls[i];
+    const isLocal = i === 0 && !candidateUrl.startsWith('http');
+    try {
+      const loaded = (await cocoSsd.load({
+        base: 'lite_mobilenet_v2',
+        modelUrl: candidateUrl,
+      })) as unknown as CocoModel;
+      return {
+        model: loaded,
+        source: isLocal ? 'local' : 'cdn',
+      };
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+
+  throw lastErr ?? new Error('Unable to download COCO-SSD neural weights.');
+}
+
 export async function ensureLocalPersonDetector(): Promise<CocoModel> {
   if (modelInstance) return modelInstance;
   if (modelLoadPromise) return modelLoadPromise;
@@ -128,9 +206,21 @@ export async function ensureLocalPersonDetector(): Promise<CocoModel> {
 
       let preferredBackend: 'webgl' | 'cpu' = 'cpu';
       try {
+        // Prevent silent float16 precision overflow in MobileNetV2 on phones/tablets
+        tf.env().set('WEBGL_FORCE_F16_TEXTURES', false);
         await tf.setBackend('webgl');
         await tf.ready();
-        preferredBackend = tf.getBackend() === 'webgl' ? 'webgl' : 'cpu';
+        if (tf.getBackend() === 'webgl') {
+          const renderFloat32Capable = Boolean(tf.env().getBool('WEBGL_RENDER_FLOAT32_CAPABLE'));
+          const numericSelfTestPassed = await runWebglNumericSelfTest(tf);
+          if (shouldPreferCpuBackend({ renderFloat32Capable, numericSelfTestPassed })) {
+            await tf.setBackend('cpu');
+            await tf.ready();
+            preferredBackend = 'cpu';
+          } else {
+            preferredBackend = 'webgl';
+          }
+        }
       } catch {
         await tf.setBackend('cpu');
         await tf.ready();
@@ -138,10 +228,10 @@ export async function ensureLocalPersonDetector(): Promise<CocoModel> {
       }
 
       const cocoSsd = await import('@tensorflow-models/coco-ssd');
-      // Fast lite_mobilenet_v2 works smoothly across laptops, tablets, and mobile browsers
-      const loaded = (await cocoSsd.load({ base: 'lite_mobilenet_v2' })) as unknown as CocoModel;
+      const { model: loaded, source } = await loadCocoSsdWithSelfHostedFallback(cocoSsd);
+      detectorModelSource = source;
 
-      // Verify inference actually runs on the active backend (catches broken mobile WebGL shaders immediately)
+      // Verify inference executes cleanly on active backend
       const warmupCanvas = createWarmupCanvas();
       try {
         await loaded.detect(warmupCanvas, 1, 0.5);
@@ -159,6 +249,8 @@ export async function ensureLocalPersonDetector(): Promise<CocoModel> {
 
       modelInstance = loaded;
       detectorStatus = 'ready';
+      consecutiveSilentZeroWebglFrames = 0;
+      cpuShadowCheckDone = false;
       return modelInstance;
     } catch (err) {
       detectorStatus = 'error';
@@ -225,7 +317,7 @@ function mapPredictionsToWeakPeople(
   for (const pred of rawPredictions) {
     if (pred.class !== 'person' || !Number.isFinite(pred.score)) continue;
     const conf = Math.round(pred.score * 100);
-    if (conf < 18 || conf >= maxConfidenceExclusive) continue;
+    if (conf < 16 || conf >= maxConfidenceExclusive) continue;
 
     const [bx, by, bw, bh] = pred.bbox;
     const rawYmin = (Math.max(0, by) / height) * 1000;
@@ -240,9 +332,8 @@ function mapPredictionsToWeakPeople(
 
     const boxW = xmax - xmin;
     const boxH = ymax - ymin;
-    // Only keep plausible human body/torso proportions so random shadows never qualify
-    if (boxW < 75 || boxH < 150) continue;
-    if (boxW > 950 && boxH > 950) continue;
+    if (boxW < 70 || boxH < 140) continue;
+    if (boxW > 960 && boxH > 960) continue;
 
     results.push({
       label: `Person (${describeHorizontalZone(xmin, xmax)})`,
@@ -366,18 +457,31 @@ function ensureTileCanvas(
   return canvas;
 }
 
+function measureCanvasExposure(canvas: HTMLCanvasElement) {
+  try {
+    exposureProbeCanvas = ensureTileCanvas(exposureProbeCanvas, 48, 36);
+    const pctx = exposureProbeCanvas.getContext('2d', { willReadFrequently: true });
+    if (!pctx) return null;
+    pctx.drawImage(canvas, 0, 0, 48, 36);
+    const rgba = pctx.getImageData(0, 0, 48, 36).data;
+    return analyzeFrameExposure(rgba);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Runs real on-device COCO-SSD neural network inference directly on the clean video canvas.
- * Detects:
- * 1. Verified multi-person positions (Full-Frame + Left/Right 60% tiles),
- * 2. Weak occluded-person body/torso proposals + lower-torso recovery crop (so covering
- *    a face with a tennis racket, book, bag, or hand NEVER makes the person vanish),
- * 3. Handheld occluder objects (tennis racket, book, backpack, phone, umbrella, etc.), AND
- * 4. Dangerous weapon-class objects (knife, baseball bat, scissors) with zero API quota.
+ * Cross-device hardened for phones, tablets, laptops, Windows app, and offline PWAs:
+ * - Self-hosted same-origin model weights (/models/coco-ssd/model.json)
+ * - Automatic float16/broken-WebGL detection & deterministic float32 CPU fallback
+ * - Runtime silent-zero WebGL watchdog
+ * - Automatic low-light brightness/contrast boost pass for dim cameras
+ * - Multi-person 60% tiling + face-occluded lower-torso recovery
  */
 export async function detectPeopleLocallyOnCanvas(
   canvas: HTMLCanvasElement,
-  minConfidencePercent = 36,
+  minConfidencePercent = 28,
   options?: { hadTrackedPeople?: boolean }
 ): Promise<{
   people: DetectedPersonBox[];
@@ -402,14 +506,53 @@ export async function detectPeopleLocallyOnCanvas(
   }
 
   const startedAt = performance.now();
-  // Query COCO-SSD down to 0.18 so dim secondary webcams, face-occluded torsos & handheld rackets are captured
-  const rawMinScore = 0.18;
+  const rawMinScore = 0.15;
 
-  // Pass 1: Full-frame detection (up to 35 boxes) on aspect-ratio-preserved canvas
+  // Pass 1: Full-frame detection on aspect-ratio-preserved canvas
   const fullStart = performance.now();
-  const fullRaw = await safeModelDetect(model, canvas, 35, rawMinScore);
+  let fullRaw = await safeModelDetect(model, canvas, 35, rawMinScore);
   const fullPassMs = performance.now() - fullStart;
-  const fullBoxes = mapPredictionsToBoxes(fullRaw, width, height, minConfidencePercent);
+
+  const exposure = measureCanvasExposure(canvas);
+
+  // Runtime silent-zero WebGL watchdog: if a phone/laptop GPU silently outputs 0 predictions
+  // across 5 consecutive real non-blank frames, shadow-test CPU once and switch permanently if CPU sees objects!
+  if (detectorBackend === 'webgl' && !cpuShadowCheckDone && exposure) {
+    const watchdog = shouldTriggerSilentZeroWebglWatchdog({
+      backend: detectorBackend,
+      rawPredictionCount: fullRaw.length,
+      isBlankFrame: exposure.isBlankFrame,
+      consecutiveSilentZeroFrames: consecutiveSilentZeroWebglFrames,
+    });
+    consecutiveSilentZeroWebglFrames = watchdog.nextSilentCount;
+
+    if (watchdog.shouldProbeCpu) {
+      cpuShadowCheckDone = true;
+      const switched = await switchToCpuBackend();
+      if (switched) {
+        const cpuProbeRaw = await model.detect(canvas, 35, rawMinScore);
+        if (cpuProbeRaw.length > 0) {
+          // Confirmed broken/silent-zero WebGL GPU on this device — stay permanently on CPU!
+          fullRaw = cpuProbeRaw;
+        } else if (tfModuleCache) {
+          // Scene genuinely has 0 objects even on CPU — restore WebGL for speed
+          try {
+            await tfModuleCache.setBackend('webgl');
+            await tfModuleCache.ready();
+            if (tfModuleCache.getBackend() === 'webgl') {
+              detectorBackend = 'webgl';
+            }
+          } catch {
+            detectorBackend = 'cpu';
+          }
+        }
+      }
+    }
+  } else if (fullRaw.length > 0) {
+    consecutiveSilentZeroWebglFrames = 0;
+  }
+
+  let fullBoxes = mapPredictionsToBoxes(fullRaw, width, height, minConfidencePercent);
   const rawWeakPeople: DetectedPersonBox[] = [
     ...mapPredictionsToWeakPeople(fullRaw, width, height, minConfidencePercent),
   ];
@@ -420,8 +563,31 @@ export async function detectPeopleLocallyOnCanvas(
     ...mapPredictionsToOccluders(fullRaw, width, height, 0, 1),
   ];
 
+  // Low-Light Exposure Boost Pass: if camera is dim/dark on another device and Pass 1 found 0 people,
+  // run a fast software brightness/contrast-normalized pass so dimly lit humans still lock on!
+  if (fullBoxes.length === 0 && exposure?.needsLowLightBoost) {
+    enhancedCanvas = ensureTileCanvas(enhancedCanvas, width, height);
+    const ectx = enhancedCanvas.getContext('2d');
+    if (ectx) {
+      await yieldToMainThread();
+      ectx.save();
+      ectx.filter = 'brightness(1.5) contrast(1.25)';
+      ectx.drawImage(canvas, 0, 0, width, height);
+      ectx.restore();
+      const boostedRaw = await safeModelDetect(model, enhancedCanvas, 25, rawMinScore);
+      const boostedBoxes = mapPredictionsToBoxes(boostedRaw, width, height, minConfidencePercent);
+      if (boostedBoxes.length > 0) {
+        fullBoxes = boostedBoxes;
+      }
+      rawWeakPeople.push(
+        ...mapPredictionsToWeakPeople(boostedRaw, width, height, minConfidencePercent)
+      );
+      rawWeapons.push(...mapPredictionsToDangerousObjects(boostedRaw, width, height, 0, 1));
+      rawOccluders.push(...mapPredictionsToOccluders(boostedRaw, width, height, 0, 1));
+    }
+  }
+
   // Pass 2 & 3: Overlapping 60% square-aspect tiles ONLY for wide landscape multi-person scenes
-  // Skip tiling on portrait mobile cameras or when a close-up person spans >=42% width or >=58% height
   const hasCloseUpDominantPerson = fullBoxes.some(
     (b) => b.box_2d[3] - b.box_2d[1] >= 420 || b.box_2d[2] - b.box_2d[0] >= 580
   );
@@ -472,7 +638,6 @@ export async function detectPeopleLocallyOnCanvas(
     : fullBoxes;
 
   // Pass 4: Lower-Torso Recovery Crop when face is hidden by a racket/book/hand
-  // Cropping out the top 34% removes the occluding racket so COCO-SSD locks onto uncovered shoulders/torso!
   if (
     people.length === 0 &&
     height >= 200 &&
@@ -489,16 +654,15 @@ export async function detectPeopleLocallyOnCanvas(
       for (const pred of torsoRaw) {
         if (pred.class !== 'person' || !Number.isFinite(pred.score)) continue;
         const conf = Math.round(pred.score * 100);
-        if (conf < 22) continue;
+        if (conf < 20) continue;
         const [bx, by, bw, bh] = pred.bbox;
         const xmin = Math.round((Math.max(0, bx) / width) * 1000);
         const xmax = Math.round((Math.min(width, bx + bw) / width) * 1000);
         const mappedYmin = Math.round(340 + (Math.max(0, by) / cropH) * 660);
         const mappedYmax = Math.round(340 + (Math.min(cropH, by + bh) / cropH) * 660);
-        // Extend top upward to cover the occluded head/racket region above the shoulders
         const extendedYmin = Math.max(40, mappedYmin - Math.round((mappedYmax - mappedYmin) * 0.45));
         const boxW = xmax - xmin;
-        if (boxW < 85 || mappedYmax - extendedYmin < 180) continue;
+        if (boxW < 80 || mappedYmax - extendedYmin < 170) continue;
 
         const recovered: DetectedPersonBox = {
           label: `Person (Face Occluded)`,
@@ -506,7 +670,7 @@ export async function detectPeopleLocallyOnCanvas(
           confidence: conf,
           faceOccluded: true,
         };
-        if (conf >= 42) {
+        if (conf >= 38) {
           people = filterVerifiedPersonDetections([...people, recovered], minConfidencePercent);
         } else {
           rawWeakPeople.push(recovered);
@@ -517,7 +681,7 @@ export async function detectPeopleLocallyOnCanvas(
 
   const dangerousObjects = deduplicateObjects(rawWeapons);
   const occluderObjects = deduplicateObjects(rawOccluders);
-  const weakPeople = filterVerifiedPersonDetections(rawWeakPeople, 18);
+  const weakPeople = filterVerifiedPersonDetections(rawWeakPeople, 16);
 
   const inferenceMs = Math.max(1, Math.round(performance.now() - startedAt));
   return {

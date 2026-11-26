@@ -69,6 +69,7 @@ import type {
   WorkspaceGmailMessage,
   WorkspaceTeacher,
 } from './types';
+import { ensureLocalPersonDetector } from './utils/localPersonDetector';
 import { extractAppearanceSignature } from './utils/subjectIntelligence';
 import { sealForensicEvidenceCase } from './utils/tacticalForensics';
 import { openRawMediaStream, playAlertChime, sendBrowserNotification } from './utils/mediaCapture';
@@ -255,6 +256,14 @@ export default function App() {
   const [loadingWorkspace, setLoadingWorkspace] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [dispatchAlert, setDispatchAlert] = useState<IncidentAlert | null>(null);
+
+  useEffect(() => {
+    // Pre-warm self-hosted COCO-SSD neural model on startup so any device recognizes humans immediately
+    const warmTimer = window.setTimeout(() => {
+      void ensureLocalPersonDetector().catch(() => {});
+    }, 600);
+    return () => clearTimeout(warmTimer);
+  }, []);
 
   useEffect(() => {
     fetch('/api/ai/capabilities')
@@ -2604,9 +2613,9 @@ export default function App() {
                         >
                           <Camera className="w-4 h-4 text-zinc-100" aria-hidden="true" />
                           <div>
-                            <div className="text-xs font-semibold text-zinc-100">USB / Webcam</div>
+                            <div className="text-xs font-semibold text-zinc-100">Wired (HDMI / USB-C)</div>
                             <div className="text-[11px] text-zinc-500 mt-0.5 leading-snug">
-                              Local laptop webcam or USB security cam
+                              Scan HDMI capture, Type-C, SDI/BNC &amp; USB cams
                             </div>
                           </div>
                         </button>

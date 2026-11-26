@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   Bluetooth,
+  Cable,
   Camera,
   CheckCircle2,
   ChevronDown,
@@ -38,6 +39,11 @@ import {
   type WifiHotspotQuickPreset,
   type WifiScanProgress,
 } from '../utils/wifiDiscovery';
+import {
+  buildWiredCameraList,
+  probeWiredCameraCapabilities,
+  type WiredCameraDevice,
+} from '../utils/wiredCameraDiscovery';
 
 export type ScannerModalTab = 'wifi' | 'bluetooth' | 'hardware' | 'microphone' | 'upload';
 
@@ -138,9 +144,12 @@ export function BluetoothScannerModal({
   const wifiScanAbortRef = useRef<AbortController | null>(null);
   const networkStatus = detectBrowserNetworkInfo();
 
-  // Hardware cameras & mics
+  // Wired / Hardware cameras & mics (HDMI capture, USB-C / Type-C, SDI/BNC/DVR, USB UVC, built-in)
   const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
   const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [wiredCameras, setWiredCameras] = useState<WiredCameraDevice[]>([]);
+  const [isProbingWired, setIsProbingWired] = useState(false);
+  const [connectingWiredId, setConnectingWiredId] = useState<string | null>(null);
   const [selectedVideoId, setSelectedVideoId] = useState<string>('');
   const [selectedAudioId, setSelectedAudioId] = useState<string>('');
   const [hardwareRoomName, setHardwareRoomName] = useState('');
@@ -163,21 +172,46 @@ export function BluetoothScannerModal({
     WIFI_CAMERA_BRAND_PRESETS.find((p) => p.id === wifiBrandId) ??
     WIFI_CAMERA_BRAND_PRESETS[0];
 
-  const refreshMediaDevices = async (requestPermission = false) => {
+  const refreshMediaDevices = async (requestPermission = false, probePorts = false) => {
     setIsLoadingDevices(true);
     setHardwareError(null);
     try {
       const { videoInputs, audioInputs } = await listHardwareMediaDevices(requestPermission);
       setVideoDevices(videoInputs);
       setAudioDevices(audioInputs);
-      if (videoInputs.length > 0 && !selectedVideoId) {
-        setSelectedVideoId(videoInputs[0].deviceId);
+      const classified = buildWiredCameraList(videoInputs, audioInputs);
+      setWiredCameras(classified);
+      if (classified.length > 0 && (!selectedVideoId || !videoInputs.some((v) => v.deviceId === selectedVideoId))) {
+        setSelectedVideoId(classified[0].deviceId);
+        if (classified[0].matchedAudioDeviceId) {
+          setSelectedAudioId(classified[0].matchedAudioDeviceId);
+        }
       }
       if (audioInputs.length > 0 && !selectedAudioId) {
         setSelectedAudioId(audioInputs[0].deviceId);
       }
+
+      if (probePorts && classified.length > 0) {
+        setIsProbingWired(true);
+        const probed = await Promise.all(
+          classified.map(async (cam) => {
+            if (!cam.deviceId) return cam;
+            const res = await probeWiredCameraCapabilities(cam.deviceId);
+            return {
+              ...cam,
+              maxWidth: res.maxWidth,
+              maxHeight: res.maxHeight,
+              maxFrameRate: res.maxFrameRate,
+              probeStatus: res.ok ? ('verified' as const) : ('busy' as const),
+            };
+          })
+        );
+        setWiredCameras(probed);
+        setIsProbingWired(false);
+      }
     } catch {
-      setHardwareError('Unable to enumerate connected cameras or microphones.');
+      setHardwareError('Unable to enumerate connected wired cameras or microphones.');
+      setIsProbingWired(false);
     } finally {
       setIsLoadingDevices(false);
     }
@@ -191,6 +225,14 @@ export function BluetoothScannerModal({
           setBlockedByIframe(true);
         }
       });
+
+      const handleHotPlug = () => {
+        void refreshMediaDevices(false);
+      };
+      navigator.mediaDevices?.addEventListener?.('devicechange', handleHotPlug);
+      return () => {
+        navigator.mediaDevices?.removeEventListener?.('devicechange', handleHotPlug);
+      };
     } else if (wifiScanAbortRef.current) {
       wifiScanAbortRef.current.abort();
       wifiScanAbortRef.current = null;
@@ -535,18 +577,49 @@ export function BluetoothScannerModal({
         videoDeviceId: selectedVideoId || undefined,
         audioDeviceId: selectedAudioId || undefined,
       });
-      const chosenCam = videoDevices.find((d) => d.deviceId === selectedVideoId);
+      const chosenCam = wiredCameras.find((d) => d.deviceId === selectedVideoId);
       onAddHardwareCamera(
         hardwareRoomName.trim(),
         stream,
         selectedVideoId || undefined,
         selectedAudioId || undefined,
-        chosenCam?.label || 'Connected Camera'
+        chosenCam ? `${chosenCam.interfaceBadge} · ${chosenCam.label}` : 'Wired Camera'
       );
       setHardwareRoomName('');
       onClose();
     } catch {
-      setHardwareError('Camera or microphone permission was denied, or the selected device is busy.');
+      setHardwareError('Camera permission was denied, or the selected wired port is currently in use by another app.');
+    }
+  };
+
+  const handleQuickConnectWired = async (cam: WiredCameraDevice) => {
+    setHardwareError(null);
+    const zoneName =
+      hardwareRoomName.trim() ||
+      `${cam.interfaceBadge} ${existingCameras.length + 1}`;
+    setConnectingWiredId(cam.deviceId || cam.label);
+    try {
+      const audioId = cam.matchedAudioDeviceId || selectedAudioId || undefined;
+      const stream = await openRawMediaStream({
+        includeVideo: true,
+        videoDeviceId: cam.deviceId || undefined,
+        audioDeviceId: audioId,
+      });
+      onAddHardwareCamera(
+        zoneName,
+        stream,
+        cam.deviceId || undefined,
+        audioId,
+        `${cam.interfaceBadge} · ${cam.label}`
+      );
+      setHardwareRoomName('');
+      onClose();
+    } catch {
+      setHardwareError(
+        `Could not open "${cam.label}". Allow camera permission or close other apps using this wired port.`
+      );
+    } finally {
+      setConnectingWiredId(null);
     }
   };
 
@@ -672,8 +745,8 @@ export function BluetoothScannerModal({
           {(
             [
               { id: 'wifi', label: 'Wi-Fi CCTV', icon: Wifi },
+              { id: 'hardware', label: 'Wired (HDMI / USB-C)', icon: Cable },
               { id: 'bluetooth', label: 'Bluetooth CCTV', icon: Bluetooth },
-              { id: 'hardware', label: 'USB / Built-in Cam', icon: Camera },
               { id: 'microphone', label: 'Mic Only', icon: Mic },
               { id: 'upload', label: 'Upload Video / Photo', icon: Upload },
             ] as const
@@ -1235,21 +1308,30 @@ export function BluetoothScannerModal({
             </>
           ) : null}
 
-          {/* TAB 3: HARDWARE CAMERAS & MICS */}
+          {/* TAB 3: WIRED CAMERAS (HDMI CAPTURE, USB-C / TYPE-C, SDI/BNC/DVR, USB UVC, BUILT-IN) */}
           {activeTab === 'hardware' ? (
             <div className="space-y-4">
-              <div className="flex items-center justify-between gap-2">
-                <p className="text-xs text-slate-400">
-                  Attach any connected USB webcam, built-in laptop camera, or Bluetooth-paired camera and microphone.
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs text-slate-400 max-w-md">
+                  Detects every wired camera plugged into this device — HDMI capture cards, USB-C / Type-C cameras, SDI / BNC DVR dongles, USB UVC webcams, and built-in lenses. Auto-updates on plug-in.
                 </p>
                 <button
                   type="button"
-                  onClick={() => void refreshMediaDevices(true)}
-                  disabled={isLoadingDevices}
-                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-lg border border-slate-700 bg-[#182130] text-slate-200 hover:bg-slate-700 cursor-pointer shrink-0"
+                  onClick={() => void refreshMediaDevices(true, true)}
+                  disabled={isLoadingDevices || isProbingWired}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-blue-500/40 bg-blue-600/20 text-blue-200 hover:bg-blue-600/30 cursor-pointer shrink-0 disabled:opacity-50"
                 >
-                  <RefreshCw className="w-3.5 h-3.5" aria-hidden="true" />
-                  <span>Detect Names</span>
+                  <RefreshCw
+                    className={`w-3.5 h-3.5 ${isLoadingDevices || isProbingWired ? 'animate-spin' : ''}`}
+                    aria-hidden="true"
+                  />
+                  <span>
+                    {isProbingWired
+                      ? 'Probing Ports...'
+                      : isLoadingDevices
+                        ? 'Scanning...'
+                        : 'Scan All Wired Ports'}
+                  </span>
                 </button>
               </div>
 
@@ -1262,15 +1344,102 @@ export function BluetoothScannerModal({
                   type="text"
                   value={hardwareRoomName}
                   onChange={(e) => setHardwareRoomName(e.target.value)}
-                  placeholder="e.g., Main Teller Lobby or Room 204"
+                  placeholder="e.g., Main Entrance HDMI Cam or Room 204"
                   className="w-full text-sm px-3 py-2 border border-slate-700 rounded-lg bg-[#0A0E14] text-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500"
                 />
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {/* Detected Wired Ports List */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                    Detected Wired Video Interfaces ({wiredCameras.length})
+                  </span>
+                  <span className="text-[10px] text-slate-500">
+                    HDMI · USB-C · SDI/BNC · USB · Built-in
+                  </span>
+                </div>
+
+                {wiredCameras.length === 0 ? (
+                  <div className="rounded-lg border border-slate-800 bg-[#0A0E14] p-3.5 text-xs text-slate-400 space-y-1.5">
+                    <p className="text-slate-200 font-medium">No wired camera port detected yet.</p>
+                    <p>
+                      Plug in your USB-C / Type-C camera, USB webcam, or HDMI-to-USB capture card, then click <strong className="text-slate-200">Scan All Wired Ports</strong>.
+                    </p>
+                    <p className="text-[11px] text-slate-500">
+                      Note: Standard laptop HDMI ports are video-out only — wired HDMI/CCTV cameras require an HDMI-to-USB or USB-C UVC capture adapter.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+                    {wiredCameras.map((cam, idx) => {
+                      const isConnectingThis = connectingWiredId === (cam.deviceId || cam.label);
+                      const isExternal = cam.interfaceType !== 'built-in';
+                      const resLabel =
+                        cam.maxWidth && cam.maxHeight
+                          ? `${cam.maxWidth}×${cam.maxHeight}${cam.maxFrameRate ? ` · ${cam.maxFrameRate}fps` : ''}`
+                          : null;
+                      return (
+                        <div
+                          key={cam.deviceId || `${cam.label}-${idx}`}
+                          className="flex items-center justify-between gap-3 rounded-lg border border-slate-800 bg-[#0A0E14] px-3 py-2.5"
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span
+                                className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide ${
+                                  cam.interfaceType === 'hdmi'
+                                    ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                                    : cam.interfaceType === 'usb-c'
+                                      ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30'
+                                      : cam.interfaceType === 'sdi-bnc'
+                                        ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                                        : isExternal
+                                          ? 'bg-indigo-500/15 text-indigo-300 border border-indigo-500/30'
+                                          : 'bg-zinc-800 text-zinc-300 border border-zinc-700'
+                                }`}
+                              >
+                                {cam.interfaceBadge}
+                              </span>
+                              {resLabel ? (
+                                <span className="text-[10px] font-mono text-emerald-400">
+                                  {resLabel}
+                                </span>
+                              ) : null}
+                              {cam.probeStatus === 'busy' ? (
+                                <span className="text-[10px] text-amber-400">Port busy</span>
+                              ) : null}
+                            </div>
+                            <p className="text-xs font-medium text-slate-100 truncate mt-1">
+                              {cam.label}
+                            </p>
+                            {cam.matchedAudioLabel ? (
+                              <p className="text-[10px] text-slate-500 truncate">
+                                Paired audio: {cam.matchedAudioLabel}
+                              </p>
+                            ) : null}
+                          </div>
+
+                          <button
+                            type="button"
+                            disabled={isConnectingThis}
+                            onClick={() => void handleQuickConnectWired(cam)}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md bg-blue-600 text-white hover:bg-blue-500 transition-colors cursor-pointer shrink-0 disabled:opacity-50"
+                          >
+                            <Cable className="w-3.5 h-3.5" aria-hidden="true" />
+                            <span>{isConnectingThis ? 'Opening...' : 'Connect'}</span>
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1 border-t border-slate-800/80">
                 <div>
                   <label htmlFor="hw-video-select" className="block text-xs font-medium text-slate-300 mb-1">
-                    Video Camera Input
+                    Manual Video Port Override
                   </label>
                   <select
                     id="hw-video-select"
@@ -1278,12 +1447,12 @@ export function BluetoothScannerModal({
                     onChange={(e) => setSelectedVideoId(e.target.value)}
                     className="w-full text-xs px-2.5 py-2 border border-slate-700 rounded-lg bg-[#0A0E14] text-slate-100"
                   >
-                    {videoDevices.length === 0 ? (
+                    {wiredCameras.length === 0 ? (
                       <option value="">Default system camera</option>
                     ) : (
-                      videoDevices.map((d, idx) => (
+                      wiredCameras.map((d, idx) => (
                         <option key={d.deviceId || idx} value={d.deviceId}>
-                          {d.label || `Camera ${idx + 1}`}
+                          [{d.interfaceBadge}] {d.label}
                         </option>
                       ))
                     )}
@@ -1325,7 +1494,7 @@ export function BluetoothScannerModal({
                 className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg bg-blue-600 text-white hover:bg-blue-500 transition-colors cursor-pointer"
               >
                 <Camera className="w-4 h-4" aria-hidden="true" />
-                <span>Connect Camera &amp; Mic</span>
+                <span>Connect Selected Port &amp; Mic</span>
               </button>
             </div>
           ) : null}

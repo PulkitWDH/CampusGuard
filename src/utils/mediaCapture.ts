@@ -51,10 +51,10 @@ export async function openRawMediaStream(options: {
   audioDeviceId?: string;
 }): Promise<MediaStream> {
   const { includeVideo = true, videoDeviceId, audioDeviceId } = options;
-  const videoConstraint: MediaTrackConstraints | boolean = includeVideo
+  const exactVideo: MediaTrackConstraints | boolean = includeVideo
     ? videoDeviceId
-      ? { deviceId: { exact: videoDeviceId } }
-      : true
+      ? { deviceId: { exact: videoDeviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+      : { width: { ideal: 1280 }, height: { ideal: 720 } }
     : false;
 
   const rawAudioConstraint: MediaTrackConstraints = {
@@ -64,16 +64,34 @@ export async function openRawMediaStream(options: {
     autoGainControl: false,
   };
 
+  // Attempt 1: Exact device + raw unattenuated audio
   try {
     return await navigator.mediaDevices.getUserMedia({
-      video: videoConstraint,
+      video: exactVideo,
       audio: rawAudioConstraint,
     });
   } catch {
-    return await navigator.mediaDevices.getUserMedia({
-      video: videoConstraint,
-      audio: audioDeviceId ? { deviceId: { exact: audioDeviceId } } : true,
-    });
+    // Attempt 2: Relaxed ideal deviceId (handles stale device IDs across different devices/browsers)
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        video: includeVideo
+          ? videoDeviceId
+            ? { deviceId: { ideal: videoDeviceId } }
+            : true
+          : false,
+        audio: audioDeviceId ? { deviceId: { ideal: audioDeviceId } } : true,
+      });
+    } catch (err) {
+      // Attempt 3: Video-only fallback if device has no microphone or mic permission is denied/busy
+      if (includeVideo) {
+        return await navigator.mediaDevices.getUserMedia({
+          video: videoDeviceId ? { deviceId: { ideal: videoDeviceId } } : true,
+          audio: false,
+        });
+      }
+      throw err;
+    }
   }
 }
+
 

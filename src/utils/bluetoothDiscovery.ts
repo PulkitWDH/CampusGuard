@@ -408,6 +408,12 @@ export async function listHardwareMediaDevices(requestPermission = false): Promi
       stream.getTracks().forEach((t) => t.stop());
     } catch {
       try {
+        const videoOnly = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        videoOnly.getTracks().forEach((t) => t.stop());
+      } catch {
+        // video permission unavailable; continue to try audio-only
+      }
+      try {
         const audioOnly = await navigator.mediaDevices.getUserMedia({ audio: true });
         audioOnly.getTracks().forEach((t) => t.stop());
       } catch {

@@ -37,6 +37,7 @@ import {
   detectPeopleLocallyOnCanvas,
   ensureLocalPersonDetector,
   getLocalDetectorStatus,
+  resetLocalPersonDetectorForRetry,
 } from '../utils/localPersonDetector';
 import {
   DEFAULT_DB_CALIBRATION_OFFSET,
@@ -776,37 +777,51 @@ export function CameraFeedCard({
     );
   }, [camera.expectedTotalCount]);
 
-  // Preload zero-quota on-device TensorFlow.js COCO-SSD person + weapon detector once video signal is active
+  // Preload zero-quota on-device TensorFlow.js COCO-SSD person + weapon detector with automatic retry
   useEffect(() => {
     if (isAudioOnly) {
       localEdgeReadyRef.current = false;
       setLocalEdgeState('fallback');
       return;
     }
-    if (!hasLiveSignal && !liveMediaStream) {
-      return;
-    }
     let cancelled = false;
-    ensureLocalPersonDetector()
-      .then(() => {
-        if (!cancelled) {
-          localEdgeReadyRef.current = true;
-          setLocalEdgeState('ready');
-          const { backend } = getLocalDetectorStatus();
-          setScanModeLabel(
-            backend === 'cpu' ? 'Edge AI (CPU) · Armed' : 'Edge AI (WebGL) · Armed'
-          );
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          localEdgeReadyRef.current = false;
-          setLocalEdgeState('fallback');
-          setScanModeLabel('Cloud AI fallback · Edge model unavailable');
-        }
-      });
+    let retryTimer: number | null = null;
+    let attempt = 0;
+
+    const loadDetector = () => {
+      attempt += 1;
+      if (!cancelled && attempt > 1) {
+        setLocalEdgeState('loading');
+        setScanModeLabel(`Retrying Edge AI model (${attempt}/3)...`);
+      }
+      ensureLocalPersonDetector()
+        .then(() => {
+          if (!cancelled) {
+            localEdgeReadyRef.current = true;
+            setLocalEdgeState('ready');
+            const { backend } = getLocalDetectorStatus();
+            setScanModeLabel(
+              backend === 'cpu' ? 'Edge AI (CPU) · Armed' : 'Edge AI (WebGL) · Armed'
+            );
+          }
+        })
+        .catch(() => {
+          if (cancelled) return;
+          if (attempt < 3) {
+            resetLocalPersonDetectorForRetry();
+            retryTimer = window.setTimeout(loadDetector, attempt * 2000);
+          } else {
+            localEdgeReadyRef.current = false;
+            setLocalEdgeState('fallback');
+            setScanModeLabel('Cloud AI fallback · Edge model unavailable');
+          }
+        });
+    };
+
+    loadDetector();
     return () => {
       cancelled = true;
+      if (retryTimer !== null) clearTimeout(retryTimer);
     };
   }, [hasLiveSignal, isAudioOnly, liveMediaStream]);
 
@@ -844,7 +859,7 @@ export function CameraFeedCard({
           occluderObjects,
           inferenceMs,
           backend,
-        } = await detectPeopleLocallyOnCanvas(rawCanvas, 36, {
+        } = await detectPeopleLocallyOnCanvas(rawCanvas, 28, {
           hadTrackedPeople: personTrackerStateRef.current.confirmed.length > 0,
         });
         if (cancelled) return;
@@ -885,9 +900,9 @@ export function CameraFeedCard({
           personTrackerStateRef.current,
           rawPeople,
           {
-            instantConfidence: 58,
-            minConfidence: 36,
-            maxMissedFrames: 2,
+            instantConfidence: 50,
+            minConfidence: 28,
+            maxMissedFrames: 3,
             maxOccludedFrames: 35,
             weakDetections: weakPeople,
             occluderObjects,
@@ -1209,16 +1224,26 @@ export function CameraFeedCard({
     edgeThreatStateRef.current = createInitialEdgeThreatState();
 
     if (liveMediaStream && videoRef.current) {
-      videoRef.current.srcObject = liveMediaStream;
-      void videoRef.current.play().catch(() => {});
+      const vid = videoRef.current;
+      vid.muted = true;
+      vid.playsInline = true;
+      vid.setAttribute('playsinline', 'true');
+      vid.setAttribute('webkit-playsinline', 'true');
+      vid.srcObject = liveMediaStream;
+      void vid.play().catch(() => {});
       return;
     }
 
     if (camera.customMediaUrl && camera.customMediaType === 'video' && videoRef.current) {
-      videoRef.current.srcObject = null;
-      videoRef.current.src = camera.customMediaUrl;
-      videoRef.current.loop = true;
-      void videoRef.current.play().catch(() => {});
+      const vid = videoRef.current;
+      vid.muted = true;
+      vid.playsInline = true;
+      vid.setAttribute('playsinline', 'true');
+      vid.setAttribute('webkit-playsinline', 'true');
+      vid.srcObject = null;
+      vid.src = camera.customMediaUrl;
+      vid.loop = true;
+      void vid.play().catch(() => {});
       return;
     }
 
@@ -2113,10 +2138,29 @@ export function CameraFeedCard({
             muted
             playsInline
             onLoadedMetadata={(e) => {
+              e.currentTarget.muted = true;
+              e.currentTarget.playsInline = true;
               void e.currentTarget.play().catch(() => {});
             }}
+            onLoadedData={(e) => {
+              if (e.currentTarget.videoWidth > 0) {
+                hasLiveFrameRef.current = true;
+                setHasLiveSignal(true);
+              }
+            }}
+            onPlaying={(e) => {
+              if (e.currentTarget.videoWidth > 0) {
+                hasLiveFrameRef.current = true;
+                setHasLiveSignal(true);
+              }
+            }}
+            onCanPlay={(e) => {
+              if (e.currentTarget.paused) {
+                void e.currentTarget.play().catch(() => {});
+              }
+            }}
             aria-hidden="true"
-            className="absolute top-0 left-0 w-px h-px opacity-[0.01] pointer-events-none"
+            className="absolute inset-0 w-full h-full object-contain opacity-0 pointer-events-none z-0"
           />
         ) : null}
         <canvas

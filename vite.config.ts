@@ -53,6 +53,22 @@ export default defineConfig(() => {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
           navigateFallbackDenylist: [/^\/api\//],
           maximumFileSizeToCacheInBytes: 8 * 1024 * 1024,
+          runtimeCaching: [
+            {
+              urlPattern: /\/models\/coco-ssd\/.*/i,
+              handler: 'CacheFirst',
+              options: {
+                cacheName: 'campusguard-coco-ssd-v1',
+                expiration: {
+                  maxEntries: 16,
+                  maxAgeSeconds: 60 * 60 * 24 * 30,
+                },
+                cacheableResponse: {
+                  statuses: [0, 200],
+                },
+              },
+            },
+          ],
         },
         devOptions: {
           enabled: true,
