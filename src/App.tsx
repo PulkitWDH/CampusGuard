@@ -1,12 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bluetooth,
+  Cable,
   Camera,
+  ChevronLeft,
+  ChevronRight,
   Columns2,
   Grid3X3,
   LayoutGrid,
   Mic,
+  RotateCw,
+  Search,
   Square,
+  SwitchCamera,
   Upload,
   Wifi,
 } from 'lucide-react';
@@ -25,6 +31,7 @@ import {
 import { DedicatedCameraPanel } from './components/DedicatedCameraPanel';
 import { EvidenceVaultView } from './components/EvidenceVaultView';
 import { LiveIncidentRail } from './components/LiveIncidentRail';
+import { MobileBottomNav } from './components/MobileBottomNav';
 import { NotificationBanner } from './components/NotificationBanner';
 import { Sidebar } from './components/Sidebar';
 import { TeacherAlertDispatchModal } from './components/TeacherAlertDispatchModal';
@@ -69,6 +76,19 @@ import type {
   WorkspaceGmailMessage,
   WorkspaceTeacher,
 } from './types';
+import {
+  MAX_CONCURRENT_CLOUD_SCANS,
+  MAX_CONCURRENT_STREAM_RECONNECTS,
+  MAX_SUPPORTED_CAMERAS,
+  type WallFilterMode,
+  type WallLayoutMode,
+  paginateCameras,
+  stripCamerasForStorage,
+} from './utils/cameraScaleEngine';
+import {
+  computeMobileLayoutState,
+  requestDeviceLandscapeLock,
+} from './utils/mobileLayout';
 import { ensureLocalPersonDetector } from './utils/localPersonDetector';
 import { extractAppearanceSignature } from './utils/subjectIntelligence';
 import { sealForensicEvidenceCase } from './utils/tacticalForensics';
@@ -145,6 +165,7 @@ function loadSavedCameras(): ClassroomCamera[] {
     if (!Array.isArray(parsed)) return [];
     return parsed
       .filter((cam) => cam.sourceKind !== 'uploaded-media')
+      .slice(0, MAX_SUPPORTED_CAMERAS)
       .map((cam) => ({
         ...cam,
         isAnalyzing: false,
@@ -218,7 +239,18 @@ export default function App() {
   const [focusedCameraId, setFocusedCameraId] = useState<string | null>(null);
   const [isScannerOpen, setIsScannerOpen] = useState(false);
   const [scannerInitialTab, setScannerInitialTab] = useState<ScannerModalTab>('wifi');
-  const [wallLayout, setWallLayout] = useState<'1x1' | '2x2' | '3x3'>('2x2');
+  const [wallLayout, setWallLayout] = useState<WallLayoutMode>('2x2');
+  const [wallPage, setWallPage] = useState(1);
+  const [wallSearch, setWallSearch] = useState('');
+  const [wallFilter, setWallFilter] = useState<WallFilterMode>('all');
+  const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false);
+  const [manualLandscape, setManualLandscape] = useState(false);
+  const [launchingQuickCam, setLaunchingQuickCam] = useState<'environment' | 'user' | null>(null);
+  const [viewportSize, setViewportSize] = useState<{ width: number; height: number }>(() =>
+    typeof window !== 'undefined'
+      ? { width: window.innerWidth, height: window.innerHeight }
+      : { width: 1440, height: 900 }
+  );
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
   const [evidenceCases, setEvidenceCases] = useState<ForensicEvidenceCase[]>([]);
@@ -230,10 +262,44 @@ export default function App() {
     setIsScannerOpen(true);
   }, []);
 
+  useEffect(() => {
+    const syncViewport = () => {
+      setViewportSize({ width: window.innerWidth, height: window.innerHeight });
+    };
+    window.addEventListener('resize', syncViewport);
+    window.addEventListener('orientationchange', syncViewport);
+    return () => {
+      window.removeEventListener('resize', syncViewport);
+      window.removeEventListener('orientationchange', syncViewport);
+    };
+  }, []);
+
+  const mobileLayout = useMemo(
+    () =>
+      computeMobileLayoutState({
+        width: viewportSize.width,
+        height: viewportSize.height,
+        manualLandscape,
+      }),
+    [viewportSize.width, viewportSize.height, manualLandscape]
+  );
+
+  const handleToggleLandscapeMode = useCallback(() => {
+    const next = !manualLandscape;
+    setManualLandscape(next);
+    void requestDeviceLandscapeLock(next).then((result) => {
+      if (next && result === 'css-fallback' && !mobileLayout.isPhysicalLandscape) {
+        setStatusNotice(
+          'Widescreen Landscape Mode enabled. Rotate your phone sideways anytime for full hardware widescreen.'
+        );
+      }
+    });
+  }, [manualLandscape, mobileLayout.isPhysicalLandscape]);
+
   const [soundAlertsEnabled, setSoundAlertsEnabled] = useState(true);
   const [audioSpikeAutoScan, setAudioSpikeAutoScan] = useState(true);
   const [dbCalibrationOffset, setDbCalibrationOffset] = useState<number>(loadSavedDbOffset);
-  const [selectedAiModel, setSelectedAiModel] = useState<AiEngineModel>('gemini-4-neon');
+  const [selectedAiModel, setSelectedAiModel] = useState<AiEngineModel>('gemini-4-hydrogen');
   const [cloudQuotaExhausted, setCloudQuotaExhausted] = useState(false);
   const cloudQuotaExhaustedRef = useRef(false);
   const localEdgeActiveCamerasRef = useRef<Set<string>>(new Set());
@@ -307,7 +373,7 @@ export default function App() {
             setCameras((prev) =>
               prev.map((cam) =>
                 cam.aiModel === 'gpt-6-astra' || cam.aiModel === 'gpt-6-sol'
-                  ? { ...cam, aiModel: 'gemini-4-neon' }
+                  ? { ...cam, aiModel: 'gemini-4-hydrogen' }
                   : cam
               )
             );
@@ -589,16 +655,15 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    try {
-      const serializable = cameras.map((cam) => ({
-        ...cam,
-        isAnalyzing: false,
-        errorMessage: undefined,
-      }));
-      localStorage.setItem(STORAGE_CAMERAS_KEY, JSON.stringify(serializable));
-    } catch {
-      // ignore storage quota errors
-    }
+    const saveTimer = window.setTimeout(() => {
+      try {
+        const compact = stripCamerasForStorage(cameras);
+        localStorage.setItem(STORAGE_CAMERAS_KEY, JSON.stringify(compact));
+      } catch {
+        // ignore storage quota errors
+      }
+    }, 1200);
+    return () => window.clearTimeout(saveTimer);
   }, [cameras]);
 
   useEffect(() => {
@@ -785,6 +850,9 @@ export default function App() {
       if (!target || analyzingIdsRef.current.has(cameraId)) return;
 
       const isAutoTrigger = Boolean(options?.isAutoTrigger);
+      if (isAutoTrigger && analyzingIdsRef.current.size >= MAX_CONCURRENT_CLOUD_SCANS) {
+        return;
+      }
       const transcriptToSend = target.voiceListeningEnabled ? target.liveTranscript : '';
       const audioLevelToSend = target.voiceListeningEnabled ? target.audioLevel : 0;
 
@@ -922,7 +990,9 @@ export default function App() {
         });
 
         const rawBody = await response.text();
-        const parsedBody = parseSafeJsonText<ClassroomAnalysis & { error?: string }>(rawBody);
+        const parsedBody = parseSafeJsonText<
+          ClassroomAnalysis & { error?: string; quotaExhausted?: boolean }
+        >(rawBody);
         if (!parsedBody.ok) {
           // Server restarting or reverse-proxy returned HTML (<!doctype ...>) — never show raw JSON syntax error
           applyLocalEdgeSafetyFallback(
@@ -934,6 +1004,18 @@ export default function App() {
           return;
         }
         const data = parsedBody.data;
+        if (data.quotaExhausted) {
+          cloudQuotaExhaustedRef.current = true;
+          setCloudQuotaExhausted(true);
+          setGlobalError(null);
+          applyLocalEdgeSafetyFallback(
+            capturePayload?.previewDataUrl,
+            !isAutoTrigger
+              ? 'Cloud API quota limit reached — running on-device Edge AI locally.'
+              : undefined
+          );
+          return;
+        }
         if (!response.ok) {
           const apiErr = new Error(
             data.error || `Analysis request failed (${response.status})`
@@ -955,11 +1037,16 @@ export default function App() {
           prev.map((cam) => {
             if (cam.id !== cameraId) return cam;
             // When real-time local Edge AI is active, preserve its instant live headcount & boxes
-            // so slower cloud threat scans never overwrite an empty room with a stale count
+            // on background scans so slower cloud scans never overwrite an empty room with a stale count;
+            // on explicit manual Cloud Scan, honor Cloud Vision's higher dense-crowd headcount estimate!
             const effectivePeople = usesLocalEdgeCount
               ? cam.lastAnalysis?.detectedPeople ?? []
               : data.detectedPeople ?? [];
-            const effectiveCount = usesLocalEdgeCount ? effectivePeople.length : data.studentCount;
+            const effectiveCount = usesLocalEdgeCount
+              ? !isAutoTrigger && data.studentCount > effectivePeople.length
+                ? data.studentCount
+                : effectivePeople.length
+              : data.studentCount;
             const mergedAnalysis: ClassroomAnalysis = {
               ...data,
               studentCount: effectiveCount,
@@ -1972,7 +2059,9 @@ export default function App() {
   // after tab switches or sleep, and auto-recovers when wired HDMI/USB-C cameras replug.
   useEffect(() => {
     const healMissingStreams = () => {
+      let activeReconnects = reconnectingIdsRef.current.size;
       for (const cam of camerasRef.current) {
+        if (activeReconnects >= MAX_CONCURRENT_STREAM_RECONNECTS) break;
         const needsLocalStream =
           cam.sourceKind === 'device-camera' ||
           cam.sourceKind === 'microphone-only' ||
@@ -1981,7 +2070,13 @@ export default function App() {
 
         const requireVideo = cam.sourceKind !== 'microphone-only' && cam.hasVideo;
         if (!isStreamAlive(mediaStreamsRef.current[cam.id], requireVideo)) {
-          void handleReconnectStream(cam.id, { silent: true });
+          if (
+            !reconnectingIdsRef.current.has(cam.id) &&
+            !permissionBlockedIdsRef.current.has(cam.id)
+          ) {
+            activeReconnects += 1;
+            void handleReconnectStream(cam.id, { silent: true });
+          }
         }
       }
     };
@@ -2008,12 +2103,24 @@ export default function App() {
     };
   }, [cameras.length, handleReconnectStream, isStreamAlive]);
 
+  const ensureCameraCapacity = useCallback((streamToStop?: MediaStream | null) => {
+    if (camerasRef.current.length >= MAX_SUPPORTED_CAMERAS) {
+      streamToStop?.getTracks().forEach((t) => t.stop());
+      setStatusNotice(
+        `Maximum capacity reached (${MAX_SUPPORTED_CAMERAS} cameras). Remove an existing camera before adding another.`
+      );
+      return false;
+    }
+    return true;
+  }, []);
+
   const handleAddBluetoothCamera = useCallback(
     (
       device: BluetoothDeviceCandidate,
       classroomName: string,
       options: { streamUrl?: string; videoDeviceId?: string; audioDeviceId?: string; stream?: MediaStream }
     ) => {
+      if (!ensureCameraCapacity(options.stream)) return;
       const newCamId = `cam-bt-${Date.now()}`;
       if (options.stream) {
         mediaStreamsRef.current[newCamId] = options.stream;
@@ -2048,7 +2155,7 @@ export default function App() {
       setActiveView('grid');
       setIsScannerOpen(false);
     },
-    [bindStreamKeepAlive, persistZoneAsync, selectedAiModel]
+    [bindStreamKeepAlive, ensureCameraCapacity, persistZoneAsync, selectedAiModel]
   );
 
   const handleAddHardwareCamera = useCallback(
@@ -2059,6 +2166,7 @@ export default function App() {
       audioDeviceId?: string,
       deviceLabel?: string
     ) => {
+      if (!ensureCameraCapacity(stream)) return;
       const newCamId = `cam-hw-${Date.now()}`;
       mediaStreamsRef.current[newCamId] = stream;
       bindStreamKeepAlive(newCamId, stream, true);
@@ -2088,7 +2196,7 @@ export default function App() {
       void persistZoneAsync(newCamera);
       setActiveView('grid');
     },
-    [persistZoneAsync, selectedAiModel]
+    [bindStreamKeepAlive, ensureCameraCapacity, persistZoneAsync, selectedAiModel]
   );
 
   const handleAddMicrophoneZone = useCallback(
@@ -2098,6 +2206,7 @@ export default function App() {
       audioDeviceId?: string,
       deviceLabel?: string
     ) => {
+      if (!ensureCameraCapacity(stream)) return;
       const newZoneId = `mic-${Date.now()}`;
       if (stream) {
         mediaStreamsRef.current[newZoneId] = stream;
@@ -2136,7 +2245,7 @@ export default function App() {
           : `Microphone-only zone "${classroomName}" added in standby mode.`
       );
     },
-    [persistZoneAsync, selectedAiModel]
+    [ensureCameraCapacity, persistZoneAsync, selectedAiModel]
   );
 
   const handleAddWifiCamera = useCallback(
@@ -2149,6 +2258,7 @@ export default function App() {
       videoDeviceId?: string;
       audioDeviceId?: string;
     }) => {
+      if (!ensureCameraCapacity(params.stream)) return;
       const newCamId = `cam-wifi-${Date.now()}`;
       if (params.stream) {
         mediaStreamsRef.current[newCamId] = params.stream;
@@ -2195,11 +2305,12 @@ export default function App() {
         `Wi-Fi CCTV camera "${params.classroomName}" (${params.wifiBrand}) connected via computer Wi-Fi (no PIN required).`
       );
     },
-    [persistZoneAsync, selectedAiModel]
+    [ensureCameraCapacity, persistZoneAsync, selectedAiModel]
   );
 
   const handleAddStreamUrlCamera = useCallback(
     (classroomName: string, streamUrl: string) => {
+      if (!ensureCameraCapacity()) return;
       const newCamId = `cam-url-${Date.now()}`;
       const newCamera: ClassroomCamera = {
         id: newCamId,
@@ -2226,7 +2337,7 @@ export default function App() {
       void persistZoneAsync(newCamera);
       setActiveView('grid');
     },
-    [persistZoneAsync, selectedAiModel]
+    [ensureCameraCapacity, persistZoneAsync, selectedAiModel]
   );
 
   const handleAddUploadedCamera = useCallback(
@@ -2236,6 +2347,7 @@ export default function App() {
       mediaType: 'image' | 'video',
       voiceTranscript: string
     ) => {
+      if (!ensureCameraCapacity()) return;
       const newCamId = `cam-upload-${Date.now()}`;
       const newCamera: ClassroomCamera = {
         id: newCamId,
@@ -2262,7 +2374,7 @@ export default function App() {
       setCameras((prev) => [...prev, newCamera]);
       setActiveView('grid');
     },
-    [selectedAiModel]
+    [ensureCameraCapacity, selectedAiModel]
   );
 
   const handleRemoveCamera = useCallback((cameraId: string) => {
@@ -2470,15 +2582,67 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
+  const handleReconnectStreamCard = useCallback(
+    (id: string) => {
+      void handleReconnectStream(id);
+    },
+    [handleReconnectStream]
+  );
+
+  const handleAnalyzeCameraCard = useCallback(
+    (id: string, isAutoTrigger?: boolean) => {
+      void analyzeCamera(id, { isAutoTrigger });
+    },
+    [analyzeCamera]
+  );
+
+  const handleToggleFocusCard = useCallback((id: string) => {
+    setFocusedCameraId((prev) => (prev === id ? null : id));
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }, []);
+
   const focusedCamera = useMemo(
     () => (focusedCameraId ? cameras.find((c) => c.id === focusedCameraId) ?? null : null),
     [cameras, focusedCameraId]
   );
 
-  const otherCameras = useMemo(
-    () => (focusedCamera ? cameras.filter((c) => c.id !== focusedCamera.id) : []),
-    [cameras, focusedCamera]
+  const otherCameras = useMemo(() => {
+    if (!focusedCamera) return [];
+    const rest = cameras.filter((c) => c.id !== focusedCamera.id);
+    if (rest.length <= 4) return rest;
+    const rank = (s: ClassroomCamera['status']) =>
+      s === 'fighting' ? 0 : s === 'warning' ? 1 : 2;
+    return [...rest].sort((a, b) => rank(a.status) - rank(b.status));
+  }, [cameras, focusedCamera]);
+
+  const visibleOtherCameras = useMemo(() => otherCameras.slice(0, 4), [otherCameras]);
+
+  const paginatedWall = useMemo(
+    () =>
+      paginateCameras(cameras, {
+        page: wallPage,
+        layout: wallLayout,
+        searchQuery: wallSearch,
+        filterMode: wallFilter,
+        prioritizeAlerts: true,
+      }),
+    [cameras, wallPage, wallLayout, wallSearch, wallFilter]
   );
+
+  useEffect(() => {
+    setWallPage(1);
+  }, [wallLayout, wallSearch, wallFilter]);
+
+  useEffect(() => {
+    if (paginatedWall.currentPage !== wallPage) {
+      setWallPage(paginatedWall.currentPage);
+    }
+  }, [paginatedWall.currentPage, wallPage]);
+
+  const showMatrixPaginationBar =
+    cameras.length > paginatedWall.pageSize ||
+    wallSearch.trim().length > 0 ||
+    wallFilter !== 'all';
 
   const hasCriticalCameraOrAlert =
     cameras.some((c) => c.status === 'fighting') ||
@@ -2499,25 +2663,83 @@ export default function App() {
       ? 'text-amber-600'
       : 'text-emerald-600';
 
+  const handleQuickStartBuiltInCamera = useCallback(
+    async (facingMode: 'environment' | 'user') => {
+      if (!ensureCameraCapacity()) return;
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setGlobalError('Camera capture is unavailable in this browser. Open in Safari or Chrome over HTTPS.');
+        return;
+      }
+      setGlobalError(null);
+      setLaunchingQuickCam(facingMode);
+      try {
+        const stream = await openRawMediaStream({
+          includeVideo: true,
+          facingMode,
+        });
+        const videoTrack = stream.getVideoTracks()[0];
+        const audioTrack = stream.getAudioTracks()[0];
+        const label =
+          facingMode === 'environment'
+            ? `Rear Camera ${camerasRef.current.length + 1}`
+            : `Front Camera ${camerasRef.current.length + 1}`;
+        handleAddHardwareCamera(
+          label,
+          stream,
+          videoTrack?.getSettings?.().deviceId,
+          audioTrack?.getSettings?.().deviceId,
+          facingMode === 'environment' ? 'Built-in · Rear Lens' : 'Built-in · Front Lens'
+        );
+        setStatusNotice(`Live ${label} started with on-device human tracking.`);
+      } catch {
+        setGlobalError(
+          'Camera permission was denied or another app is using the lens. Allow camera access and tap Retry.'
+        );
+      } finally {
+        setLaunchingQuickCam(null);
+      }
+    },
+    [ensureCameraCapacity, handleAddHardwareCamera]
+  );
+
   const wallGridClass =
-    wallLayout === '1x1' || (cameras.length === 1 && wallLayout === '2x2')
+    wallLayout === '1x1' || (paginatedWall.pageCameras.length === 1 && wallLayout === '2x2')
       ? 'grid-cols-1'
-      : wallLayout === '3x3'
-        ? 'grid-cols-1 md:grid-cols-2 2xl:grid-cols-3'
-        : 'grid-cols-1 md:grid-cols-2';
+      : mobileLayout.isMobileLandscape
+        ? 'grid-cols-2'
+        : wallLayout === '4x4'
+          ? 'grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4'
+          : wallLayout === '3x3'
+            ? 'grid-cols-1 md:grid-cols-2 2xl:grid-cols-3'
+            : 'grid-cols-1 md:grid-cols-2';
 
   return (
-    <div id="top" className="min-h-screen bg-slate-50 dark:bg-[#09090B] text-slate-900 dark:text-zinc-100 flex flex-col">
+    <div
+      id="top"
+      data-mobile-landscape={mobileLayout.isMobileLandscape ? 'true' : 'false'}
+      className={`min-h-screen bg-slate-50 dark:bg-[#09090B] text-slate-900 dark:text-zinc-100 flex flex-col ${
+        mobileLayout.showBottomTabBar ? 'pb-16 md:pb-0' : ''
+      }`}
+    >
       <TopBar
         activeView={activeView}
-        onSelectView={setActiveView}
+        onSelectView={(view) => {
+          setActiveView(view);
+          setMobileDrawerOpen(false);
+        }}
         unreadAlertsCount={summary.activeAlertsCount}
         evidenceCount={evidenceCases.length}
-        onOpenScanner={() => openScannerOnTab('wifi')}
+        onOpenScanner={() =>
+          openScannerOnTab(mobileLayout.isMobileWidth || mobileLayout.isMobileLandscape ? 'hardware' : 'wifi')
+        }
         themeMode={themeMode}
         onToggleThemeMode={() =>
           setThemeMode((prev) => (prev === 'dark' ? 'light' : 'dark'))
         }
+        isMobileLandscape={mobileLayout.isMobileLandscape}
+        manualLandscape={manualLandscape}
+        onToggleLandscapeMode={handleToggleLandscapeMode}
+        onOpenMobileDrawer={() => setMobileDrawerOpen(true)}
       />
       <OfflineBanner />
 
@@ -2562,16 +2784,30 @@ export default function App() {
           onStatusNotice={setStatusNotice}
           themeMode={themeMode}
           onChangeThemeMode={setThemeMode}
+          mobileOpen={mobileDrawerOpen}
+          onCloseMobile={() => setMobileDrawerOpen(false)}
         />
 
         {/* Keep Camera Surveillance Wall permanently mounted so switching tabs NEVER stops or drops live cameras */}
-        <div className={activeView === 'grid' ? 'flex-1 min-w-0 flex flex-col xl:flex-row' : 'hidden'}>
+        <div
+          className={
+            activeView === 'grid'
+              ? `flex-1 min-w-0 flex ${
+                  mobileLayout.isMobileLandscape ? 'flex-row' : 'flex-col xl:flex-row'
+                }`
+              : 'hidden'
+          }
+        >
           {/* Center Surveillance Stage */}
           <main className="flex-1 min-w-0 flex flex-col">
-              {/* Clean Summary Bar */}
+              {/* Desktop & Landscape Summary Bar */}
               <div
                 data-testid="telemetry-ribbon"
-                className="bg-white border-b border-slate-200 px-4 sm:px-6 py-2.5 flex flex-wrap items-center justify-between gap-3"
+                className={`${
+                  mobileLayout.isMobileLandscape ? 'flex' : 'hidden md:flex'
+                } bg-white border-b border-slate-200 px-4 sm:px-6 ${
+                  mobileLayout.isMobileLandscape ? 'py-1.5' : 'py-2.5'
+                } flex-wrap items-center justify-between gap-3`}
               >
                 <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5">
                   <div className="flex items-baseline gap-2">
@@ -2634,6 +2870,7 @@ export default function App() {
                           { id: '1x1', label: '1x1', icon: Square },
                           { id: '2x2', label: '2x2', icon: Columns2 },
                           { id: '3x3', label: '3x3', icon: Grid3X3 },
+                          { id: '4x4', label: '4x4', icon: LayoutGrid },
                         ] as const
                       ).map((opt) => {
                         const Icon = opt.icon;
@@ -2642,6 +2879,7 @@ export default function App() {
                           <button
                             key={opt.id}
                             type="button"
+                            data-testid={`layout-${opt.id}`}
                             aria-pressed={active}
                             aria-label={`${opt.label} grid layout`}
                             onClick={() => setWallLayout(opt.id)}
@@ -2662,7 +2900,48 @@ export default function App() {
               </div>
 
               {/* Center Stage Workspace */}
-              <div className="flex-1 p-4 sm:p-6 space-y-4 min-w-0">
+              <div
+                className={`flex-1 min-w-0 ${
+                  mobileLayout.isMobileLandscape ? 'p-3 space-y-3' : 'p-3.5 sm:p-6 space-y-4'
+                }`}
+              >
+                {/* Mobile Portrait Tactile 2x2 Status Strip (cleanly replaces flat text bar on phones) */}
+                {!mobileLayout.isMobileLandscape ? (
+                  <div
+                    data-testid="mobile-status-strip"
+                    className="grid grid-cols-4 gap-2 md:hidden"
+                  >
+                    <div className="bg-white border border-slate-200 rounded-xl px-2.5 py-2">
+                      <div className="text-[10px] text-slate-500">People</div>
+                      <div className="text-base font-mono font-semibold tabular-nums text-slate-900 mt-0.5">
+                        {summary.totalKidsCount}
+                      </div>
+                    </div>
+                    <div className="bg-white border border-slate-200 rounded-xl px-2.5 py-2">
+                      <div className="text-[10px] text-slate-500">Cameras</div>
+                      <div className="text-base font-mono font-semibold tabular-nums text-slate-900 mt-0.5">
+                        {summary.totalCameras}
+                      </div>
+                    </div>
+                    <div className="bg-white border border-slate-200 rounded-xl px-2.5 py-2">
+                      <div className="text-[10px] text-slate-500">Status</div>
+                      <div className={`text-[11px] font-mono font-semibold mt-1.5 truncate ${threatStatusTone}`}>
+                        {threatStatusLabel}
+                      </div>
+                    </div>
+                    <div className="bg-white border border-slate-200 rounded-xl px-2.5 py-2">
+                      <div className="text-[10px] text-slate-500">Alerts</div>
+                      <div
+                        className={`text-base font-mono font-semibold tabular-nums mt-0.5 ${
+                          summary.activeAlertsCount > 0 ? 'text-red-600' : 'text-slate-900'
+                        }`}
+                      >
+                        {summary.activeAlertsCount}
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+
                 <NotificationBanner
                   alert={latestUnacknowledgedAlert}
                   onInspectCamera={handleFocusFromAlert}
@@ -2706,9 +2985,139 @@ export default function App() {
                   <section
                     aria-label="Standby surveillance wall"
                     data-testid="empty-cameras-state"
-                    className="bg-white border border-slate-200 rounded-xl p-6 sm:p-10 flex flex-col justify-center min-h-[420px]"
+                    className={
+                      mobileLayout.isMobileLandscape
+                        ? 'grid grid-cols-2 gap-3 items-stretch'
+                        : 'space-y-3.5 md:space-y-0 md:bg-white dark:md:bg-[#111114] md:border md:border-slate-200 dark:md:border-zinc-800 md:rounded-xl md:p-10 md:flex md:flex-col md:justify-center md:min-h-[420px]'
+                    }
                   >
-                    <div className="my-auto py-6 max-w-2xl mx-auto text-center space-y-3">
+                    {/* Mobile & Landscape Dominant Focal Hero: 1-Tap Built-in Phone Camera */}
+                    <div
+                      data-testid="mobile-builtin-camera-hero"
+                      className={`${
+                        mobileLayout.isMobileLandscape ? 'flex' : 'flex md:hidden'
+                      } mobile-camera-hero rounded-2xl border border-slate-800 p-4 sm:p-5 flex-col justify-between gap-4`}
+                    >
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[11px] font-mono text-slate-300">
+                            On-Device Edge AI · HD Live
+                          </span>
+                          <button
+                            type="button"
+                            onClick={handleToggleLandscapeMode}
+                            className="inline-flex items-center gap-1 text-[11px] font-medium text-slate-200 hover:text-white cursor-pointer"
+                          >
+                            <RotateCw className="w-3 h-3" aria-hidden="true" />
+                            <span>{mobileLayout.isMobileLandscape ? 'Portrait' : 'Landscape'}</span>
+                          </button>
+                        </div>
+                        <h1 className="font-display text-xl font-semibold tracking-tight text-white text-balance">
+                          Built-in Phone Camera
+                        </h1>
+                        <p className="text-xs text-slate-300 leading-relaxed">
+                          Start live human tracking, crowding, and threat detection directly from your rear or front lens.
+                        </p>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          data-testid="mobile-start-rear-camera"
+                          disabled={launchingQuickCam !== null}
+                          onClick={() => void handleQuickStartBuiltInCamera('environment')}
+                          className="mobile-camera-hero-btn-primary min-h-[46px] px-3 py-2.5 rounded-xl text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-transform active:scale-[0.98] cursor-pointer disabled:opacity-60"
+                        >
+                          <Camera className="w-4 h-4 shrink-0" aria-hidden="true" />
+                          <span>
+                            {launchingQuickCam === 'environment' ? 'Starting...' : 'Rear Camera'}
+                          </span>
+                        </button>
+
+                        <button
+                          type="button"
+                          data-testid="mobile-start-front-camera"
+                          disabled={launchingQuickCam !== null}
+                          onClick={() => void handleQuickStartBuiltInCamera('user')}
+                          className="mobile-camera-hero-btn-secondary min-h-[46px] px-3 py-2.5 rounded-xl text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-transform active:scale-[0.98] cursor-pointer disabled:opacity-60"
+                        >
+                          <SwitchCamera className="w-4 h-4 shrink-0" aria-hidden="true" />
+                          <span>
+                            {launchingQuickCam === 'user' ? 'Starting...' : 'Front Camera'}
+                          </span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Mobile & Landscape Secondary 2x2 Quick Sources */}
+                    <div
+                      className={`${
+                        mobileLayout.isMobileLandscape ? 'grid' : 'grid md:hidden'
+                      } grid-cols-2 gap-2.5`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => openScannerOnTab('wifi')}
+                        className="bg-white border border-slate-200 hover:border-slate-400 rounded-2xl p-3.5 min-h-[82px] text-left flex flex-col justify-between gap-2 transition-transform active:scale-[0.98] cursor-pointer"
+                      >
+                        <Wifi className="w-4 h-4 text-slate-900" aria-hidden="true" />
+                        <div>
+                          <div className="text-xs font-semibold text-slate-900">Wi-Fi CCTV</div>
+                          <div className="text-[11px] text-slate-500 leading-snug">
+                            Auto-scan · No PIN
+                          </div>
+                        </div>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => openScannerOnTab('hardware')}
+                        className="bg-white border border-slate-200 hover:border-slate-400 rounded-2xl p-3.5 min-h-[82px] text-left flex flex-col justify-between gap-2 transition-transform active:scale-[0.98] cursor-pointer"
+                      >
+                        <Cable className="w-4 h-4 text-slate-900" aria-hidden="true" />
+                        <div>
+                          <div className="text-xs font-semibold text-slate-900">Wired Ports</div>
+                          <div className="text-[11px] text-slate-500 leading-snug">
+                            USB-C, HDMI &amp; USB
+                          </div>
+                        </div>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => openScannerOnTab('microphone')}
+                        className="bg-white border border-slate-200 hover:border-slate-400 rounded-2xl p-3.5 min-h-[82px] text-left flex flex-col justify-between gap-2 transition-transform active:scale-[0.98] cursor-pointer"
+                      >
+                        <Mic className="w-4 h-4 text-slate-900" aria-hidden="true" />
+                        <div>
+                          <div className="text-xs font-semibold text-slate-900">Mic Only</div>
+                          <div className="text-[11px] text-slate-500 leading-snug">
+                            dB &amp; distress AI
+                          </div>
+                        </div>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => openScannerOnTab('upload')}
+                        className="bg-white border border-slate-200 hover:border-slate-400 rounded-2xl p-3.5 min-h-[82px] text-left flex flex-col justify-between gap-2 transition-transform active:scale-[0.98] cursor-pointer"
+                      >
+                        <Upload className="w-4 h-4 text-slate-900" aria-hidden="true" />
+                        <div>
+                          <div className="text-xs font-semibold text-slate-900">Upload / BT</div>
+                          <div className="text-[11px] text-slate-500 leading-snug">
+                            Clip or Bluetooth
+                          </div>
+                        </div>
+                      </button>
+                    </div>
+
+                    {/* Desktop Standby Wall (unchanged clean 5-tile workspace) */}
+                    <div
+                      className={`${
+                        mobileLayout.isMobileLandscape ? 'hidden' : 'hidden md:block'
+                      } my-auto py-6 max-w-2xl mx-auto text-center space-y-3`}
+                    >
                       <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-slate-900 text-balance">
                         {labels.monitorTitle}
                       </h1>
@@ -2716,22 +3125,7 @@ export default function App() {
                         Choose a camera or microphone source to start live on-device human detection and safety monitoring.
                       </p>
 
-                      {/* 5 Clean Source Tiles */}
                       <div className="pt-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 text-left">
-                        <button
-                          type="button"
-                          onClick={() => openScannerOnTab('wifi')}
-                          className="group bg-white hover:bg-slate-50 border border-slate-200 hover:border-slate-400 rounded-xl p-4 transition-colors cursor-pointer flex flex-col gap-2.5"
-                        >
-                          <Wifi className="w-4 h-4 text-slate-800" aria-hidden="true" />
-                          <div>
-                            <div className="text-xs font-semibold text-slate-900">Wi-Fi CCTV</div>
-                            <div className="text-[11px] text-slate-500 mt-0.5 leading-snug">
-                              Auto-scan Wi-Fi · No PIN needed
-                            </div>
-                          </div>
-                        </button>
-
                         <button
                           type="button"
                           onClick={() => openScannerOnTab('hardware')}
@@ -2742,6 +3136,20 @@ export default function App() {
                             <div className="text-xs font-semibold text-slate-900">Built-in / Wired</div>
                             <div className="text-[11px] text-slate-500 mt-0.5 leading-snug">
                               Built-in webcam, HDMI, USB-C &amp; USB
+                            </div>
+                          </div>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => openScannerOnTab('wifi')}
+                          className="group bg-white hover:bg-slate-50 border border-slate-200 hover:border-slate-400 rounded-xl p-4 transition-colors cursor-pointer flex flex-col gap-2.5"
+                        >
+                          <Wifi className="w-4 h-4 text-slate-800" aria-hidden="true" />
+                          <div>
+                            <div className="text-xs font-semibold text-slate-900">Wi-Fi CCTV</div>
+                            <div className="text-[11px] text-slate-500 mt-0.5 leading-snug">
+                              Auto-scan Wi-Fi · No PIN needed
                             </div>
                           </div>
                         </button>
@@ -2801,6 +3209,7 @@ export default function App() {
                       dbCalibrationOffset={dbCalibrationOffset}
                       cloudQuotaExhausted={cloudQuotaExhausted}
                       isFocused
+                      visibleCameraCount={1}
                       liveMediaStream={mediaStreamsRef.current[focusedCamera.id] ?? null}
                       watchlist={watchlist}
                       onRegisterCapture={registerCapture}
@@ -2811,29 +3220,29 @@ export default function App() {
                       onManualLockEvidence={handleManualLockEvidence}
                       onEnrollLiveSubject={handleEnrollLiveSubject}
                       onWatchlistMatch={handleWatchlistMatch}
-                      onReconnectStream={(id) => {
-                        void handleReconnectStream(id);
-                      }}
-                      onAnalyzeCamera={(id, isAutoTrigger) => {
-                        void analyzeCamera(id, { isAutoTrigger });
-                      }}
+                      onReconnectStream={handleReconnectStreamCard}
+                      onAnalyzeCamera={handleAnalyzeCameraCard}
                       onToggleVoiceListening={handleToggleVoiceListening}
                       onUpdateTranscript={handleUpdateTranscript}
                       onUpdateCameraSettings={handleUpdateCameraSettings}
-                      onToggleFocus={(id) => {
-                        setFocusedCameraId((prev) => (prev === id ? null : id));
-                        window.scrollTo({ top: 0, behavior: 'smooth' });
-                      }}
+                      onToggleFocus={handleToggleFocusCard}
                       onRemoveCamera={handleRemoveCamera}
                     />
 
-                    {otherCameras.length > 0 ? (
+                    {visibleOtherCameras.length > 0 ? (
                       <section aria-label="Other active camera feeds" className="space-y-2.5">
-                        <h2 className="text-xs font-medium text-slate-500">
-                          Other Active {labels.zonePlural} ({otherCameras.length})
-                        </h2>
+                        <div className="flex items-center justify-between gap-2">
+                          <h2 className="text-xs font-medium text-slate-500">
+                            Other Active {labels.zonePlural} ({otherCameras.length})
+                          </h2>
+                          {otherCameras.length > visibleOtherCameras.length ? (
+                            <span className="text-[11px] text-slate-500">
+                              Showing top {visibleOtherCameras.length} priority feeds · Use sidebar to jump to any zone
+                            </span>
+                          ) : null}
+                        </div>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                          {otherCameras.map((cam) => (
+                          {visibleOtherCameras.map((cam) => (
                             <CameraFeedCard
                               key={cam.id}
                               camera={cam}
@@ -2843,6 +3252,7 @@ export default function App() {
                               dbCalibrationOffset={dbCalibrationOffset}
                               cloudQuotaExhausted={cloudQuotaExhausted}
                               isFocused={false}
+                              visibleCameraCount={visibleOtherCameras.length + 1}
                               liveMediaStream={mediaStreamsRef.current[cam.id] ?? null}
                               watchlist={watchlist}
                               onRegisterCapture={registerCapture}
@@ -2853,19 +3263,12 @@ export default function App() {
                               onManualLockEvidence={handleManualLockEvidence}
                               onEnrollLiveSubject={handleEnrollLiveSubject}
                               onWatchlistMatch={handleWatchlistMatch}
-                              onReconnectStream={(id) => {
-                                void handleReconnectStream(id);
-                              }}
-                              onAnalyzeCamera={(id, isAutoTrigger) => {
-                                void analyzeCamera(id, { isAutoTrigger });
-                              }}
+                              onReconnectStream={handleReconnectStreamCard}
+                              onAnalyzeCamera={handleAnalyzeCameraCard}
                               onToggleVoiceListening={handleToggleVoiceListening}
                               onUpdateTranscript={handleUpdateTranscript}
                               onUpdateCameraSettings={handleUpdateCameraSettings}
-                              onToggleFocus={(id) => {
-                                setFocusedCameraId((prev) => (prev === id ? null : id));
-                                window.scrollTo({ top: 0, behavior: 'smooth' });
-                              }}
+                              onToggleFocus={handleToggleFocusCard}
                               onRemoveCamera={handleRemoveCamera}
                             />
                           ))}
@@ -2874,52 +3277,167 @@ export default function App() {
                     ) : null}
                   </div>
                 ) : (
-                  <div
-                    data-testid="camera-grid"
-                    className={`grid ${wallGridClass} gap-4`}
-                  >
-                    {cameras.map((cam) => (
-                      <CameraFeedCard
-                        key={cam.id}
-                        camera={cam}
-                        facilityMode={facilityMode}
-                        threatSensitivity={threatSensitivity}
-                        defaultAiModel={selectedAiModel}
-                        dbCalibrationOffset={dbCalibrationOffset}
-                        cloudQuotaExhausted={cloudQuotaExhausted}
-                        isFocused={false}
-                        liveMediaStream={mediaStreamsRef.current[cam.id] ?? null}
-                        watchlist={watchlist}
-                        onRegisterCapture={registerCapture}
-                        onRegisterDvrProvider={registerDvrProvider}
-                        onLocalPersonDetections={handleLocalPersonDetections}
-                        onRealtimeEdgeThreat={handleRealtimeEdgeThreat}
-                        onPerimeterBreach={handlePerimeterBreach}
-                        onManualLockEvidence={handleManualLockEvidence}
-                        onEnrollLiveSubject={handleEnrollLiveSubject}
-                        onWatchlistMatch={handleWatchlistMatch}
-                        onReconnectStream={(id) => {
-                          void handleReconnectStream(id);
-                        }}
-                        onAnalyzeCamera={(id, isAutoTrigger) => {
-                          void analyzeCamera(id, { isAutoTrigger });
-                        }}
-                        onToggleVoiceListening={handleToggleVoiceListening}
-                        onUpdateTranscript={handleUpdateTranscript}
-                        onUpdateCameraSettings={handleUpdateCameraSettings}
-                        onToggleFocus={(id) => {
-                          setFocusedCameraId((prev) => (prev === id ? null : id));
-                          window.scrollTo({ top: 0, behavior: 'smooth' });
-                        }}
-                        onRemoveCamera={handleRemoveCamera}
-                      />
-                    ))}
+                  <div className="space-y-4">
+                    {showMatrixPaginationBar ? (
+                      <div
+                        data-testid="matrix-pagination-bar"
+                        className="bg-white border border-slate-200 rounded-lg px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-3"
+                      >
+                        <div className="flex flex-wrap items-center gap-2 min-w-0 flex-1">
+                          <div className="relative min-w-[180px] max-w-xs flex-1">
+                            <Search
+                              className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none"
+                              aria-hidden="true"
+                            />
+                            <input
+                              type="search"
+                              value={wallSearch}
+                              onChange={(e) => setWallSearch(e.target.value)}
+                              placeholder={`Filter ${cameras.length} cameras by name or code...`}
+                              aria-label="Filter camera wall"
+                              data-testid="wall-camera-search"
+                              className="w-full pl-8 pr-2.5 py-1.5 text-xs rounded-md border border-slate-200 bg-slate-50 text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-slate-400"
+                            />
+                          </div>
+
+                          <div
+                            role="group"
+                            aria-label="Camera wall filter"
+                            className="inline-flex items-center bg-slate-100 border border-slate-200 rounded-md p-0.5"
+                          >
+                            <button
+                              type="button"
+                              data-testid="wall-filter-all"
+                              aria-pressed={wallFilter === 'all'}
+                              onClick={() => setWallFilter('all')}
+                              className={`px-2 py-1 text-[11px] font-medium rounded transition-colors cursor-pointer ${
+                                wallFilter === 'all'
+                                  ? 'bg-white text-slate-900 shadow-2xs'
+                                  : 'text-slate-500 hover:text-slate-800'
+                              }`}
+                            >
+                              All ({cameras.length})
+                            </button>
+                            <button
+                              type="button"
+                              data-testid="wall-filter-alerts"
+                              aria-pressed={wallFilter === 'alerts'}
+                              onClick={() => setWallFilter('alerts')}
+                              className={`px-2 py-1 text-[11px] font-medium rounded transition-colors cursor-pointer ${
+                                wallFilter === 'alerts'
+                                  ? 'bg-white text-red-600 shadow-2xs'
+                                  : 'text-slate-500 hover:text-slate-800'
+                              }`}
+                            >
+                              Alarms
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span
+                            data-testid="matrix-page-summary"
+                            className="text-xs font-mono text-slate-500 tabular-nums"
+                          >
+                            {paginatedWall.totalMatched === 0
+                              ? '0 matched'
+                              : `${paginatedWall.startIndex + 1}–${paginatedWall.endIndex} of ${paginatedWall.totalMatched}`}
+                          </span>
+                          <div className="inline-flex items-center gap-1">
+                            <button
+                              type="button"
+                              data-testid="matrix-prev-page"
+                              aria-label="Previous camera page"
+                              disabled={paginatedWall.currentPage <= 1}
+                              onClick={() => setWallPage((p) => Math.max(1, p - 1))}
+                              className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-md border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                            >
+                              <ChevronLeft className="w-3.5 h-3.5" aria-hidden="true" />
+                              <span>Prev</span>
+                            </button>
+                            <span
+                              data-testid="matrix-page-indicator"
+                              className="px-2 text-xs font-mono font-semibold text-slate-800 tabular-nums"
+                            >
+                              Page {paginatedWall.currentPage} / {paginatedWall.totalPages}
+                            </span>
+                            <button
+                              type="button"
+                              data-testid="matrix-next-page"
+                              aria-label="Next camera page"
+                              disabled={paginatedWall.currentPage >= paginatedWall.totalPages}
+                              onClick={() =>
+                                setWallPage((p) => Math.min(paginatedWall.totalPages, p + 1))
+                              }
+                              className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-md border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                            >
+                              <span>Next</span>
+                              <ChevronRight className="w-3.5 h-3.5" aria-hidden="true" />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {paginatedWall.pageCameras.length === 0 ? (
+                      <div className="bg-white border border-slate-200 rounded-xl p-8 text-center space-y-2">
+                        <p className="text-sm font-medium text-slate-800">
+                          No cameras match the current filter.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setWallSearch('');
+                            setWallFilter('all');
+                          }}
+                          className="inline-flex items-center px-3 py-1.5 text-xs font-medium rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 cursor-pointer"
+                        >
+                          Clear filter
+                        </button>
+                      </div>
+                    ) : (
+                      <div
+                        data-testid="camera-grid"
+                        className={`grid ${wallGridClass} gap-4`}
+                      >
+                        {paginatedWall.pageCameras.map((cam) => (
+                          <CameraFeedCard
+                            key={cam.id}
+                            camera={cam}
+                            facilityMode={facilityMode}
+                            threatSensitivity={threatSensitivity}
+                            defaultAiModel={selectedAiModel}
+                            dbCalibrationOffset={dbCalibrationOffset}
+                            cloudQuotaExhausted={cloudQuotaExhausted}
+                            isFocused={false}
+                            visibleCameraCount={paginatedWall.pageCameras.length}
+                            liveMediaStream={mediaStreamsRef.current[cam.id] ?? null}
+                            watchlist={watchlist}
+                            onRegisterCapture={registerCapture}
+                            onRegisterDvrProvider={registerDvrProvider}
+                            onLocalPersonDetections={handleLocalPersonDetections}
+                            onRealtimeEdgeThreat={handleRealtimeEdgeThreat}
+                            onPerimeterBreach={handlePerimeterBreach}
+                            onManualLockEvidence={handleManualLockEvidence}
+                            onEnrollLiveSubject={handleEnrollLiveSubject}
+                            onWatchlistMatch={handleWatchlistMatch}
+                            onReconnectStream={handleReconnectStreamCard}
+                            onAnalyzeCamera={handleAnalyzeCameraCard}
+                            onToggleVoiceListening={handleToggleVoiceListening}
+                            onUpdateTranscript={handleUpdateTranscript}
+                            onUpdateCameraSettings={handleUpdateCameraSettings}
+                            onToggleFocus={handleToggleFocusCard}
+                            onRemoveCamera={handleRemoveCamera}
+                          />
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
             </main>
 
-            {/* Right Docked Command Rail: Zone Inspector when focused, otherwise Live Incident Stream */}
+            {/* Right Docked Command Rail: Hide in compact mobile landscape when 0 alerts so cameras get full widescreen */}
             {focusedCamera ? (
               <DedicatedCameraPanel
                 key={focusedCamera.id}
@@ -2937,7 +3455,7 @@ export default function App() {
                 onAcknowledgeAlert={handleAcknowledgeAlert}
                 onNotifyTeacher={(alert) => setDispatchAlert(alert)}
               />
-            ) : (
+            ) : !mobileLayout.isMobileLandscape || alerts.length > 0 ? (
               <LiveIncidentRail
                 alerts={alerts}
                 facilityMode={facilityMode}
@@ -2947,7 +3465,7 @@ export default function App() {
                 onNotifyTeacher={(alert) => setDispatchAlert(alert)}
                 onViewAllIncidents={() => setActiveView('alerts')}
               />
-            )}
+            ) : null}
           </div>
 
         {activeView !== 'grid' ? (
@@ -3105,6 +3623,18 @@ export default function App() {
         onConfirmSendGmail={handleConfirmSendGmail}
         onConfirmPostClassroom={handleConfirmPostClassroom}
         onClose={() => setDispatchAlert(null)}
+      />
+      <MobileBottomNav
+        activeView={activeView}
+        onSelectView={(view) => {
+          setActiveView(view);
+          setMobileDrawerOpen(false);
+        }}
+        unreadAlertsCount={summary.activeAlertsCount}
+        evidenceCount={evidenceCases.length}
+        isSettingsOpen={mobileDrawerOpen}
+        onOpenSettings={() => setMobileDrawerOpen((prev) => !prev)}
+        hidden={!mobileLayout.showBottomTabBar}
       />
     </div>
   );

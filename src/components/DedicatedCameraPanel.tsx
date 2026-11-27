@@ -459,7 +459,7 @@ export function DedicatedCameraPanel({
             <span>Other {labels.zonePlural} ({otherCameras.length})</span>
           </h3>
           <ul className="divide-y divide-slate-200 border border-slate-200 rounded-lg overflow-hidden">
-            {otherCameras.map((other) => (
+            {otherCameras.slice(0, 20).map((other) => (
               <li key={other.id}>
                 <button
                   type="button"
@@ -488,6 +488,11 @@ export function DedicatedCameraPanel({
               </li>
             ))}
           </ul>
+          {otherCameras.length > 20 ? (
+            <p className="text-[11px] text-slate-500">
+              Showing first 20 of {otherCameras.length} other {labels.zonePlural.toLowerCase()}. Use the sidebar search to jump to any zone.
+            </p>
+          ) : null}
         </div>
       ) : null}
 

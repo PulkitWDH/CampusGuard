@@ -1,13 +1,15 @@
-import { useRef, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import {
   ChevronDown,
   ChevronRight,
   LogOut,
   Moon,
+  Search,
   SlidersHorizontal,
   Sun,
   Trash2,
   UserPlus,
+  X,
 } from 'lucide-react';
 import type {
   AiEngineModel,
@@ -56,6 +58,8 @@ interface SidebarProps {
   onStatusNotice?: (message: string) => void;
   themeMode: 'light' | 'dark';
   onChangeThemeMode: (mode: 'light' | 'dark') => void;
+  mobileOpen?: boolean;
+  onCloseMobile?: () => void;
 }
 
 export function Sidebar({
@@ -89,13 +93,41 @@ export function Sidebar({
   onStatusNotice,
   themeMode,
   onChangeThemeMode,
+  mobileOpen = false,
+  onCloseMobile,
 }: SidebarProps) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [zoneSearch, setZoneSearch] = useState('');
+  const [visibleLimit, setVisibleLimit] = useState(40);
   const watchlistFileRef = useRef<HTMLInputElement | null>(null);
   const labels = formatFacilityLabels(facilityMode);
 
-  return (
-    <aside className="hidden lg:flex lg:flex-col w-60 shrink-0 bg-white border-r border-slate-200 select-none">
+  const filteredSidebarCameras = useMemo(() => {
+    const q = zoneSearch.trim().toLowerCase();
+    const list = q
+      ? cameras.filter((cam) =>
+          `${cam.classroomName} ${cam.cameraCode} ${cam.bluetoothDeviceName}`.toLowerCase().includes(q)
+        )
+      : cameras;
+    if (list.length <= 12) return list;
+    const hasAlert = list.some((c) => c.status === 'fighting' || c.status === 'warning');
+    if (!hasAlert) return list;
+    const rank = (s: ClassroomCamera['status']) => (s === 'fighting' ? 0 : s === 'warning' ? 1 : 2);
+    return [...list].sort((a, b) => rank(a.status) - rank(b.status));
+  }, [cameras, zoneSearch]);
+
+  const displayedSidebarCameras = useMemo(
+    () => filteredSidebarCameras.slice(0, visibleLimit),
+    [filteredSidebarCameras, visibleLimit]
+  );
+
+  const handleSelectCamera = (cameraId: string | null) => {
+    onFocusCamera(cameraId);
+    onCloseMobile?.();
+  };
+
+  const sidebarInner = (
+    <>
       {/* Main Scrollable Rail */}
       <div className="flex-1 overflow-y-auto divide-y divide-slate-200/80">
         {/* Simple Default View: Connected Cameras & Zones */}
@@ -114,81 +146,114 @@ export function Sidebar({
               No cameras connected yet. Click Add Camera to start monitoring.
             </p>
           ) : (
-            <ul className="space-y-1">
-              <li>
-                <button
-                  type="button"
-                  onClick={() => onFocusCamera(null)}
-                  className={`w-full text-left px-2.5 py-2 rounded-lg text-xs transition-colors flex items-center justify-between gap-2 cursor-pointer ${
-                    focusedCameraId === null
-                      ? 'bg-slate-900 text-white font-medium'
-                      : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
-                  }`}
-                >
-                  <span className="truncate">All Feeds</span>
-                  <span
-                    className={`font-mono text-[11px] tabular-nums ${
-                      focusedCameraId === null ? 'text-slate-300' : 'text-slate-500'
+            <div className="space-y-2">
+              {cameras.length > 10 ? (
+                <div className="relative">
+                  <Search
+                    className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none"
+                    aria-hidden="true"
+                  />
+                  <input
+                    type="search"
+                    value={zoneSearch}
+                    onChange={(e) => {
+                      setZoneSearch(e.target.value);
+                      setVisibleLimit(40);
+                    }}
+                    placeholder={`Search ${cameras.length} zones...`}
+                    aria-label="Filter monitored zones"
+                    data-testid="sidebar-zone-search"
+                    className="w-full pl-8 pr-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-md text-slate-900 placeholder:text-slate-400 focus-visible:outline-2 focus-visible:outline-blue-600"
+                  />
+                </div>
+              ) : null}
+
+              <ul className="space-y-1">
+                <li>
+                  <button
+                    type="button"
+                    onClick={() => handleSelectCamera(null)}
+                    className={`w-full text-left px-2.5 py-2 rounded-lg text-xs transition-colors flex items-center justify-between gap-2 cursor-pointer ${
+                      focusedCameraId === null
+                        ? 'bg-slate-900 text-white font-medium'
+                        : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
                     }`}
-                    data-testid="sidebar-total-kids"
                   >
-                    {summary.totalKidsCount}
-                  </span>
-                </button>
-              </li>
-              {cameras.map((cam) => {
-                const isFocused = focusedCameraId === cam.id;
-                const statusColor =
-                  cam.status === 'fighting'
-                    ? isFocused
-                      ? 'text-red-300'
-                      : 'text-red-600'
-                    : cam.status === 'warning'
-                      ? isFocused
-                        ? 'text-amber-300'
-                        : 'text-amber-600'
-                      : isFocused
-                        ? 'text-slate-300'
-                        : 'text-slate-400';
-                return (
-                  <li key={cam.id}>
-                    <button
-                      type="button"
-                      onClick={() => onFocusCamera(isFocused ? null : cam.id)}
-                      className={`w-full text-left px-2.5 py-2 rounded-lg text-xs transition-colors flex items-center justify-between gap-2 cursor-pointer ${
-                        isFocused
-                          ? 'bg-slate-900 text-white font-medium'
-                          : 'text-slate-700 hover:bg-slate-100'
+                    <span className="truncate">All Feeds</span>
+                    <span
+                      className={`font-mono text-[11px] tabular-nums ${
+                        focusedCameraId === null ? 'text-slate-300' : 'text-slate-500'
                       }`}
+                      data-testid="sidebar-total-kids"
                     >
-                      <div className="min-w-0">
-                        <div className="truncate">{cam.classroomName}</div>
-                        <div className={`text-[11px] font-mono ${statusColor}`}>
-                          {cam.status === 'fighting'
-                            ? 'Alarm'
-                            : cam.status === 'warning'
-                              ? 'Warning'
-                              : cam.cameraCode}
-                        </div>
-                      </div>
-                      <span
-                        className={`font-mono text-xs tabular-nums shrink-0 ${
-                          isFocused ? 'text-slate-200' : 'text-slate-600'
+                      {summary.totalKidsCount}
+                    </span>
+                  </button>
+                </li>
+                {displayedSidebarCameras.map((cam) => {
+                  const isFocused = focusedCameraId === cam.id;
+                  const statusColor =
+                    cam.status === 'fighting'
+                      ? isFocused
+                        ? 'text-red-300'
+                        : 'text-red-600'
+                      : cam.status === 'warning'
+                        ? isFocused
+                          ? 'text-amber-300'
+                          : 'text-amber-600'
+                        : isFocused
+                          ? 'text-slate-300'
+                          : 'text-slate-400';
+                  return (
+                    <li key={cam.id}>
+                      <button
+                        type="button"
+                        onClick={() => handleSelectCamera(isFocused ? null : cam.id)}
+                        className={`w-full text-left px-2.5 py-2 rounded-lg text-xs transition-colors flex items-center justify-between gap-2 cursor-pointer ${
+                          isFocused
+                            ? 'bg-slate-900 text-white font-medium'
+                            : 'text-slate-700 hover:bg-slate-100'
                         }`}
                       >
-                        {cam.sourceKind === 'microphone-only' || !cam.hasVideo
-                          ? `${cam.audioLevel.toFixed(0)} dB`
-                          : `${cam.studentCount}${
-                              typeof cam.expectedTotalCount === 'number' && cam.expectedTotalCount > 0
-                                ? `/${cam.expectedTotalCount}`
-                                : ''
-                            }`}
-                      </span>
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
+                        <div className="min-w-0">
+                          <div className="truncate">{cam.classroomName}</div>
+                          <div className={`text-[11px] font-mono ${statusColor}`}>
+                            {cam.status === 'fighting'
+                              ? 'Alarm'
+                              : cam.status === 'warning'
+                                ? 'Warning'
+                                : cam.cameraCode}
+                          </div>
+                        </div>
+                        <span
+                          className={`font-mono text-xs tabular-nums shrink-0 ${
+                            isFocused ? 'text-slate-200' : 'text-slate-600'
+                          }`}
+                        >
+                          {cam.sourceKind === 'microphone-only' || !cam.hasVideo
+                            ? `${cam.audioLevel.toFixed(0)} dB`
+                            : `${cam.studentCount}${
+                                typeof cam.expectedTotalCount === 'number' && cam.expectedTotalCount > 0
+                                  ? `/${cam.expectedTotalCount}`
+                                  : ''
+                              }`}
+                        </span>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+
+              {filteredSidebarCameras.length > visibleLimit ? (
+                <button
+                  type="button"
+                  onClick={() => setVisibleLimit((prev) => prev + 60)}
+                  className="w-full py-1.5 text-[11px] font-medium text-slate-600 hover:text-slate-900 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-md transition-colors cursor-pointer"
+                >
+                  Show more ({filteredSidebarCameras.length - visibleLimit} remaining)
+                </button>
+              ) : null}
+            </div>
           )}
         </section>
 
@@ -532,6 +597,47 @@ export function Sidebar({
           <GoogleSignInButton loading={isSigningIn} compact onClick={onGoogleSignIn} />
         )}
       </div>
-    </aside>
+    </>
+  );
+
+  return (
+    <>
+      <aside className="hidden lg:flex lg:flex-col w-60 shrink-0 bg-white border-r border-slate-200 select-none">
+        {sidebarInner}
+      </aside>
+
+      {mobileOpen ? (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Monitored zones and settings"
+          data-testid="mobile-zones-drawer"
+          className="lg:hidden fixed inset-0 z-50 flex items-end bg-slate-950/55 backdrop-blur-xs"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) onCloseMobile?.();
+          }}
+        >
+          <div className="w-full max-h-[86vh] bg-white rounded-t-3xl border-t border-slate-200 flex flex-col overflow-hidden shadow-2xl pb-[env(safe-area-inset-bottom)]">
+            <div className="flex justify-center pt-2.5 pb-1">
+              <span className="w-10 h-1 rounded-full bg-slate-300" aria-hidden="true" />
+            </div>
+            <div className="px-4 py-2.5 border-b border-slate-200 flex items-center justify-between">
+              <span className="font-display text-sm font-semibold text-slate-900">
+                Zones &amp; Command Settings
+              </span>
+              <button
+                type="button"
+                onClick={() => onCloseMobile?.()}
+                aria-label="Close zones and settings"
+                className="p-2 rounded-lg text-slate-500 hover:text-slate-900 hover:bg-slate-100 cursor-pointer"
+              >
+                <X className="w-4 h-4" aria-hidden="true" />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto flex flex-col">{sidebarInner}</div>
+          </div>
+        </div>
+      ) : null}
+    </>
   );
 }

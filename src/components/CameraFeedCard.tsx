@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { memo, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -18,6 +18,7 @@ import {
   Trash2,
   UserPlus,
   Video,
+  X,
 } from 'lucide-react';
 import type {
   AiEngineModel,
@@ -75,10 +76,22 @@ import {
 import {
   type PtzViewportRect,
   computeSmoothPtzViewport,
+  easePtzViewportToFull,
   extractAppearanceSignature,
+  mapBoxThroughPtzViewport,
+  mapPointThroughPtzViewport,
   matchSubjectsToWatchlist,
   updateTrackedSubjects,
 } from '../utils/subjectIntelligence';
+import {
+  computeNoseAnchor,
+  drawBodyOnlyHighlight,
+  findHoveredBodySubject,
+} from '../utils/bodySilhouette';
+import {
+  getAdaptiveRenderProfile,
+  globalEdgeInferenceScheduler,
+} from '../utils/cameraScaleEngine';
 
 export interface CameraFramePayload {
   frameBase64: string;
@@ -109,6 +122,7 @@ interface CameraFeedCardProps {
   dbCalibrationOffset?: number;
   cloudQuotaExhausted?: boolean;
   isFocused: boolean;
+  visibleCameraCount?: number;
   liveMediaStream?: MediaStream | null;
   watchlist?: WatchlistSubject[];
   onRegisterCapture: (cameraId: string, captureFn: (() => CameraFramePayload | null) | null) => void;
@@ -188,7 +202,7 @@ interface SpeechRecognitionInstance {
   stop: () => void;
 }
 
-export function CameraFeedCard({
+function CameraFeedCardInner({
   camera,
   facilityMode,
   threatSensitivity,
@@ -196,6 +210,7 @@ export function CameraFeedCard({
   dbCalibrationOffset = DEFAULT_DB_CALIBRATION_OFFSET,
   cloudQuotaExhausted = false,
   isFocused,
+  visibleCameraCount = 1,
   liveMediaStream = null,
   watchlist = [],
   onRegisterCapture,
@@ -293,7 +308,7 @@ export function CameraFeedCard({
   watchlistRef.current = watchlist;
 
   // Real-Time Subject Tracking, Auto-PTZ Zoom, Re-ID Watchlist, Heatmap, Perimeter & Black-Box Video DVR
-  const ptzAutoTrackEnabled = camera.ptzAutoTrackEnabled ?? true;
+  const ptzAutoTrackEnabled = Boolean(camera.ptzAutoTrackEnabled);
   const trailsEnabled = camera.trailsEnabled ?? true;
   const heatmapEnabled = Boolean(camera.heatmapEnabled);
   const perimeterZone = camera.perimeterZone ?? null;
@@ -305,6 +320,8 @@ export function CameraFeedCard({
   const lastPerimeterAlertAtRef = useRef<number>(0);
   const [perimeterBreached, setPerimeterBreached] = useState(false);
   const [isDrawingZone, setIsDrawingZone] = useState(false);
+  const isDrawingZoneRef = useRef(false);
+  isDrawingZoneRef.current = isDrawingZone;
   const dragStartPxRef = useRef<{ x: number; y: number } | null>(null);
   const dragCurrentPxRef = useRef<{ x: number; y: number } | null>(null);
   const heatmapGridRef = useRef<Float32Array>(createActivityHeatmap(HEATMAP_COLS, HEATMAP_ROWS));
@@ -312,6 +329,30 @@ export function CameraFeedCard({
   const [dvrFrameCount, setDvrFrameCount] = useState(0);
   const [justLockedEvidence, setJustLockedEvidence] = useState(false);
   const [isRecordingVideo, setIsRecordingVideo] = useState(false);
+
+  // Interactive ONLY-BODY Person Picker (Green default -> Red on cursor hover) for Trail, Flag & PTZ
+  const [pickMode, setPickMode] = useState<'trail' | 'flag' | 'ptz' | null>(null);
+  const pickModeRef = useRef<'trail' | 'flag' | 'ptz' | null>(null);
+  pickModeRef.current = pickMode;
+  const [hoveredSubjectId, setHoveredSubjectId] = useState<string | null>(null);
+  const hoveredSubjectIdRef = useRef<string | null>(null);
+  const lastPickerPointerPxRef = useRef<{ x: number; y: number } | null>(null);
+  const [selectedTrailSubjectIds, setSelectedTrailSubjectIds] = useState<string[]>([]);
+  const selectedTrailSubjectIdsRef = useRef<string[]>([]);
+  selectedTrailSubjectIdsRef.current = selectedTrailSubjectIds;
+  const [pickFeedback, setPickFeedback] = useState<string | null>(null);
+  const pickFeedbackTimerRef = useRef<number | null>(null);
+
+  const showPickFeedback = (message: string) => {
+    setPickFeedback(message);
+    if (pickFeedbackTimerRef.current !== null) {
+      window.clearTimeout(pickFeedbackTimerRef.current);
+    }
+    pickFeedbackTimerRef.current = window.setTimeout(() => {
+      setPickFeedback(null);
+      pickFeedbackTimerRef.current = null;
+    }, 2400);
+  };
 
   // Persistent Subject Tracker + Re-ID Signatures + Smooth Auto-PTZ Viewport
   const trackedSubjectsRef = useRef<TrackedSubject[]>([]);
@@ -340,6 +381,14 @@ export function CameraFeedCard({
       setPerimeterBreached(false);
     }
   }, [heatmapEnabled, perimeterZone, ptzAutoTrackEnabled, trailsEnabled]);
+
+  useEffect(() => {
+    return () => {
+      if (pickFeedbackTimerRef.current !== null) {
+        window.clearTimeout(pickFeedbackTimerRef.current);
+      }
+    };
+  }, []);
 
   const captureAnnotatedDvrFrame = (): DvrEvidenceFrame | null => {
     const canvas = canvasRef.current;
@@ -569,8 +618,62 @@ export function CameraFeedCard({
     };
   };
 
+  const togglePickMode = (mode: 'trail' | 'flag' | 'ptz') => {
+    setIsDrawingZone(false);
+    setPickMode((prev) => {
+      const next = prev === mode ? null : mode;
+      if (!next) {
+        lastPickerPointerPxRef.current = null;
+        hoveredSubjectIdRef.current = null;
+        setHoveredSubjectId(null);
+      }
+      return next;
+    });
+  };
+
   const handleCanvasPointerDown = (e: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (!isDrawingZone || isAudioOnly) return;
+    if (isAudioOnly) return;
+
+    if (pickModeRef.current !== null) {
+      const pt = getCanvasPointFromPointer(e);
+      const hit = findHoveredBodySubject(pt, trackedSubjectsRef.current, lastDrawRectRef.current);
+      if (!hit) return;
+
+      if (pickModeRef.current === 'trail') {
+        const alreadySelected = selectedTrailSubjectIdsRef.current.includes(hit.id);
+        const nextIds = alreadySelected
+          ? selectedTrailSubjectIdsRef.current.filter((id) => id !== hit.id)
+          : [...selectedTrailSubjectIdsRef.current, hit.id];
+        selectedTrailSubjectIdsRef.current = nextIds;
+        setSelectedTrailSubjectIds(nextIds);
+        if (!trailsEnabledRef.current) {
+          onUpdateCameraSettings(camera.id, { trailsEnabled: true });
+        }
+        showPickFeedback(
+          alreadySelected
+            ? `Removed nose trail from ${hit.id}`
+            : `Nose trail locked on ${hit.id}`
+        );
+      } else if (pickModeRef.current === 'flag') {
+        handleFlagLiveSubject(hit);
+        showPickFeedback(`Flagged ${hit.id} to Watchlist`);
+        lastPickerPointerPxRef.current = null;
+        hoveredSubjectIdRef.current = null;
+        setHoveredSubjectId(null);
+        setPickMode(null);
+      } else if (pickModeRef.current === 'ptz') {
+        setLockedPtzSubjectId(hit.id);
+        onUpdateCameraSettings(camera.id, { ptzAutoTrackEnabled: true });
+        showPickFeedback(`Auto-PTZ locked on ${hit.id}`);
+        lastPickerPointerPxRef.current = null;
+        hoveredSubjectIdRef.current = null;
+        setHoveredSubjectId(null);
+        setPickMode(null);
+      }
+      return;
+    }
+
+    if (!isDrawingZone) return;
     e.currentTarget.setPointerCapture(e.pointerId);
     const pt = getCanvasPointFromPointer(e);
     dragStartPxRef.current = pt;
@@ -578,8 +681,29 @@ export function CameraFeedCard({
   };
 
   const handleCanvasPointerMove = (e: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (!isDrawingZone || !dragStartPxRef.current) return;
-    dragCurrentPxRef.current = getCanvasPointFromPointer(e);
+    if (isAudioOnly) return;
+    if (isDrawingZone && dragStartPxRef.current) {
+      dragCurrentPxRef.current = getCanvasPointFromPointer(e);
+      return;
+    }
+    if (pickModeRef.current !== null) {
+      const pt = getCanvasPointFromPointer(e);
+      lastPickerPointerPxRef.current = pt;
+      const hit = findHoveredBodySubject(pt, trackedSubjectsRef.current, lastDrawRectRef.current);
+      const nextId = hit?.id ?? null;
+      if (hoveredSubjectIdRef.current !== nextId) {
+        hoveredSubjectIdRef.current = nextId;
+        setHoveredSubjectId(nextId);
+      }
+    }
+  };
+
+  const handleCanvasPointerLeave = () => {
+    lastPickerPointerPxRef.current = null;
+    if (hoveredSubjectIdRef.current !== null) {
+      hoveredSubjectIdRef.current = null;
+      setHoveredSubjectId(null);
+    }
   };
 
   const handleCanvasPointerUp = (e: ReactPointerEvent<HTMLCanvasElement>) => {
@@ -643,8 +767,9 @@ export function CameraFeedCard({
     }
 
     // Preserve true camera aspect ratio (e.g. portrait phone 360x640 vs landscape laptop 640x360)
-    // so humans on mobile/tablet cameras are NEVER stretched horizontally before COCO-SSD inference!
-    const fitted = computeAspectPreservingSize(srcW, srcH, 640);
+    // and retain up to 1080px detail on focused/1-2 camera views so dense crowd zoom tiles stay razor sharp!
+    const maxInferenceDim = isFocused || visibleCameraCount <= 2 ? 1080 : 640;
+    const fitted = computeAspectPreservingSize(srcW, srcH, maxInferenceDim);
     if (targetCanvas.width !== fitted.width) targetCanvas.width = fitted.width;
     if (targetCanvas.height !== fitted.height) targetCanvas.height = fitted.height;
 
@@ -831,10 +956,11 @@ export function CameraFeedCard({
     }
 
     let cancelled = false;
+    let lastStaticCrowdUrl = '';
+    let lastStaticCrowdAtMs = 0;
+
     const runEdgeDetect = async () => {
       if (cancelled || localDetectInFlightRef.current || !hasLiveFrameRef.current) return;
-      const clean = captureCleanFrameRef.current();
-      if (!clean || !rawCaptureCanvasRef.current) return;
 
       // Measure true frame-to-frame visual motion right at inference time
       const currThumb = sampleMotionPixelsRef.current();
@@ -848,9 +974,24 @@ export function CameraFeedCard({
       liveMotionPercentRef.current = instantDelta;
       setLiveMotionPercent(instantDelta);
 
+      // Avoid repeating heavy 12-tile deep crowd scans on an unchanged static photo every 300ms
+      const isStaticImage = camera.customMediaType === 'image' && Boolean(camera.customMediaUrl);
+      if (
+        isStaticImage &&
+        lastStaticCrowdUrl === camera.customMediaUrl &&
+        instantDelta < 0.5 &&
+        Date.now() - lastStaticCrowdAtMs < 6000
+      ) {
+        return;
+      }
+
+      const clean = captureCleanFrameRef.current();
+      if (!clean || !rawCaptureCanvasRef.current) return;
+
       localDetectInFlightRef.current = true;
       try {
         const rawCanvas = rawCaptureCanvasRef.current;
+        const allowDeepCrowdScan = isFocused || visibleCameraCount <= 2;
         const {
           people: rawPeople,
           weakPeople,
@@ -858,49 +999,56 @@ export function CameraFeedCard({
           occluderObjects,
           inferenceMs,
           backend,
+          crowdScanUsed,
         } = await detectPeopleLocallyOnCanvas(rawCanvas, 28, {
           hadTrackedPeople: personTrackerStateRef.current.confirmed.length > 0,
+          allowDeepCrowdScan,
         });
         if (cancelled) return;
         consecutiveEdgeErrorsRef.current = 0;
+        if (isStaticImage && crowdScanUsed) {
+          lastStaticCrowdUrl = camera.customMediaUrl || '';
+          lastStaticCrowdAtMs = Date.now();
+        }
 
-        // Lightweight 6x4 lower-torso patch sampler (shoulders/chest below face) for occlusion resilience
-        const sampleTorsoSignature = (
-          box_2d: [number, number, number, number]
-        ): number[] | null => {
-          try {
-            const cw = rawCanvas.width;
-            const ch = rawCanvas.height;
-            if (cw <= 0 || ch <= 0) return null;
-            const [ymin, xmin, ymax, xmax] = box_2d;
-            const torsoYmin = ymin + Math.round((ymax - ymin) * 0.44);
-            const sx = Math.max(0, Math.floor((xmin / 1000) * cw));
-            const sy = Math.max(0, Math.floor((torsoYmin / 1000) * ch));
-            const sw = Math.max(4, Math.floor(((xmax - xmin) / 1000) * cw));
-            const sh = Math.max(4, Math.floor(((ymax - torsoYmin) / 1000) * ch));
-            const scratch = document.createElement('canvas');
-            scratch.width = 6;
-            scratch.height = 4;
-            const sctx = scratch.getContext('2d', { willReadFrequently: true });
-            if (!sctx) return null;
-            sctx.drawImage(rawCanvas, sx, sy, Math.min(sw, cw - sx), Math.min(sh, ch - sy), 0, 0, 6, 4);
-            const data = sctx.getImageData(0, 0, 6, 4).data;
-            const vec: number[] = [];
-            for (let i = 0; i < data.length; i += 4) {
-              vec.push(Math.round(data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114));
-            }
-            return vec;
-          } catch {
-            return null;
-          }
-        };
+        // Lightweight 6x4 lower-torso patch sampler (only needed for sparse rooms, skipped for 20+ crowds for speed)
+        const sampleTorsoSignature =
+          rawPeople.length >= 20
+            ? undefined
+            : (box_2d: [number, number, number, number]): number[] | null => {
+                try {
+                  const cw = rawCanvas.width;
+                  const ch = rawCanvas.height;
+                  if (cw <= 0 || ch <= 0) return null;
+                  const [ymin, xmin, ymax, xmax] = box_2d;
+                  const torsoYmin = ymin + Math.round((ymax - ymin) * 0.44);
+                  const sx = Math.max(0, Math.floor((xmin / 1000) * cw));
+                  const sy = Math.max(0, Math.floor((torsoYmin / 1000) * ch));
+                  const sw = Math.max(4, Math.floor(((xmax - xmin) / 1000) * cw));
+                  const sh = Math.max(4, Math.floor(((ymax - torsoYmin) / 1000) * ch));
+                  const scratch = document.createElement('canvas');
+                  scratch.width = 6;
+                  scratch.height = 4;
+                  const sctx = scratch.getContext('2d', { willReadFrequently: true });
+                  if (!sctx) return null;
+                  sctx.drawImage(rawCanvas, sx, sy, Math.min(sw, cw - sx), Math.min(sh, ch - sy), 0, 0, 6, 4);
+                  const data = sctx.getImageData(0, 0, 6, 4).data;
+                  const vec: number[] = [];
+                  for (let i = 0; i < data.length; i += 4) {
+                    vec.push(Math.round(data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114));
+                  }
+                  return vec;
+                } catch {
+                  return null;
+                }
+              };
 
         const { nextState, people } = stepPersonTracker(
           personTrackerStateRef.current,
           rawPeople,
           {
-            instantConfidence: 50,
-            minConfidence: 28,
+            instantConfidence: crowdScanUsed ? 22 : 50,
+            minConfidence: crowdScanUsed ? 22 : 28,
             maxMissedFrames: 3,
             maxOccludedFrames: 35,
             weakDetections: weakPeople,
@@ -932,19 +1080,23 @@ export function CameraFeedCard({
         updateActivityHeatmap(heatmapGridRef.current, people, HEATMAP_COLS, HEATMAP_ROWS);
 
         // Update persistent Subject IDs, movement trajectories, dwell timers & Appearance Re-ID Watchlist
+        // Scale maxAgeMs to tolerate slow software WebGL or static-image crowd throttle windows without churning IDs
         const nowTrackMs = Date.now();
         const trackedStep = updateTrackedSubjects(
           trackedSubjectsRef.current,
           people,
           nowTrackMs,
-          nextSubjectNumericIdRef.current
+          nextSubjectNumericIdRef.current,
+          { maxAgeMs: Math.max(20_000, inferenceMs * 4) }
         );
         nextSubjectNumericIdRef.current = trackedStep.nextNumericId;
         let nextTracked = trackedStep.subjects;
 
         // Extract real 36-bin spatial HSV appearance signatures directly from raw frame pixels
+        // (For 20+ dense crowds with empty watchlist, defer signature extraction to on-demand Flag click for 0ms latency)
         try {
-          const rctx = rawCanvas.getContext('2d', { willReadFrequently: true });
+          const shouldExtractSigs = nextTracked.length > 0 && (nextTracked.length < 20 || watchlistRef.current.length > 0);
+          const rctx = shouldExtractSigs ? rawCanvas.getContext('2d', { willReadFrequently: true }) : null;
           if (rctx && nextTracked.length > 0) {
             const rawPixels = rctx.getImageData(0, 0, rawCanvas.width, rawCanvas.height).data;
             const nextSigs: Record<string, AppearanceSignature> = {};
@@ -1006,6 +1158,18 @@ export function CameraFeedCard({
         }
 
         trackedSubjectsRef.current = nextTracked;
+        if (pickModeRef.current !== null && lastPickerPointerPxRef.current) {
+          const liveHit = findHoveredBodySubject(
+            lastPickerPointerPxRef.current,
+            nextTracked,
+            lastDrawRectRef.current
+          );
+          const nextHoverId = liveHit?.id ?? null;
+          if (hoveredSubjectIdRef.current !== nextHoverId) {
+            hoveredSubjectIdRef.current = nextHoverId;
+            setHoveredSubjectId(nextHoverId);
+          }
+        }
         const trackedUiSig = nextTracked
           .map((s) => `${s.id}:${s.dwellSeconds}:${s.matchedWatchlistId ?? ''}:${s.matchedSimilarity ?? 0}`)
           .join('|');
@@ -1059,10 +1223,11 @@ export function CameraFeedCard({
 
         if (!isAnalyzingRef.current) {
           const backendTag = backend === 'cpu' ? 'CPU' : 'WebGL';
+          const engineTag = crowdScanUsed ? `Crowd AI (${backendTag})` : `Edge AI (${backendTag})`;
           setScanModeLabel(
             cloudQuotaExhaustedRef.current
-              ? `Edge AI (${backendTag}) · ${inferenceMs}ms`
-              : `Edge (${backendTag}) + Cloud · ${inferenceMs}ms`
+              ? `${engineTag} · ${inferenceMs}ms`
+              : `${engineTag} + Cloud · ${inferenceMs}ms`
           );
         }
       } catch (err) {
@@ -1080,16 +1245,25 @@ export function CameraFeedCard({
       }
     };
 
-    void runEdgeDetect();
-    const edgeTimer = window.setInterval(() => {
-      void runEdgeDetect();
-    }, 300);
+    const renderProfile = getAdaptiveRenderProfile(visibleCameraCount, isFocused);
+    const scheduleEdgeDetect = () => {
+      if (cancelled || localDetectInFlightRef.current || !hasLiveFrameRef.current) return;
+      const priority =
+        isFocused || cameraStatusRef.current === 'fighting' || cameraStatusRef.current === 'warning'
+          ? 0
+          : 1;
+      void globalEdgeInferenceScheduler.schedule(camera.id, priority, runEdgeDetect);
+    };
+
+    scheduleEdgeDetect();
+    const edgeTimer = window.setInterval(scheduleEdgeDetect, renderProfile.inferenceIntervalMs);
 
     return () => {
       cancelled = true;
       clearInterval(edgeTimer);
+      globalEdgeInferenceScheduler.cancel(camera.id);
     };
-  }, [camera.id, hasLiveSignal, isAudioOnly, isAutoAiOn, localEdgeState]);
+  }, [camera.id, hasLiveSignal, isAudioOnly, isAutoAiOn, isFocused, localEdgeState, visibleCameraCount]);
 
   // Cloud multimodal threat verification loop (complements on-device Edge AI when cloud quota is available)
   useEffect(() => {
@@ -1435,7 +1609,7 @@ export function CameraFeedCard({
       const canvas = canvasRef.current;
       if (!canvas) return;
 
-      // Dynamically match Full HD backing resolution (up to 1920x1080) so live cameras stay razor-sharp
+      // Adaptive GPU resolution scaling: Full HD 1920x1080 on 1 cam, 1280x720 on 2x2, 960x540 on 3x3, 640x360 on 4x4
       const activeVideo = videoRef.current;
       const activeImg = loadedImageRef.current;
       const sourceW =
@@ -1445,12 +1619,10 @@ export function CameraFeedCard({
             ? activeImg.naturalWidth
             : 1280;
       const dpr = typeof window !== 'undefined' ? Math.min(2, window.devicePixelRatio || 1) : 1;
-      const wantFullHd = sourceW >= 1400 || dpr >= 1.5;
-      const targetPixelW = wantFullHd ? 1920 : 1280;
-      const targetPixelH = wantFullHd ? 1080 : 720;
-      if (canvas.width !== targetPixelW || canvas.height !== targetPixelH) {
-        canvas.width = targetPixelW;
-        canvas.height = targetPixelH;
+      const profile = getAdaptiveRenderProfile(visibleCameraCount, isFocused, sourceW, dpr);
+      if (canvas.width !== profile.targetWidth || canvas.height !== profile.targetHeight) {
+        canvas.width = profile.targetWidth;
+        canvas.height = profile.targetHeight;
       }
 
       const ctx = canvas.getContext('2d');
@@ -1478,8 +1650,8 @@ export function CameraFeedCard({
 
         const chartLeft = 36;
         const chartRight = width - 24;
-        const chartTop = 98;
-        const chartBottom = height - 66;
+        const chartTop = 114;
+        const chartBottom = height - 64;
         const chartW = chartRight - chartLeft;
         const chartH = chartBottom - chartTop;
 
@@ -1534,15 +1706,15 @@ export function CameraFeedCard({
 
         // Large monospace dB readout
         ctx.fillStyle = isCritical || isLoud ? '#f87171' : audioConnected ? '#34d399' : '#e4e4e7';
-        ctx.font = '700 34px "JetBrains Mono", monospace';
-        ctx.fillText(`${dbVal.toFixed(1)} dB`, chartLeft, 76);
+        ctx.font = '700 32px "JetBrains Mono", monospace';
+        ctx.fillText(`${dbVal.toFixed(1)} dB`, chartLeft, 72);
 
         ctx.fillStyle = '#a1a1aa';
-        ctx.font = '500 11px "JetBrains Mono", monospace';
+        ctx.font = '500 10.5px "JetBrains Mono", monospace';
         const modeText = audioConnected
           ? 'MICROPHONE ONLY · LIVE ACOUSTIC & VOICE AI'
-          : 'MICROPHONE ONLY · STANDBY (CLICK CONNECT MIC OR INSPECT)';
-        ctx.fillText(modeText, chartLeft + 180, 68);
+          : 'MICROPHONE ONLY · STANDBY (CLICK CONNECT LIVE MIC)';
+        ctx.fillText(modeText, chartLeft, 94, Math.max(180, chartW - 16));
 
         // Live speech cue line
         const transcript = liveTranscriptRef.current.trim();
@@ -1563,10 +1735,14 @@ export function CameraFeedCard({
           video.readyState >= 2 &&
           video.videoWidth > 0;
 
+        let activeSourceMedia: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement | null = null;
+        let activeSourceW = 0;
+        let activeSourceH = 0;
+
         if (hasVideoFeed && video) {
-          const drawRect = computeContainDrawRect(video.videoWidth, video.videoHeight, width, height);
-          lastDrawRectRef.current = drawRect;
-          ctx.drawImage(video, drawRect.x, drawRect.y, drawRect.width, drawRect.height);
+          activeSourceMedia = video;
+          activeSourceW = video.videoWidth;
+          activeSourceH = video.videoHeight;
           if (!hasLiveFrameRef.current) {
             hasLiveFrameRef.current = true;
             setHasLiveSignal(true);
@@ -1576,20 +1752,9 @@ export function CameraFeedCard({
           loadedImageRef.current.complete &&
           loadedImageRef.current.naturalWidth > 0
         ) {
-          const drawRect = computeContainDrawRect(
-            loadedImageRef.current.naturalWidth,
-            loadedImageRef.current.naturalHeight,
-            width,
-            height
-          );
-          lastDrawRectRef.current = drawRect;
-          ctx.drawImage(
-            loadedImageRef.current,
-            drawRect.x,
-            drawRect.y,
-            drawRect.width,
-            drawRect.height
-          );
+          activeSourceMedia = loadedImageRef.current;
+          activeSourceW = loadedImageRef.current.naturalWidth;
+          activeSourceH = loadedImageRef.current.naturalHeight;
           if (!hasLiveFrameRef.current) {
             hasLiveFrameRef.current = true;
             setHasLiveSignal(true);
@@ -1599,16 +1764,14 @@ export function CameraFeedCard({
           (Boolean(liveMediaStream?.active) &&
             liveMediaStream!.getVideoTracks().some((t) => t.readyState === 'live'))
         ) {
-          // Hold last frame seamlessly while looping video seeks or live stream negotiates resolution
           if (
             rawCaptureCanvasRef.current &&
             rawCaptureCanvasRef.current.width > 0 &&
             rawCaptureCanvasRef.current.height > 0
           ) {
-            const held = rawCaptureCanvasRef.current;
-            const drawRect = computeContainDrawRect(held.width, held.height, width, height);
-            lastDrawRectRef.current = drawRect;
-            ctx.drawImage(held, drawRect.x, drawRect.y, drawRect.width, drawRect.height);
+            activeSourceMedia = rawCaptureCanvasRef.current;
+            activeSourceW = rawCaptureCanvasRef.current.width;
+            activeSourceH = rawCaptureCanvasRef.current.height;
           } else {
             ctx.fillStyle = '#0D131D';
             ctx.fillRect(0, 0, width, height);
@@ -1639,10 +1802,88 @@ export function CameraFeedCard({
           ctx.fillText(message, Math.max(20, (width - m.width) / 2), height / 2);
         }
 
+        const trackedSubjects = trackedSubjectsRef.current;
+        const allowPtzHere = getAdaptiveRenderProfile(visibleCameraCount, isFocused).allowAutoPtzInset;
+        let ptzTargetSubj: TrackedSubject | null = null;
+
+        if (activeSourceMedia && activeSourceW > 0 && activeSourceH > 0) {
+          const drawRect = computeContainDrawRect(activeSourceW, activeSourceH, width, height);
+          lastDrawRectRef.current = drawRect;
+
+          // Broadcast-grade Full-Frame Digital Auto-PTZ:
+          // Smoothly zooms & tracks locked person with exact aspect ratio preservation & zero jitter.
+          // Automatically eases back to full wide view while picking a person or drawing a zone.
+          const shouldTrackPtz =
+            allowPtzHere &&
+            ptzAutoTrackEnabledRef.current &&
+            pickModeRef.current === null &&
+            !isDrawingZoneRef.current &&
+            trackedSubjects.length > 0;
+
+          if (shouldTrackPtz) {
+            ptzTargetSubj =
+              trackedSubjects.find((s) => s.id === lockedPtzSubjectIdRef.current) ||
+              trackedSubjects.find((s) => Boolean(s.matchedWatchlistId)) ||
+              trackedSubjects[0];
+
+            const srcAspect = activeSourceW / Math.max(1, activeSourceH);
+            const destAspect = drawRect.width / Math.max(1, drawRect.height);
+            ptzViewportRef.current = computeSmoothPtzViewport(
+              ptzTargetSubj.box_2d,
+              ptzViewportRef.current,
+              0.1,
+              {
+                sourceAspect: srcAspect,
+                targetAspect: destAspect,
+                centerDeadband: 18,
+                spanDeadband: 34,
+              }
+            );
+          } else {
+            ptzViewportRef.current = easePtzViewportToFull(ptzViewportRef.current, 0.16);
+          }
+
+          const activePtz = ptzViewportRef.current;
+          if (activePtz) {
+            const cropX = Math.max(0, (activePtz.xmin / 1000) * activeSourceW);
+            const cropY = Math.max(0, (activePtz.ymin / 1000) * activeSourceH);
+            const cropW = Math.max(
+              16,
+              Math.min(activeSourceW - cropX, ((activePtz.xmax - activePtz.xmin) / 1000) * activeSourceW)
+            );
+            const cropH = Math.max(
+              16,
+              Math.min(activeSourceH - cropY, ((activePtz.ymax - activePtz.ymin) / 1000) * activeSourceH)
+            );
+            ctx.drawImage(
+              activeSourceMedia,
+              cropX,
+              cropY,
+              cropW,
+              cropH,
+              drawRect.x,
+              drawRect.y,
+              drawRect.width,
+              drawRect.height
+            );
+          } else {
+            ctx.drawImage(
+              activeSourceMedia,
+              drawRect.x,
+              drawRect.y,
+              drawRect.width,
+              drawRect.height
+            );
+          }
+        } else {
+          ptzViewportRef.current = null;
+        }
+
         const activeRect = lastDrawRectRef.current;
+        const activePtz = ptzViewportRef.current;
 
         // Spatial Activity Dwell Heatmap overlay (real accumulated person coordinates)
-        if (heatmapEnabledRef.current) {
+        if (heatmapEnabledRef.current && !activePtz) {
           const grid = heatmapGridRef.current;
           const cellW = activeRect.width / HEATMAP_COLS;
           const cellH = activeRect.height / HEATMAP_ROWS;
@@ -1662,39 +1903,62 @@ export function CameraFeedCard({
           }
         }
 
-        // Real-time Movement Trajectory Trails for every persistent tracked subject
-        const trackedSubjects = trackedSubjectsRef.current;
+        // Nose-Anchored Movement Trajectory Trails (for selected specific person(s) or everyone)
         if (hasLiveFrameRef.current && trailsEnabledRef.current && trackedSubjects.length > 0) {
-          trackedSubjects.forEach((subj) => {
-            if (subj.trail.length < 2) return;
+          const selectedIds = selectedTrailSubjectIdsRef.current;
+          const trailSubjects =
+            selectedIds.length > 0
+              ? trackedSubjects.filter((s) => selectedIds.includes(s.id))
+              : trackedSubjects;
+
+          trailSubjects.forEach((subj) => {
+            const liveNose = computeNoseAnchor(subj.box_2d);
+            const rawPts = subj.trail.length > 0 ? [...subj.trail, liveNose] : [liveNose];
             const isWatchlistHit = Boolean(subj.matchedWatchlistId);
+            const isPinnedTrail = selectedIds.includes(subj.id);
+
             ctx.save();
             ctx.lineCap = 'round';
             ctx.lineJoin = 'round';
-            for (let i = 1; i < subj.trail.length; i += 1) {
-              const prevPt = subj.trail[i - 1];
-              const currPt = subj.trail[i];
-              const alpha = (i / subj.trail.length) * 0.85;
-              const px1 = activeRect.x + (prevPt.x / 1000) * activeRect.width;
-              const py1 = activeRect.y + (prevPt.y / 1000) * activeRect.height;
-              const px2 = activeRect.x + (currPt.x / 1000) * activeRect.width;
-              const py2 = activeRect.y + (currPt.y / 1000) * activeRect.height;
-              ctx.strokeStyle = isWatchlistHit
-                ? `rgba(239, 68, 68, ${alpha.toFixed(2)})`
-                : `rgba(56, 189, 248, ${alpha.toFixed(2)})`;
-              ctx.lineWidth = 2.5;
-              ctx.beginPath();
-              ctx.moveTo(px1, py1);
-              ctx.lineTo(px2, py2);
-              ctx.stroke();
+
+            if (rawPts.length >= 2) {
+              for (let i = 1; i < rawPts.length; i += 1) {
+                const prevPt = mapPointThroughPtzViewport(rawPts[i - 1], activePtz);
+                const currPt = mapPointThroughPtzViewport(rawPts[i], activePtz);
+                const alpha = 0.22 + (i / rawPts.length) * 0.78;
+                const px1 = activeRect.x + (prevPt.x / 1000) * activeRect.width;
+                const py1 = activeRect.y + (prevPt.y / 1000) * activeRect.height;
+                const px2 = activeRect.x + (currPt.x / 1000) * activeRect.width;
+                const py2 = activeRect.y + (currPt.y / 1000) * activeRect.height;
+                ctx.strokeStyle = isWatchlistHit
+                  ? `rgba(239, 68, 68, ${alpha.toFixed(2)})`
+                  : isPinnedTrail
+                    ? `rgba(16, 185, 129, ${alpha.toFixed(2)})`
+                    : `rgba(56, 189, 248, ${alpha.toFixed(2)})`;
+                ctx.lineWidth = isPinnedTrail ? 3 : 2.5;
+                ctx.beginPath();
+                ctx.moveTo(px1, py1);
+                ctx.lineTo(px2, py2);
+                ctx.stroke();
+              }
             }
-            const head = subj.trail[subj.trail.length - 1];
-            const hx = activeRect.x + (head.x / 1000) * activeRect.width;
-            const hy = activeRect.y + (head.y / 1000) * activeRect.height;
-            ctx.fillStyle = isWatchlistHit ? '#ef4444' : '#38bdf8';
+
+            // Crisp nose anchor dot & halo locked directly on the subject's nose
+            const headPt = mapPointThroughPtzViewport(liveNose, activePtz);
+            const hx = activeRect.x + (headPt.x / 1000) * activeRect.width;
+            const hy = activeRect.y + (headPt.y / 1000) * activeRect.height;
+            const anchorColor = isWatchlistHit ? '#ef4444' : isPinnedTrail ? '#10b981' : '#38bdf8';
+
+            ctx.fillStyle = anchorColor;
             ctx.beginPath();
-            ctx.arc(hx, hy, 3.5, 0, Math.PI * 2);
+            ctx.arc(hx, hy, 4, 0, Math.PI * 2);
             ctx.fill();
+
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.arc(hx, hy, 6.5, 0, Math.PI * 2);
+            ctx.stroke();
             ctx.restore();
           });
         }
@@ -1702,7 +1966,10 @@ export function CameraFeedCard({
         // Draw active Restricted Perimeter Zone or in-progress drag preview
         const activePerimeter = perimeterZoneRef.current;
         if (activePerimeter) {
-          const pRect = mapNormalizedBoxToRect(activePerimeter.box_2d, activeRect);
+          const pRect = mapNormalizedBoxToRect(
+            mapBoxThroughPtzViewport(activePerimeter.box_2d, activePtz),
+            activeRect
+          );
           const isBreached = perimeterBreachedRef.current;
           ctx.save();
           ctx.fillStyle = isBreached ? 'rgba(220, 38, 38, 0.28)' : 'rgba(245, 158, 11, 0.14)';
@@ -1740,186 +2007,212 @@ export function CameraFeedCard({
           ctx.restore();
         }
 
-        // Draw grounded AI person bounding boxes with persistent Subject ID, Dwell Time & Watchlist Re-ID
-        const boxes = detectedPeopleRef.current;
-        if (hasLiveFrameRef.current && Array.isArray(boxes) && boxes.length > 0) {
-          const isCritical = cameraStatusRef.current === 'fighting';
-          const isBullying = threatCategoryRef.current === 'bullying';
+        // Interactive ONLY-BODY Picker Mode (Trail / Flag / PTZ):
+        // Everyone's BODY ONLY turns GREEN; hovered person's BODY ONLY turns RED (zero square boxes!)
+        const activePickMode = pickModeRef.current;
+        if (activePickMode !== null && hasLiveFrameRef.current && trackedSubjects.length > 0) {
+          const livePointerHitId = lastPickerPointerPxRef.current
+            ? findHoveredBodySubject(lastPickerPointerPxRef.current, trackedSubjects, activeRect)?.id ??
+              null
+            : null;
+          const effectiveHoveredId = livePointerHitId ?? hoveredSubjectIdRef.current;
 
-          boxes.forEach((person, idx) => {
-            const matchedSubj = trackedSubjects[idx];
-            const isWatchlistHit = Boolean(matchedSubj?.matchedWatchlistId);
-            const mapped = mapNormalizedBoxToRect(person.box_2d, activeRect);
-            const x = Math.max(2, Math.min(width - 18, mapped.x));
-            const y = Math.max(32, Math.min(height - 38, mapped.y));
-            const bw = Math.max(16, Math.min(width - x - 2, mapped.width));
-            const bh = Math.max(16, Math.min(height - y - 2, mapped.height));
+          trackedSubjects.forEach((subj) => {
+            const mapped = mapNormalizedBoxToRect(
+              mapBoxThroughPtzViewport(subj.box_2d, activePtz),
+              activeRect
+            );
+            const isHovered = effectiveHoveredId === subj.id;
+            const isSelected =
+              activePickMode === 'trail' && selectedTrailSubjectIdsRef.current.includes(subj.id);
+            const label = isHovered
+              ? activePickMode === 'flag'
+                ? `FLAG ${subj.id}`
+                : activePickMode === 'ptz'
+                  ? `LOCK PTZ · ${subj.id}`
+                  : isSelected
+                    ? `REMOVE TRAIL · ${subj.id}`
+                    : `NOSE TRAIL · ${subj.id}`
+              : isSelected
+                ? `${subj.id} · TRAIL ON`
+                : subj.id;
 
-            const isOccluded = Boolean(person.faceOccluded);
-            const strokeColor = isWatchlistHit
-              ? '#ef4444'
-              : isBullying
-                ? '#f97316'
-                : isCritical
-                  ? '#ef4444'
-                  : isOccluded
-                    ? '#38bdf8'
-                    : '#10b981';
-            const fillTint = isWatchlistHit
-              ? 'rgba(239, 68, 68, 0.18)'
-              : isBullying
-                ? 'rgba(249, 115, 22, 0.14)'
-                : isCritical
-                  ? 'rgba(239, 68, 68, 0.14)'
-                  : isOccluded
-                    ? 'rgba(56, 189, 248, 0.12)'
-                    : 'rgba(16, 185, 129, 0.10)';
-            const tagBg = isWatchlistHit
-              ? 'rgba(220, 38, 38, 0.95)'
-              : isBullying
-                ? 'rgba(194, 65, 12, 0.92)'
-                : isCritical
-                  ? 'rgba(185, 28, 28, 0.92)'
-                  : isOccluded
-                    ? 'rgba(3, 105, 161, 0.92)'
-                    : 'rgba(6, 95, 70, 0.90)';
-
-            ctx.fillStyle = fillTint;
-            ctx.fillRect(x, y, bw, bh);
-
-            ctx.strokeStyle = strokeColor;
-            ctx.lineWidth = isWatchlistHit ? 2.5 : 2;
-            if (isOccluded && !isCritical && !isWatchlistHit) {
-              ctx.setLineDash([6, 4]);
-            }
-            ctx.strokeRect(x, y, bw, bh);
-            ctx.setLineDash([]);
-
-            const corner = Math.min(12, Math.floor(Math.min(bw, bh) / 3));
-            ctx.lineWidth = 3.5;
-            ctx.beginPath();
-            ctx.moveTo(x, y + corner);
-            ctx.lineTo(x, y);
-            ctx.lineTo(x + corner, y);
-            ctx.moveTo(x + bw - corner, y);
-            ctx.lineTo(x + bw, y);
-            ctx.lineTo(x + bw, y + corner);
-            ctx.moveTo(x, y + bh - corner);
-            ctx.lineTo(x, y + bh);
-            ctx.lineTo(x + corner, y + bh);
-            ctx.moveTo(x + bw - corner, y + bh);
-            ctx.lineTo(x + bw, y + bh);
-            ctx.lineTo(x + bw, y + bh - corner);
-            ctx.stroke();
-
-            const subjectPrefix = matchedSubj ? matchedSubj.id : `#${idx + 1}`;
-            const dwellSuffix =
-              matchedSubj && matchedSubj.dwellSeconds > 0 ? ` · ${matchedSubj.dwellSeconds}s` : '';
-            const tagText = isWatchlistHit
-              ? `WATCHLIST: ${matchedSubj?.matchedWatchlistLabel} ${matchedSubj?.matchedSimilarity}%`
-              : isOccluded
-                ? `${subjectPrefix}${dwellSuffix} · OCCLUDED`
-                : `${subjectPrefix}${dwellSuffix} · ${person.confidence}%`;
-            ctx.font = '600 11px "JetBrains Mono", monospace';
-            const textW = ctx.measureText(tagText).width;
-            const tagW = Math.min(width - 8, Math.ceil(textW) + 12);
-            const tagX = Math.max(4, Math.min(x, width - tagW - 4));
-            const rawTagY = y >= 54 ? y - 20 : Math.min(height - 54, y + 4);
-            let tagY = Math.max(34, Math.min(height - 54, rawTagY));
-            if (tagY < 88 && tagX + tagW > width - 150) {
-              tagY = Math.min(height - 54, Math.max(90, y + 6));
-            }
-            ctx.fillStyle = tagBg;
-            ctx.fillRect(tagX, tagY, tagW, 18);
-            ctx.fillStyle = '#ffffff';
-            ctx.fillText(tagText, tagX + 6, tagY + 13, tagW - 12);
+            drawBodyOnlyHighlight(ctx, mapped, {
+              isHovered,
+              isSelected,
+              label,
+            });
           });
+        } else {
+          // Standard grounded AI person bounding boxes with persistent Subject ID, Dwell Time & Watchlist Re-ID
+          const boxes = detectedPeopleRef.current;
+          if (hasLiveFrameRef.current && Array.isArray(boxes) && boxes.length > 0) {
+            const isCritical = cameraStatusRef.current === 'fighting';
+            const isBullying = threatCategoryRef.current === 'bullying';
+
+            const isCrowdView = boxes.length >= 12;
+
+            boxes.forEach((person, idx) => {
+              const matchedSubj = trackedSubjects[idx];
+              const isWatchlistHit = Boolean(matchedSubj?.matchedWatchlistId);
+              const mapped = mapNormalizedBoxToRect(
+                mapBoxThroughPtzViewport(person.box_2d, activePtz),
+                activeRect
+              );
+              const x = Math.max(2, Math.min(width - 14, mapped.x));
+              const y = Math.max(30, Math.min(height - 34, mapped.y));
+              const bw = Math.max(12, Math.min(width - x - 2, mapped.width));
+              const bh = Math.max(14, Math.min(height - y - 2, mapped.height));
+
+              const isOccluded = Boolean(person.faceOccluded);
+              const strokeColor = isWatchlistHit
+                ? '#ef4444'
+                : isBullying
+                  ? '#f97316'
+                  : isCritical
+                    ? '#ef4444'
+                    : isOccluded
+                      ? '#38bdf8'
+                      : '#10b981';
+              const fillTint = isWatchlistHit
+                ? 'rgba(239, 68, 68, 0.18)'
+                : isCrowdView
+                  ? 'rgba(16, 185, 129, 0.06)'
+                  : isBullying
+                    ? 'rgba(249, 115, 22, 0.14)'
+                    : isCritical
+                      ? 'rgba(239, 68, 68, 0.14)'
+                      : isOccluded
+                        ? 'rgba(56, 189, 248, 0.12)'
+                        : 'rgba(16, 185, 129, 0.10)';
+              const tagBg = isWatchlistHit
+                ? 'rgba(220, 38, 38, 0.95)'
+                : isBullying
+                  ? 'rgba(194, 65, 12, 0.92)'
+                  : isCritical
+                    ? 'rgba(185, 28, 28, 0.92)'
+                    : isOccluded
+                      ? 'rgba(3, 105, 161, 0.92)'
+                      : 'rgba(6, 95, 70, 0.88)';
+
+              ctx.fillStyle = fillTint;
+              ctx.fillRect(x, y, bw, bh);
+
+              ctx.strokeStyle = strokeColor;
+              ctx.lineWidth = isWatchlistHit ? 2.5 : isCrowdView ? 1.35 : 2;
+              if (isOccluded && !isCritical && !isWatchlistHit) {
+                ctx.setLineDash([6, 4]);
+              }
+              ctx.strokeRect(x, y, bw, bh);
+              ctx.setLineDash([]);
+
+              if (!isCrowdView || isWatchlistHit) {
+                const corner = Math.min(12, Math.floor(Math.min(bw, bh) / 3));
+                ctx.lineWidth = 3.5;
+                ctx.beginPath();
+                ctx.moveTo(x, y + corner);
+                ctx.lineTo(x, y);
+                ctx.lineTo(x + corner, y);
+                ctx.moveTo(x + bw - corner, y);
+                ctx.lineTo(x + bw, y);
+                ctx.lineTo(x + bw, y + corner);
+                ctx.moveTo(x, y + bh - corner);
+                ctx.lineTo(x, y + bh);
+                ctx.lineTo(x + corner, y + bh);
+                ctx.moveTo(x + bw - corner, y + bh);
+                ctx.lineTo(x + bw, y + bh);
+                ctx.lineTo(x + bw, y + bh - corner);
+                ctx.stroke();
+              }
+
+              const subjectPrefix = matchedSubj ? matchedSubj.id : `#${idx + 1}`;
+              const dwellSuffix =
+                matchedSubj && matchedSubj.dwellSeconds > 0 ? ` · ${matchedSubj.dwellSeconds}s` : '';
+              const tagText = isWatchlistHit
+                ? `WATCHLIST: ${matchedSubj?.matchedWatchlistLabel} ${matchedSubj?.matchedSimilarity}%`
+                : isCrowdView
+                  ? `${idx + 1}`
+                  : isOccluded
+                    ? `${subjectPrefix}${dwellSuffix} · OCCLUDED`
+                    : `${subjectPrefix}${dwellSuffix} · ${person.confidence}%`;
+
+              ctx.font = isCrowdView && !isWatchlistHit
+                ? '700 8.5px "JetBrains Mono", monospace'
+                : '600 11px "JetBrains Mono", monospace';
+              const tagH = isCrowdView && !isWatchlistHit ? 12 : 18;
+              const padX = isCrowdView && !isWatchlistHit ? 3 : 6;
+              const textW = ctx.measureText(tagText).width;
+              const tagW = Math.min(width - 8, Math.ceil(textW) + padX * 2);
+              const tagX = Math.max(2, Math.min(x, width - tagW - 2));
+              const rawTagY = y >= 50 ? y - tagH - 1 : Math.min(height - 44, y + 2);
+              let tagY = Math.max(30, Math.min(height - 44, rawTagY));
+              if (!isCrowdView && tagY < 88 && tagX + tagW > width - 150) {
+                tagY = Math.min(height - 54, Math.max(90, y + 6));
+              }
+              ctx.fillStyle = tagBg;
+              ctx.fillRect(tagX, tagY, tagW, tagH);
+              ctx.fillStyle = '#ffffff';
+              ctx.fillText(tagText, tagX + padX, tagY + (isCrowdView && !isWatchlistHit ? 9 : 13), tagW - padX * 2);
+            });
+          }
         }
 
-        // Real Digital Auto-PTZ Close-Up Picture-in-Picture (smoothly tracks locked/active subject)
-        if (hasLiveFrameRef.current && ptzAutoTrackEnabledRef.current && trackedSubjects.length > 0) {
-          const targetSubj =
-            trackedSubjects.find((s) => s.id === lockedPtzSubjectIdRef.current) ||
-            trackedSubjects.find((s) => Boolean(s.matchedWatchlistId)) ||
-            trackedSubjects[0];
+        // Clean Wide-Angle Room Radar Mini-Map when Full-Frame Auto-PTZ is actively zoomed in
+        if (
+          activePtz &&
+          ptzAutoTrackEnabledRef.current &&
+          ptzTargetSubj &&
+          activeSourceMedia &&
+          activeSourceW > 0 &&
+          activeSourceH > 0
+        ) {
+          const mapMaxW = 136;
+          const mapMaxH = 78;
+          const mapFit = computeContainDrawRect(activeSourceW, activeSourceH, mapMaxW, mapMaxH);
+          const mapW = Math.max(64, Math.round(mapFit.width));
+          const mapH = Math.max(44, Math.round(mapFit.height));
+          const mapX = width - mapW - 10;
+          const mapY = height - mapH - 36;
+          const isHit = Boolean(ptzTargetSubj.matchedWatchlistId);
 
-          const srcMedia: HTMLVideoElement | HTMLImageElement | null =
-            hasVideoFeed && video
-              ? video
-              : loadedImageRef.current &&
-                  loadedImageRef.current.complete &&
-                  loadedImageRef.current.naturalWidth > 0
-                ? loadedImageRef.current
-                : null;
+          ctx.save();
+          ctx.fillStyle = 'rgba(9, 12, 18, 0.88)';
+          ctx.fillRect(mapX - 2, mapY - 17, mapW + 4, mapH + 19);
 
-          if (targetSubj && srcMedia) {
-            const srcW =
-              srcMedia instanceof HTMLVideoElement ? srcMedia.videoWidth : srcMedia.naturalWidth;
-            const srcH =
-              srcMedia instanceof HTMLVideoElement ? srcMedia.videoHeight : srcMedia.naturalHeight;
+          ctx.globalAlpha = 0.88;
+          ctx.drawImage(activeSourceMedia, mapX, mapY, mapW, mapH);
+          ctx.globalAlpha = 1;
 
-            if (srcW > 0 && srcH > 0) {
-              const vp = computeSmoothPtzViewport(targetSubj.box_2d, ptzViewportRef.current, 0.24);
-              ptzViewportRef.current = vp;
+          // Live PTZ zoom frame box inside the wide-angle radar mini-map
+          const fx = mapX + (activePtz.xmin / 1000) * mapW;
+          const fy = mapY + (activePtz.ymin / 1000) * mapH;
+          const fw = ((activePtz.xmax - activePtz.xmin) / 1000) * mapW;
+          const fh = ((activePtz.ymax - activePtz.ymin) / 1000) * mapH;
+          ctx.strokeStyle = isHit ? '#ef4444' : '#38bdf8';
+          ctx.lineWidth = 1.75;
+          ctx.strokeRect(fx, fy, fw, fh);
 
-              const cropX = Math.max(0, Math.floor((vp.xmin / 1000) * srcW));
-              const cropY = Math.max(0, Math.floor((vp.ymin / 1000) * srcH));
-              const cropW = Math.max(16, Math.min(srcW - cropX, Math.floor(((vp.xmax - vp.xmin) / 1000) * srcW)));
-              const cropH = Math.max(16, Math.min(srcH - cropY, Math.floor(((vp.ymax - vp.ymin) / 1000) * srcH)));
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(mapX - 1, mapY - 16, mapW + 2, mapH + 17);
 
-              const pipW = 192;
-              const pipH = 112;
-              const pipX = width - pipW - 10;
-              const pipY = height - pipH - 36;
-              const isHit = Boolean(targetSubj.matchedWatchlistId);
-
-              ctx.save();
-              ctx.fillStyle = '#09090b';
-              ctx.fillRect(pipX - 2, pipY - 18, pipW + 4, pipH + 20);
-              ctx.drawImage(srcMedia, cropX, cropY, cropW, cropH, pipX, pipY, pipW, pipH);
-
-              // Crisp PTZ reticle + header strip
-              ctx.strokeStyle = isHit ? '#ef4444' : '#38bdf8';
-              ctx.lineWidth = 1.5;
-              ctx.strokeRect(pipX - 1, pipY - 17, pipW + 2, pipH + 18);
-
-              ctx.fillStyle = isHit ? 'rgba(185, 28, 28, 0.94)' : 'rgba(9, 12, 18, 0.92)';
-              ctx.fillRect(pipX - 1, pipY - 17, pipW + 2, 17);
-
-              ctx.fillStyle = '#ffffff';
-              ctx.font = '700 9px "JetBrains Mono", monospace';
-              const ptzLabel = isHit
-                ? `PTZ LOCK · ${targetSubj.matchedWatchlistLabel?.slice(0, 12)} · ${vp.zoomFactor}x`
-                : `AUTO-PTZ · ${targetSubj.id} · ${vp.zoomFactor}x`;
-              ctx.fillText(ptzLabel, pipX + 5, pipY - 5, pipW - 10);
-
-              // Subtle optical center crosshair inside PiP
-              const cx = pipX + pipW / 2;
-              const cy = pipY + pipH / 2;
-              ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
-              ctx.lineWidth = 1;
-              ctx.beginPath();
-              ctx.moveTo(cx - 8, cy);
-              ctx.lineTo(cx - 3, cy);
-              ctx.moveTo(cx + 3, cy);
-              ctx.lineTo(cx + 8, cy);
-              ctx.moveTo(cx, cy - 8);
-              ctx.lineTo(cx, cy - 3);
-              ctx.moveTo(cx, cy + 3);
-              ctx.lineTo(cx, cy + 8);
-              ctx.stroke();
-              ctx.restore();
-            }
-          }
-        } else if (trackedSubjects.length === 0) {
-          ptzViewportRef.current = null;
+          ctx.fillStyle = isHit ? 'rgba(185, 28, 28, 0.94)' : 'rgba(9, 12, 18, 0.94)';
+          ctx.fillRect(mapX - 1, mapY - 16, mapW + 2, 16);
+          ctx.fillStyle = '#ffffff';
+          ctx.font = '700 8.5px "JetBrains Mono", monospace';
+          const ptzBadge = `PTZ ${activePtz.zoomFactor.toFixed(1)}x · ${ptzTargetSubj.id}`;
+          ctx.fillText(ptzBadge, mapX + 4, mapY - 5, mapW - 8);
+          ctx.restore();
         }
 
         // Draw crimson bounding boxes for any detected weapon objects
         const weapons = detectedObjectsRef.current;
         if (hasLiveFrameRef.current && Array.isArray(weapons) && weapons.length > 0) {
           weapons.forEach((weapon) => {
-            const mapped = mapNormalizedBoxToRect(weapon.box_2d, activeRect);
+            const mapped = mapNormalizedBoxToRect(
+              mapBoxThroughPtzViewport(weapon.box_2d, activePtz),
+              activeRect
+            );
             const x = Math.max(2, Math.min(width - 18, mapped.x));
             const y = Math.max(32, Math.min(height - 38, mapped.y));
             const bw = Math.max(16, Math.min(width - x - 2, mapped.width));
@@ -1960,9 +2253,23 @@ export function CameraFeedCard({
       ctx.fillText(timeLabel, width - timeMetrics.width - 10, 18);
     };
 
+    const targetProfile = getAdaptiveRenderProfile(visibleCameraCount, isFocused);
+    const minFrameMs = Math.max(33, Math.round(1000 / Math.min(30, targetProfile.targetFps)));
+    let rafId = 0;
+    let lastDrawnAt = 0;
+
+    const rafLoop = (now: number) => {
+      rafId = window.requestAnimationFrame(rafLoop);
+      if (document.hidden) return;
+      if (now - lastDrawnAt >= minFrameMs) {
+        lastDrawnAt = now;
+        drawFrame(now);
+      }
+    };
+
     drawFrame(performance.now());
-    const intervalId = window.setInterval(() => drawFrame(performance.now()), 90);
-    return () => window.clearInterval(intervalId);
+    rafId = window.requestAnimationFrame(rafLoop);
+    return () => window.cancelAnimationFrame(rafId);
   }, [
     camera.bluetoothDeviceName,
     camera.cameraCode,
@@ -1970,7 +2277,9 @@ export function CameraFeedCard({
     camera.customMediaUrl,
     camera.sourceKind,
     isAudioOnly,
+    isFocused,
     liveMediaStream,
+    visibleCameraCount,
   ]);
 
   useEffect(() => {
@@ -2248,8 +2557,13 @@ export function CameraFeedCard({
           width={1280}
           height={720}
           data-testid={`camera-canvas-${camera.id}`}
+          data-pick-mode={pickMode ?? 'none'}
+          data-hovered-subject={hoveredSubjectId ?? ''}
+          data-trail-targets={selectedTrailSubjectIds.join(',')}
+          data-ptz-active={ptzAutoTrackEnabled ? 'true' : 'false'}
           onPointerDown={handleCanvasPointerDown}
           onPointerMove={handleCanvasPointerMove}
+          onPointerLeave={handleCanvasPointerLeave}
           onPointerUp={handleCanvasPointerUp}
           aria-label={
             isAudioOnly
@@ -2257,9 +2571,65 @@ export function CameraFeedCard({
               : `Live CCTV feed for ${camera.classroomName}`
           }
           className={`w-full h-full object-cover block relative z-10 ${
-            isDrawingZone ? 'cursor-crosshair touch-none' : ''
+            isDrawingZone || pickMode !== null ? 'cursor-crosshair touch-none' : ''
           }`}
         />
+
+        {pickMode !== null ? (
+          <div
+            data-testid={`camera-picker-banner-${camera.id}`}
+            className="absolute top-9 left-2.5 z-20 flex flex-wrap items-center gap-1.5 rounded-md bg-zinc-950/92 border border-emerald-500/70 px-2.5 py-1.5 text-[11px] font-medium text-white shadow-lg max-w-[calc(100%-5.5rem)]"
+          >
+            <span className="text-emerald-300 font-semibold">
+              {pickMode === 'trail'
+                ? 'Nose Trail Picker:'
+                : pickMode === 'flag'
+                  ? 'Flag Person Picker:'
+                  : 'Auto-PTZ Target:'}
+            </span>
+            <span className="text-zinc-200">
+              {hoveredSubjectId
+                ? `Click red body (${hoveredSubjectId})`
+                : 'Hover body (turns red) & click'}
+            </span>
+            {pickMode === 'trail' ? (
+              <button
+                type="button"
+                onClick={() => {
+                  selectedTrailSubjectIdsRef.current = [];
+                  setSelectedTrailSubjectIds([]);
+                  onUpdateCameraSettings(camera.id, { trailsEnabled: true });
+                  showPickFeedback('Nose trails active on all people');
+                }}
+                className="px-1.5 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-[10px] font-semibold text-zinc-100 cursor-pointer"
+              >
+                All
+              </button>
+            ) : null}
+            <button
+              type="button"
+              onClick={() => {
+                hoveredSubjectIdRef.current = null;
+                setHoveredSubjectId(null);
+                setPickMode(null);
+              }}
+              aria-label="Close person picker"
+              className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 text-[10px] font-semibold text-white cursor-pointer"
+            >
+              <X className="w-3 h-3" aria-hidden="true" />
+              <span>Done</span>
+            </button>
+          </div>
+        ) : null}
+
+        {pickFeedback && pickMode === null ? (
+          <div
+            role="status"
+            className="pointer-events-none absolute top-9 left-2.5 z-20 rounded-md bg-zinc-950/90 border border-zinc-700 px-2.5 py-1 text-[11px] font-medium text-emerald-300"
+          >
+            {pickFeedback}
+          </div>
+        ) : null}
 
         {isDrawingZone ? (
           <div className="pointer-events-none absolute top-9 left-2.5 z-20 rounded bg-amber-950/90 border border-amber-500/60 px-2.5 py-1 text-[11px] font-medium text-amber-100">
@@ -2433,14 +2803,18 @@ export function CameraFeedCard({
           </p>
         </div>
 
-        <div className="flex items-center gap-1.5 shrink-0">
+        <div className="flex flex-wrap items-center gap-1.5 min-w-0">
           <button
             type="button"
             onClick={() => onAnalyzeCamera(camera.id, false)}
             disabled={camera.isAnalyzing}
             aria-label={`Scan AI safety for ${camera.classroomName}`}
             title="Scan frame now"
-            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-md bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50 transition-colors whitespace-nowrap cursor-pointer"
+            className={`inline-flex items-center gap-1 font-semibold rounded-md bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50 transition-colors whitespace-nowrap cursor-pointer ${
+              !isFocused && visibleCameraCount >= 5
+                ? 'px-2 py-1 text-[11px]'
+                : 'px-2.5 py-1.5 text-xs'
+            }`}
           >
             <ScanSearch className="w-3.5 h-3.5" aria-hidden="true" />
             <span className="hidden sm:inline">{camera.isAnalyzing ? 'Scanning' : 'Scan'}</span>
@@ -2455,7 +2829,11 @@ export function CameraFeedCard({
                 : `Listen via microphone on ${camera.classroomName}`
             }
             title={micActive ? 'Stop live mic' : 'Enable live mic'}
-            className={`inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
+            className={`inline-flex items-center gap-1 font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
+              !isFocused && visibleCameraCount >= 5
+                ? 'px-1.5 py-1 text-[11px]'
+                : 'px-2 py-1.5 text-xs'
+            } ${
               micActive
                 ? 'bg-emerald-50 border-emerald-300 text-emerald-700'
                 : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-50'
@@ -2466,8 +2844,77 @@ export function CameraFeedCard({
             ) : (
               <MicOff className="w-3.5 h-3.5" aria-hidden="true" />
             )}
-            <span className="hidden xl:inline">{micActive ? 'Live' : 'Mic'}</span>
+            {isFocused || visibleCameraCount < 5 ? (
+              <span className="hidden xl:inline">{micActive ? 'Live' : 'Mic'}</span>
+            ) : null}
           </button>
+
+          {!isAudioOnly && hasLiveSignal && (isFocused || visibleCameraCount <= 4) ? (
+            <>
+              <button
+                type="button"
+                data-testid={`camera-trail-btn-${camera.id}`}
+                onClick={() => togglePickMode('trail')}
+                aria-pressed={pickMode === 'trail'}
+                aria-label={`Choose person for nose trail on ${camera.classroomName}`}
+                title="Pick specific person for nose-anchored trail (bodies turn green, red on hover)"
+                className={`inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
+                  pickMode === 'trail'
+                    ? 'bg-emerald-600 border-emerald-600 text-white'
+                    : selectedTrailSubjectIds.length > 0
+                      ? 'bg-emerald-50 border-emerald-300 text-emerald-700'
+                      : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-50'
+                }`}
+              >
+                <Route className="w-3.5 h-3.5" aria-hidden="true" />
+                <span className="hidden sm:inline">
+                  {selectedTrailSubjectIds.length > 0
+                    ? `Trail (${selectedTrailSubjectIds.length})`
+                    : 'Trail'}
+                </span>
+              </button>
+
+              {onEnrollLiveSubject ? (
+                <button
+                  type="button"
+                  data-testid={`camera-flag-btn-${camera.id}`}
+                  onClick={() => togglePickMode('flag')}
+                  aria-pressed={pickMode === 'flag'}
+                  aria-label={`Choose person to flag on ${camera.classroomName}`}
+                  title="Pick specific person to flag to Watchlist (bodies turn green, red on hover)"
+                  className={`inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
+                    pickMode === 'flag'
+                      ? 'bg-red-600 border-red-600 text-white'
+                      : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-50'
+                  }`}
+                >
+                  <UserPlus className="w-3.5 h-3.5" aria-hidden="true" />
+                  <span className="hidden sm:inline">Flag</span>
+                </button>
+              ) : null}
+
+              <button
+                type="button"
+                data-testid={`camera-ptz-btn-${camera.id}`}
+                onClick={() =>
+                  onUpdateCameraSettings(camera.id, {
+                    ptzAutoTrackEnabled: !ptzAutoTrackEnabled,
+                  })
+                }
+                aria-pressed={ptzAutoTrackEnabled}
+                aria-label={`Toggle smooth Auto-PTZ on ${camera.classroomName}`}
+                title="Smooth digital Auto-PTZ zoom tracking"
+                className={`inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
+                  ptzAutoTrackEnabled
+                    ? 'bg-blue-600 border-blue-600 text-white'
+                    : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-50'
+                }`}
+              >
+                <Focus className="w-3.5 h-3.5" aria-hidden="true" />
+                <span className="hidden sm:inline">PTZ</span>
+              </button>
+            </>
+          ) : null}
 
           {!isFocused ? (
             <button
@@ -2475,7 +2922,11 @@ export function CameraFeedCard({
               onClick={() => onToggleFocus(camera.id)}
               aria-label={`Open dedicated place for ${camera.classroomName}`}
               title="Inspect camera details"
-              className="inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 transition-colors whitespace-nowrap cursor-pointer"
+              className={`inline-flex items-center gap-1 font-medium rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 transition-colors whitespace-nowrap cursor-pointer ${
+                visibleCameraCount >= 5
+                  ? 'px-2 py-1 text-[11px]'
+                  : 'px-2 py-1.5 text-xs'
+              }`}
             >
               <FolderOpen className="w-3.5 h-3.5" aria-hidden="true" />
               <span className="hidden sm:inline">Inspect</span>
@@ -2485,16 +2936,23 @@ export function CameraFeedCard({
           <button
             type="button"
             aria-expanded={showAdvancedTools}
+            aria-label={`Advanced camera controls for ${camera.classroomName}`}
             onClick={() => setShowAdvancedTools((prev) => !prev)}
             title="Advanced tracking, Auto-PTZ, Heatmap, Perimeter Zone & DVR Clip tools"
-            className={`inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
+            className={`inline-flex items-center gap-1 font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
+              !isFocused && visibleCameraCount >= 5
+                ? 'px-1.5 py-1 text-[11px]'
+                : 'px-2 py-1.5 text-xs'
+            } ${
               showAdvancedTools
                 ? 'bg-slate-100 border-slate-400 text-slate-900'
                 : 'bg-white border-slate-300 text-slate-600 hover:bg-slate-50 hover:text-slate-900'
             }`}
           >
             <SlidersHorizontal className="w-3.5 h-3.5" aria-hidden="true" />
-            <span className="hidden sm:inline">Advanced</span>
+            {isFocused || visibleCameraCount < 5 ? (
+              <span className="hidden sm:inline">Advanced</span>
+            ) : null}
           </button>
 
           <button
@@ -2567,11 +3025,25 @@ export function CameraFeedCard({
 
                   <button
                     type="button"
+                    onClick={() => togglePickMode('ptz')}
+                    aria-pressed={pickMode === 'ptz'}
+                    aria-label={`Pick Auto-PTZ target person on ${camera.classroomName}`}
+                    className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-md border transition-colors cursor-pointer whitespace-nowrap ${
+                      pickMode === 'ptz'
+                        ? 'bg-blue-600 border-blue-600 text-white'
+                        : 'bg-white border-slate-300 text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <span>Pick PTZ Target</span>
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={() =>
                       onUpdateCameraSettings(camera.id, { trailsEnabled: !trailsEnabled })
                     }
                     aria-pressed={trailsEnabled}
-                    aria-label={`Toggle movement trajectory trails for ${camera.classroomName}`}
+                    aria-label={`Toggle nose-anchored movement trails for ${camera.classroomName}`}
                     className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-md border transition-colors cursor-pointer whitespace-nowrap ${
                       trailsEnabled
                         ? 'bg-blue-50 border-blue-300 text-blue-700'
@@ -2579,8 +3051,39 @@ export function CameraFeedCard({
                     }`}
                   >
                     <Route className="w-3 h-3" aria-hidden="true" />
-                    <span>Trails</span>
+                    <span>{trailsEnabled ? 'Nose Trails ON' : 'Nose Trails OFF'}</span>
                   </button>
+
+                  <button
+                    type="button"
+                    onClick={() => togglePickMode('trail')}
+                    aria-pressed={pickMode === 'trail'}
+                    aria-label={`Pick specific person for nose trail on ${camera.classroomName}`}
+                    className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-md border transition-colors cursor-pointer whitespace-nowrap ${
+                      pickMode === 'trail'
+                        ? 'bg-emerald-600 border-emerald-600 text-white'
+                        : 'bg-white border-slate-300 text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <span>Pick Trail Person</span>
+                  </button>
+
+                  {onEnrollLiveSubject ? (
+                    <button
+                      type="button"
+                      onClick={() => togglePickMode('flag')}
+                      aria-pressed={pickMode === 'flag'}
+                      aria-label={`Pick specific person to flag on ${camera.classroomName}`}
+                      className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-md border transition-colors cursor-pointer whitespace-nowrap ${
+                        pickMode === 'flag'
+                          ? 'bg-red-600 border-red-600 text-white'
+                          : 'bg-white border-slate-300 text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      <UserPlus className="w-3 h-3" aria-hidden="true" />
+                      <span>Pick Flag Person</span>
+                    </button>
+                  ) : null}
 
                   <button
                     type="button"
@@ -2852,3 +3355,5 @@ export function CameraFeedCard({
     </article>
   );
 }
+
+export const CameraFeedCard = memo(CameraFeedCardInner);

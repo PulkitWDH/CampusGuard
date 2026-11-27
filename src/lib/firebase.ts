@@ -310,7 +310,10 @@ export async function saveIncidentToFirestore(
       cameraId: sanitizeId(alert.cameraId),
       cameraCode: alert.cameraCode.slice(0, 32),
       classroomName: alert.classroomName.slice(0, 140),
-      alertType: alert.alertType === 'sound-threshold' ? 'sound-threshold' : 'ai-vision',
+      alertType:
+        alert.alertType === 'sound-threshold' || alert.alertType === 'attendance'
+          ? alert.alertType
+          : 'ai-vision',
       severity: alert.severity,
       ...(alert.threatCategory ? { threatCategory: alert.threatCategory } : {}),
       ...(alert.modelUsed ? { modelUsed: alert.modelUsed.slice(0, 64) } : {}),
@@ -377,7 +380,10 @@ export function subscribeToUserIncidents(
           cameraId: String(data.cameraId),
           cameraCode: String(data.cameraCode),
           classroomName: String(data.classroomName),
-          alertType: data.alertType === 'sound-threshold' ? 'sound-threshold' : 'ai-vision',
+          alertType:
+            data.alertType === 'sound-threshold' || data.alertType === 'attendance'
+              ? data.alertType
+              : 'ai-vision',
           severity: data.severity === 'critical' ? 'critical' : 'warning',
           threatCategory: data.threatCategory,
           modelUsed: data.modelUsed,

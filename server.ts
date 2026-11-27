@@ -473,7 +473,7 @@ async function analyzeWithOpenAi(
 }
 
 async function analyzeWithGemini(
-  model: 'gemini-4-neon' | 'gemini-4-hydrogen',
+  model: 'gemini-4-neon' | 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite',
   promptText: string,
   body: AnalyzeClassroomRequest
 ): Promise<ParsedAnalysisResult> {
@@ -521,12 +521,12 @@ async function analyzeWithGemini(
         properties: {
           studentCount: {
             type: Type.INTEGER,
-            description: 'Exact count of verified visible people in TARGET IMAGE B (0 if room is empty).',
+            description: 'Exact count of verified visible people in CURRENT LIVE FRAME (0 if room is empty).',
           },
           detectedPeople: {
             type: Type.ARRAY,
             description:
-              'Empty array [] if no real person is visible in TARGET IMAGE B. Otherwise one tight box per visible person.',
+              'Empty array [] if no real person is visible in CURRENT LIVE FRAME. Otherwise one tight box per visible person.',
             items: {
               type: Type.OBJECT,
               properties: {
@@ -609,7 +609,9 @@ async function analyzeWithGemini(
   });
 
   const rawText = response.text ?? '{}';
-  return normalizeModelOutput(safeParseJson(rawText), model, Boolean(body.imageBase64));
+  const reportedModel: AiEngineModel =
+    model === 'gemini-3.1-flash-lite' ? 'gemini-4-hydrogen' : model;
+  return normalizeModelOutput(safeParseJson(rawText), reportedModel, Boolean(body.imageBase64));
 }
 
 function classifyDiscoveredName(id: string, name: string, uuids: string[] = []) {
@@ -816,6 +818,24 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '15mb' }));
 
+  app.get('/favicon.ico', (_req, res) => {
+    const pngIcon = path.resolve(process.cwd(), 'public', 'pwa-192x192.png');
+    const svgIcon = path.resolve(process.cwd(), 'public', 'icon.svg');
+    if (fs.existsSync(pngIcon)) {
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.sendFile(pngIcon);
+      return;
+    }
+    if (fs.existsSync(svgIcon)) {
+      res.setHeader('Content-Type', 'image/svg+xml');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.sendFile(svgIcon);
+      return;
+    }
+    res.status(204).end();
+  });
+
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true });
   });
@@ -826,7 +846,7 @@ async function startServer() {
     res.json({
       openaiConfigured,
       geminiConfigured,
-      defaultModel: geminiConfigured ? 'gemini-4-neon' : openaiConfigured ? 'gpt-6-astra' : 'gemini-4-hydrogen',
+      defaultModel: geminiConfigured ? 'gemini-4-hydrogen' : openaiConfigured ? 'gpt-6-astra' : 'gemini-4-hydrogen',
       serverPlatform: process.platform,
       hasLocalBluetoothHardware:
         process.platform === 'linux' ? hasLinuxBluetoothSysfs() : process.platform === 'darwin' || process.platform === 'win32',
@@ -839,12 +859,17 @@ async function startServer() {
   });
 
   const isBlockedMetadataHost = (hostname: string): boolean => {
-    const h = hostname.trim().toLowerCase();
+    const h = hostname.trim().toLowerCase().replace(/^\[|\]$/g, '');
     return (
-      h === '169.254.169.254' ||
+      h === 'localhost' ||
+      h === '0.0.0.0' ||
+      h === '::1' ||
+      h.startsWith('127.') ||
+      h.startsWith('169.254.') ||
       h === 'metadata.google.internal' ||
       h === 'metadata' ||
-      h === '100.100.100.200'
+      h === '100.100.100.200' ||
+      h === 'fd00:ec2::254'
     );
   };
 
@@ -854,10 +879,18 @@ async function startServer() {
   ): Promise<{ buffer: Buffer; contentType: string; latencyMs: number }> => {
     const parsed = new URL(rawUrl);
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      throw new Error('Only HTTP/HTTPS snapshot or MJPEG URLs are supported.');
+      const err = new Error('Only HTTP/HTTPS snapshot or MJPEG URLs are supported.') as Error & {
+        status?: number;
+      };
+      err.status = 400;
+      throw err;
     }
     if (isBlockedMetadataHost(parsed.hostname)) {
-      throw new Error('Restricted metadata address is not allowed.');
+      const err = new Error('Restricted loopback or metadata address is not allowed.') as Error & {
+        status?: number;
+      };
+      err.status = 400;
+      throw err;
     }
 
     const headers: Record<string, string> = {};
@@ -1055,7 +1088,7 @@ async function startServer() {
               ? 'gpt-6-sol'
               : body.aiModel === 'gpt-6-astra'
                 ? 'gpt-6-astra'
-                : 'gemini-4-neon';
+                : 'gemini-4-hydrogen';
 
       if (!body.imageBase64 && !body.audioBase64 && !voiceTranscript) {
         res.status(400).json({
@@ -1074,11 +1107,13 @@ async function startServer() {
         Boolean(body.previousFrameBase64 && body.imageBase64)
       );
 
-      // Build ordered live failover chain: requested model first, then real Gemini models if quota/429 hits
-      const modelChain: AiEngineModel[] = [requestedModel];
+      // Build ordered live failover chain: requested model first, then free-tier Gemini models if quota/429 hits
+      type CandidateCloudModel = AiEngineModel | 'gemini-3.1-flash-lite';
+      const modelChain: CandidateCloudModel[] = [requestedModel];
       if (hasValidGeminiKey()) {
-        if (!modelChain.includes('gemini-4-neon')) modelChain.push('gemini-4-neon');
         if (!modelChain.includes('gemini-4-hydrogen')) modelChain.push('gemini-4-hydrogen');
+        if (!modelChain.includes('gemini-3.1-flash-lite')) modelChain.push('gemini-3.1-flash-lite');
+        if (!modelChain.includes('gemini-4-neon')) modelChain.push('gemini-4-neon');
       }
 
       let lastErr: unknown = null;
@@ -1128,6 +1163,15 @@ async function startServer() {
       throw lastErr || new Error('Failed to analyze camera feed.');
     } catch (err) {
       const { statusCode, message } = formatAiProviderError(err);
+      if (statusCode === 429) {
+        // Gracefully hand off to unlimited on-device Edge AI with HTTP 200 so browsers don't log noisy 429 network errors
+        res.status(200).json({
+          quotaExhausted: true,
+          fallbackToEdge: true,
+          error: message,
+        });
+        return;
+      }
       console.error(`[analyze-classroom error ${statusCode}]`, message);
       res.status(statusCode).json({ error: message });
     }

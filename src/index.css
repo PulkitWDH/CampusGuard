@@ -40,12 +40,49 @@ html.dark #top {
   color: #f4f4f5;
 }
 
-html.dark header.bg-white\/95 {
+html.dark header.bg-white\/95,
+html.dark nav.bg-white\/95 {
   background-color: rgba(9, 9, 11, 0.94) !important;
   border-color: #27272a !important;
 }
 
-html.dark .bg-white {
+/* Mobile tactical built-in camera hero card (remains deep charcoal in both Light & Dark modes) */
+.mobile-camera-hero {
+  background-color: #0f172a;
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+  background-size: 28px 28px;
+  color: #f8fafc;
+}
+
+html.dark .mobile-camera-hero {
+  background-color: #141418 !important;
+  border-color: #27272a !important;
+  color: #f4f4f5 !important;
+}
+
+.mobile-camera-hero-btn-primary {
+  background-color: #ffffff;
+  color: #0f172a;
+}
+
+.mobile-camera-hero-btn-primary:hover {
+  background-color: #f1f5f9;
+}
+
+.mobile-camera-hero-btn-secondary {
+  background-color: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  color: #ffffff;
+}
+
+.mobile-camera-hero-btn-secondary:hover {
+  background-color: rgba(255, 255, 255, 0.16);
+}
+
+html.dark .bg-white,
+html.dark .md\:bg-white {
   background-color: #111114 !important;
 }
 
@@ -63,6 +100,7 @@ html.dark .bg-slate-200 {
 }
 
 html.dark .border-slate-200,
+html.dark .md\:border-slate-200,
 html.dark .border-slate-200\/80,
 html.dark .divide-slate-200 > :not(:last-child),
 html.dark .divide-slate-200\/80 > :not(:last-child) {
@@ -140,6 +178,10 @@ html.dark .bg-emerald-50 {
 html.dark .border-emerald-200 {
   border-color: rgba(16, 185, 129, 0.35) !important;
 }
+html.dark .text-emerald-900,
+html.dark .text-emerald-800 {
+  color: #6ee7b7 !important;
+}
 html.dark .text-emerald-700,
 html.dark .text-emerald-600 {
   color: #34d399 !important;
@@ -181,6 +223,14 @@ html.dark .border-blue-200,
 html.dark .border-sky-200,
 html.dark .border-indigo-200 {
   border-color: rgba(59, 130, 246, 0.35) !important;
+}
+html.dark .text-blue-900,
+html.dark .text-blue-800,
+html.dark .text-sky-900,
+html.dark .text-sky-800,
+html.dark .text-indigo-900,
+html.dark .text-indigo-800 {
+  color: #93c5fd !important;
 }
 html.dark .text-blue-700,
 html.dark .text-blue-600,

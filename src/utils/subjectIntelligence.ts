@@ -4,6 +4,7 @@ import type {
   TrackedSubject,
   WatchlistSubject,
 } from '../types';
+import { computeNoseAnchor } from './bodySilhouette';
 
 export interface PtzViewportRect {
   /** Normalized 0..1000 crop coordinates inside active video draw rect */
@@ -50,7 +51,7 @@ function boxCenter(box: [number, number, number, number]): { x: number; y: numbe
 }
 
 /**
- * Maintains persistent Subject IDs (SUBJ-01, SUBJ-02...), movement trajectory trails,
+ * Maintains persistent Subject IDs (SUBJ-01, SUBJ-02...), nose-anchored movement trajectory trails,
  * dwell time, and normalized movement speed across frames.
  */
 export function updateTrackedSubjects(
@@ -61,7 +62,7 @@ export function updateTrackedSubjects(
   options?: { maxAgeMs?: number; maxTrailPoints?: number }
 ): { subjects: TrackedSubject[]; nextNumericId: number } {
   const maxAgeMs = options?.maxAgeMs ?? 6000;
-  const maxTrailPoints = options?.maxTrailPoints ?? 28;
+  const maxTrailPoints = options?.maxTrailPoints ?? 36;
 
   const activePrev = prevSubjects.filter((s) => nowMs - s.lastSeenAtMs <= maxAgeMs);
   const matchedPrevIds = new Set<string>();
@@ -97,6 +98,7 @@ export function updateTrackedSubjects(
     const det = detections[pair.detIdx];
     const prevCenter = boxCenter(prev.box_2d);
     const nextCenter = boxCenter(det.box_2d);
+    const nextNose = computeNoseAnchor(det.box_2d);
     const dtSec = Math.max(0.05, (nowMs - prev.lastSeenAtMs) / 1000);
     const stepDist = Math.hypot(nextCenter.x - prevCenter.x, nextCenter.y - prevCenter.y);
     const instantSpeed = stepDist / dtSec;
@@ -104,12 +106,12 @@ export function updateTrackedSubjects(
 
     const lastTrail = prev.trail[prev.trail.length - 1];
     const trailDist = lastTrail
-      ? Math.hypot(nextCenter.x - lastTrail.x, nextCenter.y - lastTrail.y)
+      ? Math.hypot(nextNose.x - lastTrail.x, nextNose.y - lastTrail.y)
       : 999;
 
     const nextTrail =
-      trailDist >= 8 || prev.trail.length === 0
-        ? [...prev.trail, { x: Math.round(nextCenter.x), y: Math.round(nextCenter.y), atMs: nowMs }].slice(
+      trailDist >= 6 || prev.trail.length === 0
+        ? [...prev.trail, { x: Math.round(nextNose.x), y: Math.round(nextNose.y), atMs: nowMs }].slice(
             -maxTrailPoints
           )
         : prev.trail;
@@ -131,7 +133,7 @@ export function updateTrackedSubjects(
   for (let d = 0; d < detections.length; d += 1) {
     if (matchedDetIndices.has(d)) continue;
     const det = detections[d];
-    const center = boxCenter(det.box_2d);
+    const nose = computeNoseAnchor(det.box_2d);
     const numericId = nextNumericId++;
     nextSubjects.push({
       id: `SUBJ-${String(numericId).padStart(2, '0')}`,
@@ -144,7 +146,7 @@ export function updateTrackedSubjects(
       lastSeenAtMs: nowMs,
       dwellSeconds: 0,
       speedNormPerSec: 0,
-      trail: [{ x: Math.round(center.x), y: Math.round(center.y), atMs: nowMs }],
+      trail: [{ x: Math.round(nose.x), y: Math.round(nose.y), atMs: nowMs }],
     });
   }
 
@@ -352,79 +354,198 @@ export function matchSubjectsToWatchlist(
   return results;
 }
 
+export interface PtzComputeOptions {
+  /** Source media pixel aspect ratio (srcWidth / srcHeight). Defaults to 16/9. */
+  sourceAspect?: number;
+  /** Target rendered viewport aspect ratio (destWidth / destHeight). Defaults to sourceAspect. */
+  targetAspect?: number;
+  /** Deadband in normalized 0..1000 units to eliminate micro-jitter on stationary people. */
+  centerDeadband?: number;
+  /** Deadband in normalized 0..1000 units for zoom span stability. */
+  spanDeadband?: number;
+}
+
+function clampViewportPreservingSpan(
+  cx: number,
+  cy: number,
+  spanW: number,
+  spanH: number
+): PtzViewportRect {
+  const safeW = clamp(spanW, 120, 1000);
+  const safeH = clamp(spanH, 120, 1000);
+  const halfW = safeW / 2;
+  const halfH = safeH / 2;
+
+  let xmin = cx - halfW;
+  let xmax = cx + halfW;
+  if (xmin < 0) {
+    xmax -= xmin;
+    xmin = 0;
+  }
+  if (xmax > 1000) {
+    xmin -= xmax - 1000;
+    xmax = 1000;
+  }
+
+  let ymin = cy - halfH;
+  let ymax = cy + halfH;
+  if (ymin < 0) {
+    ymax -= ymin;
+    ymin = 0;
+  }
+  if (ymax > 1000) {
+    ymin -= ymax - 1000;
+    ymax = 1000;
+  }
+
+  xmin = clamp(xmin, 0, Math.max(0, 1000 - safeW));
+  xmax = clamp(xmin + safeW, safeW, 1000);
+  ymin = clamp(ymin, 0, Math.max(0, 1000 - safeH));
+  ymax = clamp(ymin + safeH, safeH, 1000);
+
+  const zoomFactor = Number((1000 / Math.max(120, Math.min(xmax - xmin, ymax - ymin))).toFixed(1));
+  return { xmin, ymin, xmax, ymax, zoomFactor };
+}
+
 /**
- * Computes a smoothly damped 16:9 Digital Auto-PTZ zoom crop locked onto a target subject's
- * head & upper torso, clamped cleanly inside normalized [0..1000] video bounds.
+ * Computes a broadcast-grade, jitter-free Digital Auto-PTZ viewport locked onto a target subject's
+ * head/nose and upper torso:
+ * - Preserves exact source-to-target pixel aspect ratio (zero stretching or squishing)
+ * - Uses center + zoom deadband hysteresis so stationary people never vibrate
+ * - Applies smooth cinema gimbal damping on pan and zoom
  */
 export function computeSmoothPtzViewport(
   targetBox: [number, number, number, number],
   prevViewport: PtzViewportRect | null,
-  smoothing = 0.22
+  smoothing = 0.1,
+  options?: PtzComputeOptions
 ): PtzViewportRect {
   const [ymin, xmin, ymax, xmax] = targetBox;
-  const boxW = Math.max(80, xmax - xmin);
-  const boxH = Math.max(100, ymax - ymin);
+  const boxW = Math.max(70, xmax - xmin);
+  const boxH = Math.max(90, ymax - ymin);
 
-  // Target center slightly biased toward upper body/head (38% down from top of bounding box)
-  const cx = (xmin + xmax) / 2;
-  const cy = ymin + boxH * 0.38;
+  const sourceAspect = Math.max(0.25, Math.min(4, options?.sourceAspect ?? 16 / 9));
+  const targetAspect = Math.max(0.25, Math.min(4, options?.targetAspect ?? sourceAspect));
+  const centerDeadband = options?.centerDeadband ?? 18;
+  const spanDeadband = options?.spanDeadband ?? 34;
 
-  // Compute zoom window width/height with generous padding so subject stays comfortably framed
-  const targetSpan = clamp(Math.max(boxW * 2.1, boxH * 1.15), 260, 620);
-  const halfW = targetSpan / 2;
-  const halfH = targetSpan / 2;
+  // Frame head/nose + upper torso with generous headroom (never slice off the top of the head)
+  const nose = computeNoseAnchor(targetBox);
+  const targetCx = nose.x;
+  const targetCy = clamp(ymin + boxH * 0.34, ymin + 30, ymax - 20);
 
-  let nextXMin = cx - halfW;
-  let nextXMax = cx + halfW;
-  if (nextXMin < 0) {
-    nextXMax -= nextXMin;
-    nextXMin = 0;
+  // Target zoom span: crisp 1.35x to 2.75x framing (avoids blurry over-zooming)
+  let targetSpanH = clamp(Math.max(boxH * 1.48, boxW * 1.65), 360, 740);
+  let targetSpanW = targetSpanH * (targetAspect / sourceAspect);
+
+  if (targetSpanW > 960) {
+    targetSpanW = 960;
+    targetSpanH = targetSpanW * (sourceAspect / targetAspect);
   }
-  if (nextXMax > 1000) {
-    nextXMin -= nextXMax - 1000;
-    nextXMax = 1000;
-  }
-
-  let nextYMin = cy - halfH;
-  let nextYMax = cy + halfH;
-  if (nextYMin < 0) {
-    nextYMax -= nextYMin;
-    nextYMin = 0;
-  }
-  if (nextYMax > 1000) {
-    nextYMin -= nextYMax - 1000;
-    nextYMax = 1000;
+  if (targetSpanH > 960) {
+    targetSpanH = 960;
+    targetSpanW = targetSpanH * (targetAspect / sourceAspect);
   }
 
-  nextXMin = clamp(nextXMin, 0, 990);
-  nextXMax = clamp(nextXMax, nextXMin + 10, 1000);
-  nextYMin = clamp(nextYMin, 0, 990);
-  nextYMax = clamp(nextYMax, nextYMin + 10, 1000);
+  // Ensure the subject's full width + headroom always fits comfortably inside the PTZ frame
+  const minWForSubject = Math.min(960, boxW * 1.55);
+  if (targetSpanW < minWForSubject) {
+    targetSpanW = minWForSubject;
+    targetSpanH = Math.min(960, targetSpanW * (sourceAspect / targetAspect));
+  }
+
+  const desired = clampViewportPreservingSpan(targetCx, targetCy, targetSpanW, targetSpanH);
 
   if (!prevViewport) {
-    const zoomFactor = Number((1000 / Math.max(100, nextXMax - nextXMin)).toFixed(1));
-    return {
-      xmin: nextXMin,
-      ymin: nextYMin,
-      xmax: nextXMax,
-      ymax: nextYMax,
-      zoomFactor,
-    };
+    return desired;
   }
 
-  const alpha = clamp(smoothing, 0.05, 1);
-  const lerp = (a: number, b: number) => a + (b - a) * alpha;
-  const xminSmooth = lerp(prevViewport.xmin, nextXMin);
-  const yminSmooth = lerp(prevViewport.ymin, nextYMin);
-  const xmaxSmooth = lerp(prevViewport.xmax, nextXMax);
-  const ymaxSmooth = lerp(prevViewport.ymax, nextYMax);
-  const zoomFactor = Number((1000 / Math.max(100, xmaxSmooth - xminSmooth)).toFixed(1));
+  const prevW = Math.max(120, prevViewport.xmax - prevViewport.xmin);
+  const prevH = Math.max(120, prevViewport.ymax - prevViewport.ymin);
+  const prevCx = (prevViewport.xmin + prevViewport.xmax) / 2;
+  const prevCy = (prevViewport.ymin + prevViewport.ymax) / 2;
+
+  const desiredW = desired.xmax - desired.xmin;
+  const desiredH = desired.ymax - desired.ymin;
+  const desiredCx = (desired.xmin + desired.xmax) / 2;
+  const desiredCy = (desired.ymin + desired.ymax) / 2;
+
+  const centerDelta = Math.hypot(desiredCx - prevCx, desiredCy - prevCy);
+  const spanDelta = Math.max(Math.abs(desiredW - prevW), Math.abs(desiredH - prevH));
+
+  // Deadband lock: hold completely rock-steady when detector jitter is minor
+  if (centerDelta < centerDeadband && spanDelta < spanDeadband) {
+    return prevViewport;
+  }
+
+  const alpha = clamp(smoothing, 0.04, 0.45);
+  const nextCx = prevCx + (desiredCx - prevCx) * alpha;
+  const nextCy = prevCy + (desiredCy - prevCy) * alpha;
+  const nextW = prevW + (desiredW - prevW) * (alpha * 0.85);
+  const nextH = nextW * (sourceAspect / targetAspect);
+
+  return clampViewportPreservingSpan(nextCx, nextCy, nextW, nextH);
+}
+
+/**
+ * Smoothly glides an active Auto-PTZ viewport back to the full wide-angle camera frame [0..1000].
+ * Returns null once settled back at full frame.
+ */
+export function easePtzViewportToFull(
+  prevViewport: PtzViewportRect | null,
+  smoothing = 0.14
+): PtzViewportRect | null {
+  if (!prevViewport) return null;
+  const alpha = clamp(smoothing, 0.05, 0.5);
+  const xmin = prevViewport.xmin + (0 - prevViewport.xmin) * alpha;
+  const ymin = prevViewport.ymin + (0 - prevViewport.ymin) * alpha;
+  const xmax = prevViewport.xmax + (1000 - prevViewport.xmax) * alpha;
+  const ymax = prevViewport.ymax + (1000 - prevViewport.ymax) * alpha;
+
+  if (xmin < 3 && ymin < 3 && xmax > 997 && ymax > 997) {
+    return null;
+  }
 
   return {
-    xmin: xminSmooth,
-    ymin: yminSmooth,
-    xmax: xmaxSmooth,
-    ymax: ymaxSmooth,
-    zoomFactor,
+    xmin,
+    ymin,
+    xmax,
+    ymax,
+    zoomFactor: Number((1000 / Math.max(120, Math.min(xmax - xmin, ymax - ymin))).toFixed(1)),
   };
 }
+
+/**
+ * Maps a normalized [0..1000] point from full-frame space into the active zoomed PTZ viewport space.
+ */
+export function mapPointThroughPtzViewport(
+  pt: { x: number; y: number },
+  vp: PtzViewportRect | null
+): { x: number; y: number } {
+  if (!vp) return pt;
+  const spanW = Math.max(1, vp.xmax - vp.xmin);
+  const spanH = Math.max(1, vp.ymax - vp.ymin);
+  return {
+    x: ((pt.x - vp.xmin) / spanW) * 1000,
+    y: ((pt.y - vp.ymin) / spanH) * 1000,
+  };
+}
+
+/**
+ * Maps a normalized [ymin, xmin, ymax, xmax] bounding box from full-frame space into the active PTZ viewport.
+ */
+export function mapBoxThroughPtzViewport(
+  box: [number, number, number, number],
+  vp: PtzViewportRect | null
+): [number, number, number, number] {
+  if (!vp) return box;
+  const spanW = Math.max(1, vp.xmax - vp.xmin);
+  const spanH = Math.max(1, vp.ymax - vp.ymin);
+  return [
+    ((box[0] - vp.ymin) / spanH) * 1000,
+    ((box[1] - vp.xmin) / spanW) * 1000,
+    ((box[2] - vp.ymin) / spanH) * 1000,
+    ((box[3] - vp.xmin) / spanW) * 1000,
+  ];
+}
+

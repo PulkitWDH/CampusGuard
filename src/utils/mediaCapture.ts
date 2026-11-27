@@ -49,12 +49,14 @@ export async function openRawMediaStream(options: {
   includeVideo?: boolean;
   videoDeviceId?: string;
   audioDeviceId?: string;
+  facingMode?: 'user' | 'environment';
 }): Promise<MediaStream> {
-  const { includeVideo = true, videoDeviceId, audioDeviceId } = options;
+  const { includeVideo = true, videoDeviceId, audioDeviceId, facingMode } = options;
   const hdVideoConstraints: MediaTrackConstraints = {
     width: { ideal: 1920 },
     height: { ideal: 1080 },
     frameRate: { ideal: 30 },
+    ...(facingMode && !videoDeviceId ? { facingMode: { ideal: facingMode } } : {}),
   };
   const exactVideo: MediaTrackConstraints | boolean = includeVideo
     ? videoDeviceId
@@ -69,14 +71,14 @@ export async function openRawMediaStream(options: {
     autoGainControl: false,
   };
 
-  // Attempt 1: Exact device + Full HD video + raw unattenuated audio
+  // Attempt 1: Exact device / facingMode + Full HD video + raw unattenuated audio
   try {
     return await navigator.mediaDevices.getUserMedia({
       video: exactVideo,
       audio: rawAudioConstraint,
     });
   } catch {
-    // Attempt 2: Relaxed ideal deviceId while preserving Full HD video quality
+    // Attempt 2: Relaxed ideal deviceId/facingMode while preserving Full HD video quality
     try {
       return await navigator.mediaDevices.getUserMedia({
         video: includeVideo
@@ -99,7 +101,11 @@ export async function openRawMediaStream(options: {
         } catch {
           // Attempt 4: Bare video-only fallback for legacy webcams rejecting HD constraints
           return await navigator.mediaDevices.getUserMedia({
-            video: videoDeviceId ? { deviceId: { ideal: videoDeviceId } } : true,
+            video: videoDeviceId
+              ? { deviceId: { ideal: videoDeviceId } }
+              : facingMode
+                ? { facingMode }
+                : true,
             audio: false,
           });
         }

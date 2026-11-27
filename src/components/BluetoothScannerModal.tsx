@@ -111,6 +111,18 @@ export function BluetoothScannerModal({
       setActiveTab(initialTab);
     }
   }, [initialTab, isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, onClose]);
   const [btNotices, setBtNotices] = useState<string[]>([]);
   const [blockedByIframe, setBlockedByIframe] = useState(false);
   const [btSearch, setBtSearch] = useState('');
@@ -589,34 +601,48 @@ export function BluetoothScannerModal({
     }
   };
 
-  const handleStartBuiltInCamera = async () => {
+  const handleStartBuiltInCamera = async (preferredFacing?: 'environment' | 'user') => {
     setHardwareError(null);
     if (!navigator.mediaDevices?.getUserMedia) {
       setHardwareError('Browser camera capture is unavailable here.');
       return;
     }
-    const builtInCam = wiredCameras.find((c) => c.interfaceType === 'built-in');
+    const builtInCam = !preferredFacing
+      ? wiredCameras.find((c) => c.interfaceType === 'built-in')
+      : undefined;
     const targetVideoId = builtInCam?.deviceId || undefined;
     const targetAudioId = builtInCam?.matchedAudioDeviceId || selectedAudioId || undefined;
-    const zoneLabel = hardwareRoomName.trim() || 'Built-in Camera';
-    setConnectingWiredId('__builtin__');
+    const defaultLabel =
+      preferredFacing === 'environment'
+        ? 'Rear Phone Camera'
+        : preferredFacing === 'user'
+          ? 'Front Phone Camera'
+          : 'Built-in Camera';
+    const zoneLabel = hardwareRoomName.trim() || defaultLabel;
+    const busyKey = preferredFacing ? `__builtin_${preferredFacing}__` : '__builtin__';
+    setConnectingWiredId(busyKey);
     try {
       const stream = await openRawMediaStream({
         includeVideo: true,
         videoDeviceId: targetVideoId,
         audioDeviceId: targetAudioId,
+        facingMode: preferredFacing,
       });
+      const liveTrack = stream.getVideoTracks()[0];
+      const liveDeviceId = liveTrack?.getSettings?.().deviceId || targetVideoId;
       onAddHardwareCamera(
         zoneLabel,
         stream,
-        targetVideoId,
+        liveDeviceId,
         targetAudioId,
-        builtInCam ? `Built-in · ${builtInCam.label}` : 'Built-in Camera'
+        builtInCam ? `Built-in · ${builtInCam.label}` : defaultLabel
       );
       setHardwareRoomName('');
       onClose();
     } catch {
-      setHardwareError('Could not access the built-in camera. Please allow camera permission in your browser.');
+      setHardwareError(
+        'Could not access the built-in camera. Allow browser camera permission and ensure no other app is locking the lens.'
+      );
     } finally {
       setConnectingWiredId(null);
     }
@@ -749,33 +775,36 @@ export function BluetoothScannerModal({
       role="dialog"
       aria-modal="true"
       aria-labelledby="scanner-modal-title"
-      className="fixed inset-0 z-50 bg-slate-900/45 backdrop-blur-xs flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4"
     >
-      <div className="bg-white border border-slate-200 rounded-lg w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden shadow-2xl">
-        <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between gap-4">
+      <div className="bg-white border border-slate-200 rounded-t-2xl sm:rounded-xl w-full max-w-2xl max-h-[92vh] sm:max-h-[90vh] flex flex-col overflow-hidden shadow-2xl pb-[env(safe-area-inset-bottom)]">
+        <div className="sm:hidden flex justify-center pt-2.5 pb-1">
+          <span className="w-10 h-1 rounded-full bg-slate-300" aria-hidden="true" />
+        </div>
+        <div className="px-4 sm:px-5 py-3 sm:py-4 border-b border-slate-200 flex items-center justify-between gap-4">
           <div>
             <h2 id="scanner-modal-title" className="text-base font-semibold text-slate-900">
               Add Security Camera Feed
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Connect Wi-Fi CCTV cameras, Bluetooth CCTV, local webcams, microphone-only monitors, or recorded footage.
+              Start your phone/laptop built-in camera, or connect Wi-Fi, wired HDMI/USB-C, Bluetooth, or mic feeds.
             </p>
           </div>
           <button
             type="button"
             onClick={onClose}
             aria-label="Close camera setup modal"
-            className="p-1.5 rounded-md text-slate-500 hover:text-slate-900 hover:bg-slate-100 cursor-pointer"
+            className="p-2 rounded-lg text-slate-500 hover:text-slate-900 hover:bg-slate-100 cursor-pointer shrink-0"
           >
             <X className="w-5 h-5" aria-hidden="true" />
           </button>
         </div>
 
-        <div className="px-4 pt-1 border-b border-slate-200 flex items-center gap-0.5 overflow-x-auto bg-slate-50">
+        <div className="px-3 sm:px-4 pt-1 border-b border-slate-200 flex items-center gap-0.5 overflow-x-auto bg-slate-50">
           {(
             [
+              { id: 'hardware', label: 'Built-in / Wired', icon: Camera },
               { id: 'wifi', label: 'Wi-Fi CCTV', icon: Wifi },
-              { id: 'hardware', label: 'Built-in / Wired', icon: Cable },
               { id: 'bluetooth', label: 'Bluetooth', icon: Bluetooth },
               { id: 'microphone', label: 'Mic Only', icon: Mic },
               { id: 'upload', label: 'Upload Clip', icon: Upload },
@@ -787,10 +816,11 @@ export function BluetoothScannerModal({
               <button
                 key={tab.id}
                 type="button"
+                data-testid={`scanner-tab-${tab.id}`}
                 onClick={() => setActiveTab(tab.id)}
-                className={`inline-flex items-center gap-1.5 px-2.5 py-2.5 text-xs font-medium border-b-2 transition-colors whitespace-nowrap cursor-pointer ${
+                className={`inline-flex items-center gap-1.5 px-2.5 py-2.5 text-xs font-medium border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   active
-                    ? 'border-slate-900 text-slate-950'
+                    ? 'border-slate-900 text-slate-950 font-semibold'
                     : 'border-transparent text-slate-500 hover:text-slate-900'
                 }`}
               >
@@ -1338,31 +1368,56 @@ export function BluetoothScannerModal({
             </>
           ) : null}
 
-          {/* TAB 3: WIRED CAMERAS (HDMI CAPTURE, USB-C / TYPE-C, SDI/BNC/DVR, USB UVC, BUILT-IN) */}
+          {/* TAB 1: BUILT-IN PHONE/LAPTOP CAMERA & WIRED PORTS (HDMI, USB-C, SDI/BNC, USB) */}
           {activeTab === 'hardware' ? (
             <div className="space-y-4">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <p className="text-xs text-slate-500 max-w-sm">
-                  Use your device&apos;s built-in camera or any wired camera — HDMI capture cards, USB-C / Type-C, SDI / BNC DVR dongles, and USB webcams.
-                </p>
-                <div className="flex flex-wrap items-center gap-2 shrink-0">
+              {/* Instant Built-in Camera Launchers (works immediately on Mobile & Desktop without pre-scan) */}
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-3.5 space-y-3">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <h3 className="text-xs font-semibold text-slate-900">
+                      Built-in Device Camera (Phone &amp; Laptop)
+                    </h3>
+                    <p className="text-[11px] text-slate-500 mt-0.5">
+                      Launch your phone rear/front lens or laptop webcam in 1 tap — no cable or scan required.
+                    </p>
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                   <button
                     type="button"
-                    onClick={() => void handleStartBuiltInCamera()}
-                    disabled={connectingWiredId === '__builtin__'}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-900 text-white hover:bg-slate-800 cursor-pointer disabled:opacity-50"
+                    data-testid="modal-start-rear-camera"
+                    onClick={() => void handleStartBuiltInCamera('environment')}
+                    disabled={connectingWiredId === '__builtin_environment__'}
+                    className="inline-flex items-center justify-center gap-1.5 px-3 py-2.5 min-h-[44px] text-xs font-semibold rounded-lg bg-slate-900 text-white hover:bg-slate-800 cursor-pointer disabled:opacity-50"
                   >
-                    <Camera className="w-3.5 h-3.5" aria-hidden="true" />
-                    <span>{connectingWiredId === '__builtin__' ? 'Opening...' : 'Start Built-in Camera'}</span>
+                    <Camera className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                    <span>
+                      {connectingWiredId === '__builtin_environment__'
+                        ? 'Opening...'
+                        : 'Rear / Main Camera'}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="modal-start-front-camera"
+                    onClick={() => void handleStartBuiltInCamera('user')}
+                    disabled={connectingWiredId === '__builtin_user__'}
+                    className="inline-flex items-center justify-center gap-1.5 px-3 py-2.5 min-h-[44px] text-xs font-semibold rounded-lg border border-slate-300 bg-white text-slate-800 hover:bg-slate-100 cursor-pointer disabled:opacity-50"
+                  >
+                    <Video className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                    <span>
+                      {connectingWiredId === '__builtin_user__' ? 'Opening...' : 'Front Camera'}
+                    </span>
                   </button>
                   <button
                     type="button"
                     onClick={() => void refreshMediaDevices(true, true)}
                     disabled={isLoadingDevices || isProbingWired}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-blue-500/40 bg-blue-50 text-blue-700 hover:bg-blue-100 cursor-pointer disabled:opacity-50"
+                    className="inline-flex items-center justify-center gap-1.5 px-3 py-2.5 min-h-[44px] text-xs font-semibold rounded-lg border border-blue-500/40 bg-blue-50 text-blue-700 hover:bg-blue-100 cursor-pointer disabled:opacity-50"
                   >
                     <RefreshCw
-                      className={`w-3.5 h-3.5 ${isLoadingDevices || isProbingWired ? 'animate-spin' : ''}`}
+                      className={`w-3.5 h-3.5 shrink-0 ${isLoadingDevices || isProbingWired ? 'animate-spin' : ''}`}
                       aria-hidden="true"
                     />
                     <span>

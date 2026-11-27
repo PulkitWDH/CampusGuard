@@ -8,8 +8,13 @@ import {
 import {
   computeBoxIoU,
   filterVerifiedPersonDetections,
-  mergeTiledPersonDetections,
 } from './monitoringLogic';
+import {
+  buildOverlappingTileGrid,
+  mapTilePredictionToFullFrame,
+  mergeCrowdTileDetections,
+  shouldEngageDeepCrowdGrid,
+} from './crowdTiling';
 
 export type LocalDetectorStatus = 'idle' | 'loading' | 'ready' | 'error';
 
@@ -60,8 +65,8 @@ let consecutiveSilentZeroWebglFrames = 0;
 let cpuShadowCheckDone = false;
 
 // Reusable offscreen crop/enhancement canvases
-let leftTileCanvas: HTMLCanvasElement | null = null;
-let rightTileCanvas: HTMLCanvasElement | null = null;
+let pass1Canvas: HTMLCanvasElement | null = null;
+let cropTileCanvas: HTMLCanvasElement | null = null;
 let torsoTileCanvas: HTMLCanvasElement | null = null;
 let enhancedCanvas: HTMLCanvasElement | null = null;
 let exposureProbeCanvas: HTMLCanvasElement | null = null;
@@ -482,7 +487,7 @@ function measureCanvasExposure(canvas: HTMLCanvasElement) {
 export async function detectPeopleLocallyOnCanvas(
   canvas: HTMLCanvasElement,
   minConfidencePercent = 28,
-  options?: { hadTrackedPeople?: boolean }
+  options?: { hadTrackedPeople?: boolean; allowDeepCrowdScan?: boolean }
 ): Promise<{
   people: DetectedPersonBox[];
   weakPeople: DetectedPersonBox[];
@@ -490,6 +495,7 @@ export async function detectPeopleLocallyOnCanvas(
   occluderObjects: DetectedObjectBox[];
   inferenceMs: number;
   backend: LocalDetectorBackend;
+  crowdScanUsed: boolean;
 }> {
   const model = await ensureLocalPersonDetector();
   const width = canvas.width;
@@ -502,18 +508,36 @@ export async function detectPeopleLocallyOnCanvas(
       occluderObjects: [],
       inferenceMs: 0,
       backend: detectorBackend,
+      crowdScanUsed: false,
     };
   }
 
   const startedAt = performance.now();
   const rawMinScore = 0.15;
 
-  // Pass 1: Full-frame detection on aspect-ratio-preserved canvas
+  // COCO-SSD (lite_mobilenet_v2) internally resizes inputs to 300x300.
+  // Downscaling Pass 1 to <= 320px avoids uploading massive 1080px tensors while keeping
+  // the full 1080px source canvas razor sharp for zoomed crowd crop tiles in Pass 2 & Pass 3!
+  const pass1Scale = Math.min(1, 320 / Math.max(width, height));
+  const pass1W = Math.max(64, Math.round(width * pass1Scale));
+  const pass1H = Math.max(64, Math.round(height * pass1Scale));
+  pass1Canvas = ensureTileCanvas(pass1Canvas, pass1W, pass1H);
+  const p1Ctx = pass1Canvas.getContext('2d');
+  if (p1Ctx) {
+    p1Ctx.imageSmoothingEnabled = true;
+    p1Ctx.imageSmoothingQuality = 'high';
+    p1Ctx.drawImage(canvas, 0, 0, width, height, 0, 0, pass1W, pass1H);
+  }
+  const pass1Input = p1Ctx ? pass1Canvas : canvas;
+  const pass1InputW = p1Ctx ? pass1W : width;
+  const pass1InputH = p1Ctx ? pass1H : height;
+
+  // Pass 1: Full-frame detection on aspect-ratio-preserved 320px canvas
   const fullStart = performance.now();
-  let fullRaw = await safeModelDetect(model, canvas, 35, rawMinScore);
+  let fullRaw = await safeModelDetect(model, pass1Input, 80, rawMinScore);
   const fullPassMs = performance.now() - fullStart;
 
-  const exposure = measureCanvasExposure(canvas);
+  const exposure = measureCanvasExposure(pass1Input);
 
   // Runtime silent-zero WebGL watchdog: if a phone/laptop GPU silently outputs 0 predictions
   // across 5 consecutive real non-blank frames, shadow-test CPU once and switch permanently if CPU sees objects!
@@ -530,12 +554,10 @@ export async function detectPeopleLocallyOnCanvas(
       cpuShadowCheckDone = true;
       const switched = await switchToCpuBackend();
       if (switched) {
-        const cpuProbeRaw = await model.detect(canvas, 35, rawMinScore);
+        const cpuProbeRaw = await model.detect(pass1Input, 80, rawMinScore);
         if (cpuProbeRaw.length > 0) {
-          // Confirmed broken/silent-zero WebGL GPU on this device — stay permanently on CPU!
           fullRaw = cpuProbeRaw;
         } else if (tfModuleCache) {
-          // Scene genuinely has 0 objects even on CPU — restore WebGL for speed
           try {
             await tfModuleCache.setBackend('webgl');
             await tfModuleCache.ready();
@@ -552,90 +574,136 @@ export async function detectPeopleLocallyOnCanvas(
     consecutiveSilentZeroWebglFrames = 0;
   }
 
-  let fullBoxes = mapPredictionsToBoxes(fullRaw, width, height, minConfidencePercent);
+  let fullBoxes = mapPredictionsToBoxes(fullRaw, pass1InputW, pass1InputH, minConfidencePercent);
   const rawWeakPeople: DetectedPersonBox[] = [
-    ...mapPredictionsToWeakPeople(fullRaw, width, height, minConfidencePercent),
+    ...mapPredictionsToWeakPeople(fullRaw, pass1InputW, pass1InputH, minConfidencePercent),
   ];
   const rawWeapons: DetectedObjectBox[] = [
-    ...mapPredictionsToDangerousObjects(fullRaw, width, height, 0, 1),
+    ...mapPredictionsToDangerousObjects(fullRaw, pass1InputW, pass1InputH, 0, 1),
   ];
   const rawOccluders: DetectedObjectBox[] = [
-    ...mapPredictionsToOccluders(fullRaw, width, height, 0, 1),
+    ...mapPredictionsToOccluders(fullRaw, pass1InputW, pass1InputH, 0, 1),
   ];
 
-  // Low-Light Exposure Boost Pass: if camera is dim/dark on another device and Pass 1 found 0 people,
+  // Low-Light Exposure Boost Pass: if camera is dim/dark and Pass 1 found 0 people,
   // run a fast software brightness/contrast-normalized pass so dimly lit humans still lock on!
   if (fullBoxes.length === 0 && exposure?.needsLowLightBoost) {
-    enhancedCanvas = ensureTileCanvas(enhancedCanvas, width, height);
+    enhancedCanvas = ensureTileCanvas(enhancedCanvas, pass1InputW, pass1InputH);
     const ectx = enhancedCanvas.getContext('2d');
     if (ectx) {
       await yieldToMainThread();
       ectx.save();
       ectx.filter = 'brightness(1.5) contrast(1.25)';
-      ectx.drawImage(canvas, 0, 0, width, height);
+      ectx.drawImage(pass1Input, 0, 0, pass1InputW, pass1InputH);
       ectx.restore();
-      const boostedRaw = await safeModelDetect(model, enhancedCanvas, 25, rawMinScore);
-      const boostedBoxes = mapPredictionsToBoxes(boostedRaw, width, height, minConfidencePercent);
+      const boostedRaw = await safeModelDetect(model, enhancedCanvas, 40, rawMinScore);
+      const boostedBoxes = mapPredictionsToBoxes(
+        boostedRaw,
+        pass1InputW,
+        pass1InputH,
+        minConfidencePercent
+      );
       if (boostedBoxes.length > 0) {
         fullBoxes = boostedBoxes;
       }
       rawWeakPeople.push(
-        ...mapPredictionsToWeakPeople(boostedRaw, width, height, minConfidencePercent)
+        ...mapPredictionsToWeakPeople(boostedRaw, pass1InputW, pass1InputH, minConfidencePercent)
       );
-      rawWeapons.push(...mapPredictionsToDangerousObjects(boostedRaw, width, height, 0, 1));
-      rawOccluders.push(...mapPredictionsToOccluders(boostedRaw, width, height, 0, 1));
+      rawWeapons.push(
+        ...mapPredictionsToDangerousObjects(boostedRaw, pass1InputW, pass1InputH, 0, 1)
+      );
+      rawOccluders.push(...mapPredictionsToOccluders(boostedRaw, pass1InputW, pass1InputH, 0, 1));
     }
   }
 
-  // Pass 2 & 3: Overlapping 60% square-aspect tiles ONLY for wide landscape multi-person scenes
+  // Helper to run COCO-SSD across an overlapping zoom tile grid (upscaling small crops cleanly to >= 320px)
+  const runTileGrid = async (
+    cols: number,
+    rows: number,
+    overlap: number,
+    tileMinConf: number,
+    maxPerTile: number
+  ): Promise<DetectedPersonBox[]> => {
+    const tiles = buildOverlappingTileGrid(cols, rows, overlap);
+    const collected: DetectedPersonBox[] = [];
+
+    for (const tile of tiles) {
+      const sx = Math.floor((tile.xmin / 1000) * width);
+      const sy = Math.floor((tile.ymin / 1000) * height);
+      const sw = Math.max(24, Math.min(width - sx, Math.ceil(((tile.xmax - tile.xmin) / 1000) * width)));
+      const sh = Math.max(24, Math.min(height - sy, Math.ceil(((tile.ymax - tile.ymin) / 1000) * height)));
+
+      // Match COCO-SSD's native 300px tensor resolution: keeps 100% of zoomed crowd crop detail
+      // from the high-res 1080px source canvas while running 3-4x faster per tile!
+      const tileScale = 300 / Math.max(1, Math.max(sw, sh));
+      const tw = Math.max(64, Math.min(300, Math.round(sw * Math.min(tileScale, 2.2))));
+      const th = Math.max(64, Math.min(300, Math.round(sh * Math.min(tileScale, 2.2))));
+
+      cropTileCanvas = ensureTileCanvas(cropTileCanvas, tw, th);
+      const tctx = cropTileCanvas.getContext('2d');
+      if (!tctx) continue;
+
+      await yieldToMainThread();
+      tctx.imageSmoothingEnabled = true;
+      tctx.imageSmoothingQuality = 'high';
+      tctx.drawImage(canvas, sx, sy, sw, sh, 0, 0, tw, th);
+
+      const tileRaw = await safeModelDetect(model, cropTileCanvas, maxPerTile, rawMinScore);
+      for (const pred of tileRaw) {
+        if (pred.class !== 'person' || !Number.isFinite(pred.score)) continue;
+        const conf = Math.round(pred.score * 100);
+        const projected = mapTilePredictionToFullFrame(pred.bbox, conf, tw, th, tile, tileMinConf);
+        if (projected) {
+          collected.push(projected);
+        }
+      }
+
+      const tileScaleX = (tile.xmax - tile.xmin) / 1000;
+      rawWeapons.push(...mapPredictionsToDangerousObjects(tileRaw, tw, th, tile.xmin, tileScaleX));
+      rawOccluders.push(...mapPredictionsToOccluders(tileRaw, tw, th, tile.xmin, tileScaleX));
+    }
+
+    return collected;
+  };
+
+  // Pass 2: Overlapping 2x2 Quadrant Zoom Tiles (catches groups, back-row students, and crowds)
   const hasCloseUpDominantPerson = fullBoxes.some(
     (b) => b.box_2d[3] - b.box_2d[1] >= 420 || b.box_2d[2] - b.box_2d[0] >= 580
   );
-  const isLandscape = width >= height;
-  const shouldRunTiles =
-    isLandscape &&
-    width >= 320 &&
+  const canRunTiles =
     !hasCloseUpDominantPerson &&
-    (fullPassMs < 350 || fullBoxes.length >= 2);
-  let leftBoxes: DetectedPersonBox[] = [];
-  let rightBoxes: DetectedPersonBox[] = [];
+    !exposure?.isBlankFrame &&
+    width >= 260 &&
+    height >= 180 &&
+    (fullPassMs < 1500 || fullBoxes.length >= 1);
 
-  if (shouldRunTiles) {
-    const tileW = Math.round(width * 0.6);
-    const rightStartX = width - tileW;
-
-    leftTileCanvas = ensureTileCanvas(leftTileCanvas, tileW, height);
-    rightTileCanvas = ensureTileCanvas(rightTileCanvas, tileW, height);
-
-    const leftCtx = leftTileCanvas.getContext('2d');
-    const rightCtx = rightTileCanvas.getContext('2d');
-
-    if (leftCtx && rightCtx) {
-      await yieldToMainThread();
-      leftCtx.drawImage(canvas, 0, 0, tileW, height, 0, 0, tileW, height);
-      const leftRaw = await safeModelDetect(model, leftTileCanvas, 30, rawMinScore);
-      leftBoxes = mapPredictionsToBoxes(leftRaw, tileW, height, minConfidencePercent);
-      rawWeakPeople.push(
-        ...mapPredictionsToWeakPeople(leftRaw, tileW, height, minConfidencePercent, 0, 0.6)
-      );
-      rawWeapons.push(...mapPredictionsToDangerousObjects(leftRaw, tileW, height, 0, 0.6));
-      rawOccluders.push(...mapPredictionsToOccluders(leftRaw, tileW, height, 0, 0.6));
-
-      await yieldToMainThread();
-      rightCtx.drawImage(canvas, rightStartX, 0, tileW, height, 0, 0, tileW, height);
-      const rightRaw = await safeModelDetect(model, rightTileCanvas, 30, rawMinScore);
-      rightBoxes = mapPredictionsToBoxes(rightRaw, tileW, height, minConfidencePercent);
-      rawWeakPeople.push(
-        ...mapPredictionsToWeakPeople(rightRaw, tileW, height, minConfidencePercent, 400, 0.6)
-      );
-      rawWeapons.push(...mapPredictionsToDangerousObjects(rightRaw, tileW, height, 400, 0.6));
-      rawOccluders.push(...mapPredictionsToOccluders(rightRaw, tileW, height, 400, 0.6));
-    }
+  let quadBoxes: DetectedPersonBox[] = [];
+  if (canRunTiles) {
+    quadBoxes = await runTileGrid(2, 2, 0.2, Math.max(24, minConfidencePercent - 2), 45);
   }
 
-  let people = shouldRunTiles
-    ? mergeTiledPersonDetections(fullBoxes, leftBoxes, rightBoxes, minConfidencePercent)
-    : fullBoxes;
+  // Pass 3: Adaptive Deep Crowd Zoom Pyramid (4x3 on fast GPU, 3x3 on mid-tier, 3x2 on slow CPU)
+  // Automatically engages whenever a dense crowd or distant small people are detected!
+  let deepCrowdBoxes: DetectedPersonBox[] = [];
+  let crowdScanUsed = false;
+  if (
+    canRunTiles &&
+    options?.allowDeepCrowdScan !== false &&
+    shouldEngageDeepCrowdGrid(fullBoxes, quadBoxes, hasCloseUpDominantPerson)
+  ) {
+    crowdScanUsed = true;
+    const gridCols = fullPassMs < 400 ? 4 : 3;
+    const gridRows = fullPassMs < 700 ? 3 : 2;
+    deepCrowdBoxes = await runTileGrid(gridCols, gridRows, 0.22, 22, 50);
+  }
+
+  let people: DetectedPersonBox[] =
+    crowdScanUsed || quadBoxes.length > 0
+      ? mergeCrowdTileDetections(
+          [...fullBoxes, ...quadBoxes, ...deepCrowdBoxes],
+          crowdScanUsed ? 22 : minConfidencePercent
+        )
+      : fullBoxes;
 
   // Pass 4: Lower-Torso Recovery Crop when face is hidden by a racket/book/hand
   if (
@@ -645,21 +713,24 @@ export async function detectPeopleLocallyOnCanvas(
   ) {
     const cropStartY = Math.round(height * 0.34);
     const cropH = height - cropStartY;
-    torsoTileCanvas = ensureTileCanvas(torsoTileCanvas, width, cropH);
+    const torsoScale = Math.min(1, 320 / Math.max(width, cropH));
+    const torsoW = Math.max(64, Math.round(width * torsoScale));
+    const torsoH = Math.max(64, Math.round(cropH * torsoScale));
+    torsoTileCanvas = ensureTileCanvas(torsoTileCanvas, torsoW, torsoH);
     const torsoCtx = torsoTileCanvas.getContext('2d');
     if (torsoCtx) {
       await yieldToMainThread();
-      torsoCtx.drawImage(canvas, 0, cropStartY, width, cropH, 0, 0, width, cropH);
+      torsoCtx.drawImage(canvas, 0, cropStartY, width, cropH, 0, 0, torsoW, torsoH);
       const torsoRaw = await safeModelDetect(model, torsoTileCanvas, 20, rawMinScore);
       for (const pred of torsoRaw) {
         if (pred.class !== 'person' || !Number.isFinite(pred.score)) continue;
         const conf = Math.round(pred.score * 100);
         if (conf < 20) continue;
         const [bx, by, bw, bh] = pred.bbox;
-        const xmin = Math.round((Math.max(0, bx) / width) * 1000);
-        const xmax = Math.round((Math.min(width, bx + bw) / width) * 1000);
-        const mappedYmin = Math.round(340 + (Math.max(0, by) / cropH) * 660);
-        const mappedYmax = Math.round(340 + (Math.min(cropH, by + bh) / cropH) * 660);
+        const xmin = Math.round((Math.max(0, bx) / torsoW) * 1000);
+        const xmax = Math.round((Math.min(torsoW, bx + bw) / torsoW) * 1000);
+        const mappedYmin = Math.round(340 + (Math.max(0, by) / torsoH) * 660);
+        const mappedYmax = Math.round(340 + (Math.min(torsoH, by + bh) / torsoH) * 660);
         const extendedYmin = Math.max(40, mappedYmin - Math.round((mappedYmax - mappedYmin) * 0.45));
         const boxW = xmax - xmin;
         if (boxW < 80 || mappedYmax - extendedYmin < 170) continue;
@@ -691,5 +762,6 @@ export async function detectPeopleLocallyOnCanvas(
     occluderObjects,
     inferenceMs,
     backend: detectorBackend,
+    crowdScanUsed,
   };
 }
