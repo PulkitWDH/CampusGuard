@@ -51,10 +51,15 @@ export async function openRawMediaStream(options: {
   audioDeviceId?: string;
 }): Promise<MediaStream> {
   const { includeVideo = true, videoDeviceId, audioDeviceId } = options;
+  const hdVideoConstraints: MediaTrackConstraints = {
+    width: { ideal: 1920 },
+    height: { ideal: 1080 },
+    frameRate: { ideal: 30 },
+  };
   const exactVideo: MediaTrackConstraints | boolean = includeVideo
     ? videoDeviceId
-      ? { deviceId: { exact: videoDeviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
-      : { width: { ideal: 1280 }, height: { ideal: 720 } }
+      ? { deviceId: { exact: videoDeviceId }, ...hdVideoConstraints }
+      : hdVideoConstraints
     : false;
 
   const rawAudioConstraint: MediaTrackConstraints = {
@@ -64,30 +69,40 @@ export async function openRawMediaStream(options: {
     autoGainControl: false,
   };
 
-  // Attempt 1: Exact device + raw unattenuated audio
+  // Attempt 1: Exact device + Full HD video + raw unattenuated audio
   try {
     return await navigator.mediaDevices.getUserMedia({
       video: exactVideo,
       audio: rawAudioConstraint,
     });
   } catch {
-    // Attempt 2: Relaxed ideal deviceId (handles stale device IDs across different devices/browsers)
+    // Attempt 2: Relaxed ideal deviceId while preserving Full HD video quality
     try {
       return await navigator.mediaDevices.getUserMedia({
         video: includeVideo
           ? videoDeviceId
-            ? { deviceId: { ideal: videoDeviceId } }
-            : true
+            ? { deviceId: { ideal: videoDeviceId }, ...hdVideoConstraints }
+            : hdVideoConstraints
           : false,
         audio: audioDeviceId ? { deviceId: { ideal: audioDeviceId } } : true,
       });
     } catch (err) {
-      // Attempt 3: Video-only fallback if device has no microphone or mic permission is denied/busy
+      // Attempt 3: Full HD video-only fallback if device has no microphone or mic is denied/busy
       if (includeVideo) {
-        return await navigator.mediaDevices.getUserMedia({
-          video: videoDeviceId ? { deviceId: { ideal: videoDeviceId } } : true,
-          audio: false,
-        });
+        try {
+          return await navigator.mediaDevices.getUserMedia({
+            video: videoDeviceId
+              ? { deviceId: { ideal: videoDeviceId }, ...hdVideoConstraints }
+              : hdVideoConstraints,
+            audio: false,
+          });
+        } catch {
+          // Attempt 4: Bare video-only fallback for legacy webcams rejecting HD constraints
+          return await navigator.mediaDevices.getUserMedia({
+            video: videoDeviceId ? { deviceId: { ideal: videoDeviceId } } : true,
+            audio: false,
+          });
+        }
       }
       throw err;
     }

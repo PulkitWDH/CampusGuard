@@ -113,6 +113,17 @@ function loadSavedWatchlist(): WatchlistSubject[] {
   }
 }
 
+const STORAGE_THEME_KEY = 'campusguard_theme_v1';
+
+function loadSavedThemeMode(): 'light' | 'dark' {
+  if (typeof window === 'undefined') return 'light';
+  try {
+    return localStorage.getItem(STORAGE_THEME_KEY) === 'dark' ? 'dark' : 'light';
+  } catch {
+    return 'light';
+  }
+}
+
 function loadSavedThreatSensitivity(): ThreatSensitivity {
   if (typeof window === 'undefined') return 'standard';
   try {
@@ -196,6 +207,7 @@ export default function App() {
   const [alerts, setAlerts] = useState<IncidentAlert[]>(loadSavedAlerts);
   const [popupAlerts, setPopupAlerts] = useState<IncidentAlert[]>([]);
   const [facilityMode, setFacilityMode] = useState<FacilityMode>(loadSavedFacilityMode);
+  const [themeMode, setThemeMode] = useState<'light' | 'dark'>(loadSavedThemeMode);
   const [threatSensitivity, setThreatSensitivity] = useState<ThreatSensitivity>(
     loadSavedThreatSensitivity
   );
@@ -334,6 +346,8 @@ export default function App() {
   const dvrProvidersRef = useRef<Record<string, () => DvrBundleSnapshot>>({});
   const caseCounterRef = useRef(1);
   const mediaStreamsRef = useRef<Record<string, MediaStream>>({});
+  const reconnectingIdsRef = useRef<Set<string>>(new Set());
+  const permissionBlockedIdsRef = useRef<Set<string>>(new Set());
   const analyzingIdsRef = useRef<Set<string>>(new Set());
   const lastSpikeScanAtRef = useRef<Record<string, number>>({});
   const lastDbAlertAtRef = useRef<Record<string, number>>({});
@@ -634,6 +648,18 @@ export default function App() {
       // ignore storage quota errors
     }
   }, [watchlist]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    root.classList.toggle('dark', themeMode === 'dark');
+    root.dataset.theme = themeMode;
+    root.style.colorScheme = themeMode;
+    try {
+      localStorage.setItem(STORAGE_THEME_KEY, themeMode);
+    } catch {
+      // ignore storage errors
+    }
+  }, [themeMode]);
 
   const labels = useMemo(() => formatFacilityLabels(facilityMode), [facilityMode]);
 
@@ -984,13 +1010,31 @@ export default function App() {
           setGlobalError(null);
           applyLocalEdgeSafetyFallback(
             capturePayload?.previewDataUrl,
-            'Cloud API quota limit reached (HTTP 429) — running seamlessly on unlimited on-device Edge AI (multi-person counting + local voice & safety monitoring). Click Scan Now anytime to retry cloud AI.'
+            !isAutoTrigger
+              ? 'Cloud API quota limit reached — running on-device Edge AI locally.'
+              : undefined
           );
           return;
         }
 
         const baseMessage =
           err instanceof Error ? err.message : 'Unable to complete zone AI analysis.';
+        const isNetworkOrOfflineError =
+          !status ||
+          status >= 500 ||
+          /failed to fetch|networkerror|load failed|network request failed|abort/i.test(baseMessage);
+
+        if (isNetworkOrOfflineError) {
+          setGlobalError(null);
+          applyLocalEdgeSafetyFallback(
+            capturePayload?.previewDataUrl,
+            !isAutoTrigger
+              ? 'Cloud AI offline — monitoring seamlessly with on-device Edge AI.'
+              : undefined
+          );
+          return;
+        }
+
         const shouldPauseOnAuth = status === 401 || status === 403;
         const finalMessage = shouldPauseOnAuth
           ? `${baseMessage} Autonomous scanning paused for this camera.`
@@ -1819,31 +1863,150 @@ export default function App() {
     ]
   );
 
-  const handleReconnectStream = useCallback(async (cameraId: string) => {
-    const target = camerasRef.current.find((c) => c.id === cameraId);
-    if (!target) return;
-    const isMicOnly = target.sourceKind === 'microphone-only' || !target.hasVideo;
-    try {
-      const stream = await openRawMediaStream({
-        includeVideo: !isMicOnly,
-        videoDeviceId: isMicOnly ? undefined : target.videoDeviceId,
-        audioDeviceId: target.audioDeviceId,
+  const isStreamAlive = useCallback(
+    (stream: MediaStream | undefined | null, requireVideo: boolean): boolean => {
+      if (!stream || !stream.active) return false;
+      const tracks = requireVideo ? stream.getVideoTracks() : stream.getAudioTracks();
+      return tracks.some((t) => t.readyState === 'live');
+    },
+    []
+  );
+
+  const handleReconnectStreamRef = useRef<
+    ((cameraId: string, options?: { silent?: boolean }) => Promise<void>) | null
+  >(null);
+
+  const bindStreamKeepAlive = useCallback(
+    (cameraId: string, stream: MediaStream, requireVideo: boolean) => {
+      const tracks = requireVideo ? stream.getVideoTracks() : stream.getAudioTracks();
+      tracks.forEach((track) => {
+        track.addEventListener(
+          'ended',
+          () => {
+            // Only auto-heal if this stream is still the active one for a still-mounted camera
+            if (mediaStreamsRef.current[cameraId] !== stream) return;
+            if (!camerasRef.current.some((c) => c.id === cameraId)) return;
+            window.setTimeout(() => {
+              if (mediaStreamsRef.current[cameraId] === stream) {
+                void handleReconnectStreamRef.current?.(cameraId, { silent: true });
+              }
+            }, 900);
+          },
+          { once: true }
+        );
       });
-      mediaStreamsRef.current[cameraId] = stream;
-      setStreamRevision((v) => v + 1);
-      setStatusNotice(
-        isMicOnly
-          ? `Live microphone connected for "${target.classroomName}".`
-          : `Live camera reconnected for "${target.classroomName}".`
-      );
-    } catch {
-      setGlobalError(
-        isMicOnly
-          ? `Unable to access microphone for ${target.classroomName}. Allow browser mic permissions and retry.`
-          : `Unable to reconnect camera stream for ${target.classroomName}.`
-      );
-    }
-  }, []);
+    },
+    []
+  );
+
+  const handleReconnectStream = useCallback(
+    async (cameraId: string, options?: { silent?: boolean }) => {
+      const target = camerasRef.current.find((c) => c.id === cameraId);
+      if (!target) return;
+      if (reconnectingIdsRef.current.has(cameraId)) return;
+
+      const isMicOnly = target.sourceKind === 'microphone-only' || !target.hasVideo;
+      if (isStreamAlive(mediaStreamsRef.current[cameraId], !isMicOnly)) {
+        return;
+      }
+
+      if (!options?.silent) {
+        permissionBlockedIdsRef.current.delete(cameraId);
+      } else if (permissionBlockedIdsRef.current.has(cameraId)) {
+        return;
+      }
+
+      reconnectingIdsRef.current.add(cameraId);
+      try {
+        const prevStream = mediaStreamsRef.current[cameraId];
+        if (prevStream) {
+          prevStream.getTracks().forEach((t) => t.stop());
+        }
+
+        const stream = await openRawMediaStream({
+          includeVideo: !isMicOnly,
+          videoDeviceId: isMicOnly ? undefined : target.videoDeviceId,
+          audioDeviceId: target.audioDeviceId,
+        });
+
+        // Verify camera wasn't deleted while awaiting getUserMedia
+        if (!camerasRef.current.some((c) => c.id === cameraId)) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+
+        permissionBlockedIdsRef.current.delete(cameraId);
+        mediaStreamsRef.current[cameraId] = stream;
+        bindStreamKeepAlive(cameraId, stream, !isMicOnly);
+        setStreamRevision((v) => v + 1);
+        if (!options?.silent) {
+          setStatusNotice(
+            isMicOnly
+              ? `Live microphone connected for "${target.classroomName}".`
+              : `Live camera reconnected for "${target.classroomName}".`
+          );
+        }
+      } catch (err) {
+        const errName = err instanceof Error ? err.name : '';
+        if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError' || errName === 'SecurityError') {
+          permissionBlockedIdsRef.current.add(cameraId);
+        }
+        if (!options?.silent) {
+          setGlobalError(
+            isMicOnly
+              ? `Unable to access microphone for ${target.classroomName}. Allow browser mic permissions and retry.`
+              : `Unable to reconnect camera stream for ${target.classroomName}.`
+          );
+        }
+      } finally {
+        reconnectingIdsRef.current.delete(cameraId);
+      }
+    },
+    [bindStreamKeepAlive, isStreamAlive]
+  );
+
+  handleReconnectStreamRef.current = handleReconnectStream;
+
+  // Permanent Always-On Camera Keep-Alive Watchdog:
+  // Automatically reconnects saved cameras on page load/refresh, wakes paused/dropped streams
+  // after tab switches or sleep, and auto-recovers when wired HDMI/USB-C cameras replug.
+  useEffect(() => {
+    const healMissingStreams = () => {
+      for (const cam of camerasRef.current) {
+        const needsLocalStream =
+          cam.sourceKind === 'device-camera' ||
+          cam.sourceKind === 'microphone-only' ||
+          (cam.sourceKind === 'bluetooth-cctv' && !cam.streamUrl && !cam.customMediaUrl);
+        if (!needsLocalStream) continue;
+
+        const requireVideo = cam.sourceKind !== 'microphone-only' && cam.hasVideo;
+        if (!isStreamAlive(mediaStreamsRef.current[cam.id], requireVideo)) {
+          void handleReconnectStream(cam.id, { silent: true });
+        }
+      }
+    };
+
+    healMissingStreams();
+    const watchdogTimer = window.setInterval(healMissingStreams, 4000);
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        healMissingStreams();
+      }
+    };
+    const handleDeviceChange = () => {
+      permissionBlockedIdsRef.current.clear();
+      healMissingStreams();
+    };
+
+    document.addEventListener('visibilitychange', handleVisibility);
+    navigator.mediaDevices?.addEventListener?.('devicechange', handleDeviceChange);
+
+    return () => {
+      window.clearInterval(watchdogTimer);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      navigator.mediaDevices?.removeEventListener?.('devicechange', handleDeviceChange);
+    };
+  }, [cameras.length, handleReconnectStream, isStreamAlive]);
 
   const handleAddBluetoothCamera = useCallback(
     (
@@ -1854,6 +2017,7 @@ export default function App() {
       const newCamId = `cam-bt-${Date.now()}`;
       if (options.stream) {
         mediaStreamsRef.current[newCamId] = options.stream;
+        bindStreamKeepAlive(newCamId, options.stream, true);
       }
 
       const newCamera: ClassroomCamera = {
@@ -1884,7 +2048,7 @@ export default function App() {
       setActiveView('grid');
       setIsScannerOpen(false);
     },
-    [persistZoneAsync, selectedAiModel]
+    [bindStreamKeepAlive, persistZoneAsync, selectedAiModel]
   );
 
   const handleAddHardwareCamera = useCallback(
@@ -1897,6 +2061,7 @@ export default function App() {
     ) => {
       const newCamId = `cam-hw-${Date.now()}`;
       mediaStreamsRef.current[newCamId] = stream;
+      bindStreamKeepAlive(newCamId, stream, true);
       const newCamera: ClassroomCamera = {
         id: newCamId,
         cameraCode: `CAM-${camerasRef.current.length + 1}`,
@@ -2329,10 +2494,10 @@ export default function App() {
       ? 'WARNING'
       : 'NOMINAL';
   const threatStatusTone = hasCriticalCameraOrAlert
-    ? 'text-red-400'
+    ? 'text-red-600'
     : hasWarningCameraOrAlert
-      ? 'text-amber-400'
-      : 'text-emerald-400';
+      ? 'text-amber-600'
+      : 'text-emerald-600';
 
   const wallGridClass =
     wallLayout === '1x1' || (cameras.length === 1 && wallLayout === '2x2')
@@ -2342,13 +2507,17 @@ export default function App() {
         : 'grid-cols-1 md:grid-cols-2';
 
   return (
-    <div id="top" className="min-h-screen bg-[#09090B] text-zinc-100 flex flex-col">
+    <div id="top" className="min-h-screen bg-slate-50 dark:bg-[#09090B] text-slate-900 dark:text-zinc-100 flex flex-col">
       <TopBar
         activeView={activeView}
         onSelectView={setActiveView}
         unreadAlertsCount={summary.activeAlertsCount}
         evidenceCount={evidenceCases.length}
         onOpenScanner={() => openScannerOnTab('wifi')}
+        themeMode={themeMode}
+        onToggleThemeMode={() =>
+          setThemeMode((prev) => (prev === 'dark' ? 'light' : 'dark'))
+        }
       />
       <OfflineBanner />
 
@@ -2391,47 +2560,49 @@ export default function App() {
           onEnrollWatchlistPhoto={handleEnrollWatchlistPhoto}
           onRemoveWatchlistSubject={handleRemoveWatchlistSubject}
           onStatusNotice={setStatusNotice}
+          themeMode={themeMode}
+          onChangeThemeMode={setThemeMode}
         />
 
-        {activeView === 'grid' ? (
-          <div className="flex-1 min-w-0 flex flex-col xl:flex-row">
-            {/* Center Surveillance Stage */}
-            <main className="flex-1 min-w-0 flex flex-col">
-              {/* Operational Telemetry Ribbon */}
+        {/* Keep Camera Surveillance Wall permanently mounted so switching tabs NEVER stops or drops live cameras */}
+        <div className={activeView === 'grid' ? 'flex-1 min-w-0 flex flex-col xl:flex-row' : 'hidden'}>
+          {/* Center Surveillance Stage */}
+          <main className="flex-1 min-w-0 flex flex-col">
+              {/* Clean Summary Bar */}
               <div
                 data-testid="telemetry-ribbon"
-                className="bg-[#101114] border-b border-zinc-800/90 px-4 sm:px-5 py-2.5 flex flex-wrap items-center justify-between gap-3"
+                className="bg-white border-b border-slate-200 px-4 sm:px-6 py-2.5 flex flex-wrap items-center justify-between gap-3"
               >
                 <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5">
                   <div className="flex items-baseline gap-2">
-                    <span className="text-[11px] text-zinc-500">Occupancy</span>
+                    <span className="text-xs text-slate-500">Occupancy</span>
                     <span
-                      className="text-sm font-mono font-semibold tabular-nums text-zinc-100"
+                      className="text-sm font-mono font-semibold tabular-nums text-slate-900"
                       data-testid="telemetry-occupancy"
                     >
                       {summary.totalKidsCount}
                     </span>
                   </div>
-                  <span className="hidden sm:inline-block h-3.5 w-px bg-zinc-800" aria-hidden="true" />
+                  <span className="hidden sm:inline-block h-3.5 w-px bg-slate-200" aria-hidden="true" />
                   <div className="flex items-baseline gap-2">
-                    <span className="text-[11px] text-zinc-500">Active Feeds</span>
-                    <span className="text-sm font-mono font-semibold tabular-nums text-zinc-100">
+                    <span className="text-xs text-slate-500">Cameras</span>
+                    <span className="text-sm font-mono font-semibold tabular-nums text-slate-900">
                       {summary.totalCameras}
                     </span>
                   </div>
-                  <span className="hidden sm:inline-block h-3.5 w-px bg-zinc-800" aria-hidden="true" />
+                  <span className="hidden sm:inline-block h-3.5 w-px bg-slate-200" aria-hidden="true" />
                   <div className="flex items-baseline gap-2">
-                    <span className="text-[11px] text-zinc-500">Status</span>
+                    <span className="text-xs text-slate-500">Status</span>
                     <span className={`text-xs font-mono font-semibold tracking-wider ${threatStatusTone}`}>
                       {threatStatusLabel}
                     </span>
                   </div>
-                  <span className="hidden sm:inline-block h-3.5 w-px bg-zinc-800" aria-hidden="true" />
+                  <span className="hidden sm:inline-block h-3.5 w-px bg-slate-200" aria-hidden="true" />
                   <div className="flex items-baseline gap-2">
-                    <span className="text-[11px] text-zinc-500">Open Alerts</span>
+                    <span className="text-xs text-slate-500">Open Alerts</span>
                     <span
                       className={`text-sm font-mono font-semibold tabular-nums ${
-                        summary.activeAlertsCount > 0 ? 'text-red-400' : 'text-zinc-300'
+                        summary.activeAlertsCount > 0 ? 'text-red-600' : 'text-slate-700'
                       }`}
                     >
                       {summary.activeAlertsCount}
@@ -2439,34 +2610,15 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Right Controls: Mobile selectors + Wall Layout Switcher */}
+                {/* Right Controls: Mobile quick controls + Layout Switcher */}
                 <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 min-w-0">
-                  <select
-                    aria-label="Select facility mode"
-                    value={facilityMode}
-                    onChange={(e) => setFacilityMode(e.target.value as FacilityMode)}
-                    className="lg:hidden text-xs bg-[#09090B] border border-zinc-800 rounded-md px-2 py-1 text-zinc-200"
-                  >
-                    <option value="all">All Sectors</option>
-                    <option value="bank">Bank &amp; Vault</option>
-                    <option value="school">School &amp; Class</option>
-                  </select>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setThreatSensitivity((prev) => (prev === 'standard' ? 'high' : 'standard'))
-                    }
-                    className="lg:hidden text-xs bg-[#09090B] border border-zinc-800 rounded-md px-2 py-1 text-zinc-300 cursor-pointer"
-                  >
-                    AI: {threatSensitivity === 'high' ? 'High' : 'Std'}
-                  </button>
                   <AppDownloadControls compact onStatusNotice={setStatusNotice} />
 
                   {focusedCamera ? (
                     <button
                       type="button"
                       onClick={() => setFocusedCameraId(null)}
-                      className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md border border-zinc-800 bg-[#16181D] text-zinc-200 hover:bg-zinc-800 transition-colors whitespace-nowrap cursor-pointer"
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 transition-colors whitespace-nowrap cursor-pointer"
                     >
                       <LayoutGrid className="w-3.5 h-3.5" aria-hidden="true" />
                       <span>All Feeds ({cameras.length})</span>
@@ -2475,7 +2627,7 @@ export default function App() {
                     <div
                       role="group"
                       aria-label="Monitor wall layout"
-                      className="inline-flex items-center bg-[#09090B] border border-zinc-800 rounded-md p-0.5"
+                      className="inline-flex items-center bg-slate-100 border border-slate-200 rounded-md p-0.5"
                     >
                       {(
                         [
@@ -2495,8 +2647,8 @@ export default function App() {
                             onClick={() => setWallLayout(opt.id)}
                             className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-mono rounded transition-colors cursor-pointer ${
                               active
-                                ? 'bg-zinc-800 text-zinc-100 font-semibold'
-                                : 'text-zinc-500 hover:text-zinc-300'
+                                ? 'bg-white text-slate-900 font-semibold shadow-2xs'
+                                : 'text-slate-500 hover:text-slate-800'
                             }`}
                           >
                             <Icon className="w-3 h-3" aria-hidden="true" />
@@ -2510,7 +2662,7 @@ export default function App() {
               </div>
 
               {/* Center Stage Workspace */}
-              <div className="flex-1 p-4 sm:p-5 space-y-4 min-w-0">
+              <div className="flex-1 p-4 sm:p-6 space-y-4 min-w-0">
                 <NotificationBanner
                   alert={latestUnacknowledgedAlert}
                   onInspectCamera={handleFocusFromAlert}
@@ -2521,13 +2673,13 @@ export default function App() {
                 {statusNotice ? (
                   <div
                     role="status"
-                    className="bg-emerald-950/50 border border-emerald-800/70 text-emerald-100 rounded-lg px-4 py-2.5 text-xs flex items-center justify-between gap-4"
+                    className="bg-emerald-50 border border-emerald-200 text-emerald-900 rounded-lg px-4 py-2.5 text-xs flex items-center justify-between gap-4"
                   >
                     <span>{statusNotice}</span>
                     <button
                       type="button"
                       onClick={() => setStatusNotice(null)}
-                      className="text-xs font-semibold text-emerald-300 hover:underline cursor-pointer shrink-0"
+                      className="text-xs font-semibold text-emerald-700 hover:underline cursor-pointer shrink-0"
                     >
                       Dismiss
                     </button>
@@ -2537,13 +2689,13 @@ export default function App() {
                 {globalError ? (
                   <div
                     role="alert"
-                    className="bg-amber-950/50 border border-amber-800/70 text-amber-100 rounded-lg px-4 py-2.5 text-xs flex items-center justify-between gap-4"
+                    className="bg-amber-50 border border-amber-200 text-amber-900 rounded-lg px-4 py-2.5 text-xs flex items-center justify-between gap-4"
                   >
                     <span>{globalError}</span>
                     <button
                       type="button"
                       onClick={() => setGlobalError(null)}
-                      className="text-xs font-semibold text-amber-300 hover:underline cursor-pointer shrink-0"
+                      className="text-xs font-semibold text-amber-800 hover:underline cursor-pointer shrink-0"
                     >
                       Dismiss
                     </button>
@@ -2554,54 +2706,28 @@ export default function App() {
                   <section
                     aria-label="Standby surveillance wall"
                     data-testid="empty-cameras-state"
-                    className="relative bg-[#0E0F12] border border-zinc-800/90 rounded-lg overflow-hidden p-6 sm:p-8 flex flex-col justify-between min-h-[440px]"
+                    className="bg-white border border-slate-200 rounded-xl p-6 sm:p-10 flex flex-col justify-center min-h-[420px]"
                   >
-                    {/* Viewfinder corner reticles */}
-                    <span
-                      aria-hidden="true"
-                      className="pointer-events-none absolute top-3 left-3 w-4 h-4 border-t border-l border-zinc-700"
-                    />
-                    <span
-                      aria-hidden="true"
-                      className="pointer-events-none absolute top-3 right-3 w-4 h-4 border-t border-r border-zinc-700"
-                    />
-                    <span
-                      aria-hidden="true"
-                      className="pointer-events-none absolute bottom-3 left-3 w-4 h-4 border-b border-l border-zinc-700"
-                    />
-                    <span
-                      aria-hidden="true"
-                      className="pointer-events-none absolute bottom-3 right-3 w-4 h-4 border-b border-r border-zinc-700"
-                    />
-
-                    <div className="flex items-center justify-between gap-2 text-[11px] font-mono text-zinc-500">
-                      <span>CH-00 · STANDBY</span>
-                      <span>
-                        EDGE AI ARMED · {threatSensitivity === 'high' ? 'HIGH' : 'STANDARD'} · &gt;
-                        {SOUND_ALERT_THRESHOLD_DB.toFixed(1)} dB
-                      </span>
-                    </div>
-
-                    <div className="my-auto py-8 max-w-2xl mx-auto text-center space-y-3">
-                      <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-zinc-100">
+                    <div className="my-auto py-6 max-w-2xl mx-auto text-center space-y-3">
+                      <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-slate-900 text-balance">
                         {labels.monitorTitle}
                       </h1>
-                      <p className="text-sm text-zinc-400 leading-relaxed max-w-xl mx-auto">
-                        Select a camera source to bring the surveillance wall online. Real-time on-device vision tracks people through face occlusion while filtering normal movement to prevent false fight alarms.
+                      <p className="text-sm text-slate-500 leading-relaxed max-w-lg mx-auto">
+                        Choose a camera or microphone source to start live on-device human detection and safety monitoring.
                       </p>
 
-                      {/* 5 Direct Quick-Connect Source Tiles */}
-                      <div className="pt-5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5 text-left">
+                      {/* 5 Clean Source Tiles */}
+                      <div className="pt-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 text-left">
                         <button
                           type="button"
                           onClick={() => openScannerOnTab('wifi')}
-                          className="group bg-[#14161B] hover:bg-[#1A1D24] border border-zinc-800 hover:border-zinc-600 rounded-lg p-3.5 transition-colors cursor-pointer flex flex-col gap-2"
+                          className="group bg-white hover:bg-slate-50 border border-slate-200 hover:border-slate-400 rounded-xl p-4 transition-colors cursor-pointer flex flex-col gap-2.5"
                         >
-                          <Wifi className="w-4 h-4 text-zinc-100" aria-hidden="true" />
+                          <Wifi className="w-4 h-4 text-slate-800" aria-hidden="true" />
                           <div>
-                            <div className="text-xs font-semibold text-zinc-100">Wi-Fi CCTV</div>
-                            <div className="text-[11px] text-zinc-500 mt-0.5 leading-snug">
-                              Auto-scan computer Wi-Fi · No PIN needed
+                            <div className="text-xs font-semibold text-slate-900">Wi-Fi CCTV</div>
+                            <div className="text-[11px] text-slate-500 mt-0.5 leading-snug">
+                              Auto-scan Wi-Fi · No PIN needed
                             </div>
                           </div>
                         </button>
@@ -2609,13 +2735,13 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => openScannerOnTab('hardware')}
-                          className="group bg-[#14161B] hover:bg-[#1A1D24] border border-zinc-800 hover:border-zinc-600 rounded-lg p-3.5 transition-colors cursor-pointer flex flex-col gap-2"
+                          className="group bg-white hover:bg-slate-50 border border-slate-200 hover:border-slate-400 rounded-xl p-4 transition-colors cursor-pointer flex flex-col gap-2.5"
                         >
-                          <Camera className="w-4 h-4 text-zinc-100" aria-hidden="true" />
+                          <Camera className="w-4 h-4 text-slate-800" aria-hidden="true" />
                           <div>
-                            <div className="text-xs font-semibold text-zinc-100">Wired (HDMI / USB-C)</div>
-                            <div className="text-[11px] text-zinc-500 mt-0.5 leading-snug">
-                              Scan HDMI capture, Type-C, SDI/BNC &amp; USB cams
+                            <div className="text-xs font-semibold text-slate-900">Built-in / Wired</div>
+                            <div className="text-[11px] text-slate-500 mt-0.5 leading-snug">
+                              Built-in webcam, HDMI, USB-C &amp; USB
                             </div>
                           </div>
                         </button>
@@ -2623,13 +2749,13 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => openScannerOnTab('microphone')}
-                          className="group bg-[#14161B] hover:bg-[#1A1D24] border border-zinc-800 hover:border-zinc-600 rounded-lg p-3.5 transition-colors cursor-pointer flex flex-col gap-2"
+                          className="group bg-white hover:bg-slate-50 border border-slate-200 hover:border-slate-400 rounded-xl p-4 transition-colors cursor-pointer flex flex-col gap-2.5"
                         >
-                          <Mic className="w-4 h-4 text-zinc-100" aria-hidden="true" />
+                          <Mic className="w-4 h-4 text-slate-800" aria-hidden="true" />
                           <div>
-                            <div className="text-xs font-semibold text-zinc-100">Mic Only</div>
-                            <div className="text-[11px] text-zinc-500 mt-0.5 leading-snug">
-                              Audio-only dB &amp; voice distress monitor
+                            <div className="text-xs font-semibold text-slate-900">Mic Only</div>
+                            <div className="text-[11px] text-slate-500 mt-0.5 leading-snug">
+                              Audio-only dB &amp; distress monitor
                             </div>
                           </div>
                         </button>
@@ -2637,13 +2763,13 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => openScannerOnTab('bluetooth')}
-                          className="group bg-[#14161B] hover:bg-[#1A1D24] border border-zinc-800 hover:border-zinc-600 rounded-lg p-3.5 transition-colors cursor-pointer flex flex-col gap-2"
+                          className="group bg-white hover:bg-slate-50 border border-slate-200 hover:border-slate-400 rounded-xl p-4 transition-colors cursor-pointer flex flex-col gap-2.5"
                         >
-                          <Bluetooth className="w-4 h-4 text-zinc-100" aria-hidden="true" />
+                          <Bluetooth className="w-4 h-4 text-slate-800" aria-hidden="true" />
                           <div>
-                            <div className="text-xs font-semibold text-zinc-100">Bluetooth CCTV</div>
-                            <div className="text-[11px] text-zinc-500 mt-0.5 leading-snug">
-                              Pair Bluetooth camera or mic hardware
+                            <div className="text-xs font-semibold text-slate-900">Bluetooth CCTV</div>
+                            <div className="text-[11px] text-slate-500 mt-0.5 leading-snug">
+                              Pair Bluetooth camera or mic
                             </div>
                           </div>
                         </button>
@@ -2651,22 +2777,17 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => openScannerOnTab('upload')}
-                          className="group bg-[#14161B] hover:bg-[#1A1D24] border border-zinc-800 hover:border-zinc-600 rounded-lg p-3.5 transition-colors cursor-pointer flex flex-col gap-2"
+                          className="group bg-white hover:bg-slate-50 border border-slate-200 hover:border-slate-400 rounded-xl p-4 transition-colors cursor-pointer flex flex-col gap-2.5"
                         >
-                          <Upload className="w-4 h-4 text-zinc-100" aria-hidden="true" />
+                          <Upload className="w-4 h-4 text-slate-800" aria-hidden="true" />
                           <div>
-                            <div className="text-xs font-semibold text-zinc-100">Upload Clip</div>
-                            <div className="text-[11px] text-zinc-500 mt-0.5 leading-snug">
-                              Test recorded CCTV video or photo frame
+                            <div className="text-xs font-semibold text-slate-900">Upload Clip</div>
+                            <div className="text-[11px] text-slate-500 mt-0.5 leading-snug">
+                              Test recorded video or photo
                             </div>
                           </div>
                         </button>
                       </div>
-                    </div>
-
-                    <div className="flex items-center justify-between gap-4 text-[11px] font-mono text-zinc-600 min-w-0">
-                      <span className="truncate">{labels.sectorDescription}</span>
-                      <span className="shrink-0">READY</span>
                     </div>
                   </section>
                 ) : focusedCamera ? (
@@ -2708,7 +2829,7 @@ export default function App() {
 
                     {otherCameras.length > 0 ? (
                       <section aria-label="Other active camera feeds" className="space-y-2.5">
-                        <h2 className="text-xs font-medium text-zinc-400">
+                        <h2 className="text-xs font-medium text-slate-500">
                           Other Active {labels.zonePlural} ({otherCameras.length})
                         </h2>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -2828,7 +2949,8 @@ export default function App() {
               />
             )}
           </div>
-        ) : (
+
+        {activeView !== 'grid' ? (
           <main className="flex-1 min-w-0 p-4 sm:p-6 space-y-5 max-w-[1360px]">
             <NotificationBanner
               alert={latestUnacknowledgedAlert}
@@ -2840,13 +2962,13 @@ export default function App() {
             {statusNotice ? (
               <div
                 role="status"
-                className="bg-emerald-950/50 border border-emerald-800/70 text-emerald-100 rounded-lg px-4 py-2.5 text-xs flex items-center justify-between gap-4"
+                className="bg-emerald-50 border border-emerald-200 text-emerald-900 rounded-lg px-4 py-2.5 text-xs flex items-center justify-between gap-4"
               >
                 <span>{statusNotice}</span>
                 <button
                   type="button"
                   onClick={() => setStatusNotice(null)}
-                  className="text-xs font-semibold text-emerald-300 hover:underline cursor-pointer shrink-0"
+                  className="text-xs font-semibold text-emerald-700 hover:underline cursor-pointer shrink-0"
                 >
                   Dismiss
                 </button>
@@ -2856,13 +2978,13 @@ export default function App() {
             {globalError ? (
               <div
                 role="alert"
-                className="bg-amber-950/50 border border-amber-800/70 text-amber-100 rounded-lg px-4 py-2.5 text-xs flex items-center justify-between gap-4"
+                className="bg-amber-50 border border-amber-200 text-amber-900 rounded-lg px-4 py-2.5 text-xs flex items-center justify-between gap-4"
               >
                 <span>{globalError}</span>
                 <button
                   type="button"
                   onClick={() => setGlobalError(null)}
-                  className="text-xs font-semibold text-amber-300 hover:underline cursor-pointer shrink-0"
+                  className="text-xs font-semibold text-amber-800 hover:underline cursor-pointer shrink-0"
                 >
                   Dismiss
                 </button>
@@ -2882,10 +3004,10 @@ export default function App() {
             {activeView === 'alerts' ? (
               <div className="space-y-4">
                 <div>
-                  <h1 className="text-xl font-semibold tracking-tight text-zinc-100">
+                  <h1 className="text-xl font-semibold tracking-tight text-slate-900">
                     Incident &amp; Threat Audit Log
                   </h1>
-                  <p className="text-xs text-zinc-400 mt-0.5">
+                  <p className="text-xs text-slate-500 mt-0.5">
                     Review verified fighting, beating, bullying, weapon, breach, and &gt;{SOUND_ALERT_THRESHOLD_DB.toFixed(1)} dB (3s) acoustic alerts with occupancy counts and evidence frames.
                   </p>
                 </div>
@@ -2944,7 +3066,7 @@ export default function App() {
               />
             ) : null}
           </main>
-        )}
+        ) : null}
       </div>
 
       <AlertPopupOverlay

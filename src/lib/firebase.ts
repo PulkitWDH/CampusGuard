@@ -82,16 +82,7 @@ googleProvider.setCustomParameters({ prompt: 'consent select_account' });
 let cachedAccessToken: string | null = null;
 let isSigningIn = false;
 
-async function testConnection() {
-  try {
-    await getDocFromServer(doc(db, 'test', 'connection'));
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Please check your Firebase configuration.');
-    }
-  }
-}
-void testConnection();
+// Firestore persistence activates only after explicit Google Sign-In (owner-scoped rules).
 
 export enum OperationType {
   CREATE = 'create',

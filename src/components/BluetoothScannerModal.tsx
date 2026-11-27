@@ -563,10 +563,7 @@ export function BluetoothScannerModal({
 
   const handleConnectHardware = async () => {
     setHardwareError(null);
-    if (!hardwareRoomName.trim()) {
-      setHardwareError('Please enter a zone or classroom name.');
-      return;
-    }
+    const zoneLabel = hardwareRoomName.trim() || `Camera ${existingCameras.length + 1}`;
     if (!navigator.mediaDevices?.getUserMedia) {
       setHardwareError('Browser camera and microphone capture is unavailable here.');
       return;
@@ -579,16 +576,49 @@ export function BluetoothScannerModal({
       });
       const chosenCam = wiredCameras.find((d) => d.deviceId === selectedVideoId);
       onAddHardwareCamera(
-        hardwareRoomName.trim(),
+        zoneLabel,
         stream,
         selectedVideoId || undefined,
         selectedAudioId || undefined,
-        chosenCam ? `${chosenCam.interfaceBadge} · ${chosenCam.label}` : 'Wired Camera'
+        chosenCam ? `${chosenCam.interfaceBadge} · ${chosenCam.label}` : 'Built-in / Wired Camera'
       );
       setHardwareRoomName('');
       onClose();
     } catch {
-      setHardwareError('Camera permission was denied, or the selected wired port is currently in use by another app.');
+      setHardwareError('Camera permission was denied, or the selected camera port is currently in use by another app.');
+    }
+  };
+
+  const handleStartBuiltInCamera = async () => {
+    setHardwareError(null);
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setHardwareError('Browser camera capture is unavailable here.');
+      return;
+    }
+    const builtInCam = wiredCameras.find((c) => c.interfaceType === 'built-in');
+    const targetVideoId = builtInCam?.deviceId || undefined;
+    const targetAudioId = builtInCam?.matchedAudioDeviceId || selectedAudioId || undefined;
+    const zoneLabel = hardwareRoomName.trim() || 'Built-in Camera';
+    setConnectingWiredId('__builtin__');
+    try {
+      const stream = await openRawMediaStream({
+        includeVideo: true,
+        videoDeviceId: targetVideoId,
+        audioDeviceId: targetAudioId,
+      });
+      onAddHardwareCamera(
+        zoneLabel,
+        stream,
+        targetVideoId,
+        targetAudioId,
+        builtInCam ? `Built-in · ${builtInCam.label}` : 'Built-in Camera'
+      );
+      setHardwareRoomName('');
+      onClose();
+    } catch {
+      setHardwareError('Could not access the built-in camera. Please allow camera permission in your browser.');
+    } finally {
+      setConnectingWiredId(null);
     }
   };
 
@@ -719,15 +749,15 @@ export function BluetoothScannerModal({
       role="dialog"
       aria-modal="true"
       aria-labelledby="scanner-modal-title"
-      className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 bg-slate-900/45 backdrop-blur-xs flex items-center justify-center p-4"
     >
-      <div className="bg-[#101114] border border-zinc-800 rounded-lg w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden shadow-2xl">
-        <div className="px-5 py-4 border-b border-zinc-800/90 flex items-center justify-between gap-4">
+      <div className="bg-white border border-slate-200 rounded-lg w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden shadow-2xl">
+        <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between gap-4">
           <div>
-            <h2 id="scanner-modal-title" className="text-base font-semibold text-zinc-100">
+            <h2 id="scanner-modal-title" className="text-base font-semibold text-slate-900">
               Add Security Camera Feed
             </h2>
-            <p className="text-xs text-zinc-400 mt-0.5">
+            <p className="text-xs text-slate-500 mt-0.5">
               Connect Wi-Fi CCTV cameras, Bluetooth CCTV, local webcams, microphone-only monitors, or recorded footage.
             </p>
           </div>
@@ -735,20 +765,20 @@ export function BluetoothScannerModal({
             type="button"
             onClick={onClose}
             aria-label="Close camera setup modal"
-            className="p-1.5 rounded-md text-zinc-400 hover:text-white hover:bg-zinc-800 cursor-pointer"
+            className="p-1.5 rounded-md text-slate-500 hover:text-slate-900 hover:bg-slate-100 cursor-pointer"
           >
             <X className="w-5 h-5" aria-hidden="true" />
           </button>
         </div>
 
-        <div className="px-5 pt-1 border-b border-zinc-800/90 flex items-center gap-1 overflow-x-auto bg-[#0B0C0F]">
+        <div className="px-4 pt-1 border-b border-slate-200 flex items-center gap-0.5 overflow-x-auto bg-slate-50">
           {(
             [
               { id: 'wifi', label: 'Wi-Fi CCTV', icon: Wifi },
-              { id: 'hardware', label: 'Wired (HDMI / USB-C)', icon: Cable },
-              { id: 'bluetooth', label: 'Bluetooth CCTV', icon: Bluetooth },
+              { id: 'hardware', label: 'Built-in / Wired', icon: Cable },
+              { id: 'bluetooth', label: 'Bluetooth', icon: Bluetooth },
               { id: 'microphone', label: 'Mic Only', icon: Mic },
-              { id: 'upload', label: 'Upload Video / Photo', icon: Upload },
+              { id: 'upload', label: 'Upload Clip', icon: Upload },
             ] as const
           ).map((tab) => {
             const Icon = tab.icon;
@@ -758,10 +788,10 @@ export function BluetoothScannerModal({
                 key={tab.id}
                 type="button"
                 onClick={() => setActiveTab(tab.id)}
-                className={`inline-flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium border-b-2 transition-colors whitespace-nowrap cursor-pointer ${
+                className={`inline-flex items-center gap-1.5 px-2.5 py-2.5 text-xs font-medium border-b-2 transition-colors whitespace-nowrap cursor-pointer ${
                   active
-                    ? 'border-zinc-100 text-zinc-50'
-                    : 'border-transparent text-zinc-400 hover:text-zinc-200'
+                    ? 'border-slate-900 text-slate-950'
+                    : 'border-transparent text-slate-500 hover:text-slate-900'
                 }`}
               >
                 <Icon className="w-3.5 h-3.5" aria-hidden="true" />
@@ -776,9 +806,9 @@ export function BluetoothScannerModal({
           {activeTab === 'wifi' ? (
             <div className="space-y-4">
               {/* Computer Wi-Fi Status & Zero-PIN Explanation */}
-              <div className="bg-[#0B0C0F] border border-zinc-800 rounded-lg p-3.5 space-y-2.5">
+              <div className="bg-slate-50 border border-slate-200 rounded-lg p-3.5 space-y-2.5">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex items-center gap-2 text-xs font-semibold text-zinc-100">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-slate-900">
                     <span
                       className={`w-2 h-2 rounded-full ${
                         networkStatus.online ? 'bg-emerald-400' : 'bg-amber-400'
@@ -792,22 +822,22 @@ export function BluetoothScannerModal({
                     </span>
                   </div>
                   {wifiDetectedSubnet ? (
-                    <span className="text-[11px] font-mono text-zinc-400">
+                    <span className="text-[11px] font-mono text-slate-500">
                       LAN {wifiDetectedSubnet}.*
                     </span>
                   ) : null}
                 </div>
-                <p className="text-xs text-zinc-400 leading-relaxed">
+                <p className="text-xs text-slate-500 leading-relaxed">
                   Connect your computer&apos;s Wi-Fi to your CCTV camera&apos;s Wi-Fi network (or the same Wi-Fi router), then click{' '}
-                  <strong className="text-zinc-200">Scan Computer Wi-Fi</strong>. Discovered cameras connect in one click without entering a PIN code, IP address, or password.
+                  <strong className="text-slate-800">Scan Computer Wi-Fi</strong>. Discovered cameras connect in one click without entering a PIN code, IP address, or password.
                 </p>
               </div>
 
               {/* Optional Zone Name + One-Click Scan Actions */}
               <div className="space-y-3">
                 <div>
-                  <label htmlFor="wifi-room-input" className="block text-xs font-medium text-zinc-300 mb-1">
-                    Zone / Room Name <span className="text-zinc-500 font-normal">(optional — auto-named if blank)</span>
+                  <label htmlFor="wifi-room-input" className="block text-xs font-medium text-slate-700 mb-1">
+                    Zone / Room Name <span className="text-slate-500 font-normal">(optional — auto-named if blank)</span>
                   </label>
                   <input
                     id="wifi-room-input"
@@ -815,7 +845,7 @@ export function BluetoothScannerModal({
                     value={wifiRoomName}
                     onChange={(e) => setWifiRoomName(e.target.value)}
                     placeholder="e.g., Main Corridor Wi-Fi Cam"
-                    className="w-full text-sm px-3 py-2 border border-zinc-700 rounded-lg bg-[#09090B] text-zinc-100 focus-visible:outline-2 focus-visible:outline-zinc-400"
+                    className="w-full text-sm px-3 py-2 border border-slate-300 rounded-lg bg-slate-50 text-slate-900 focus-visible:outline-2 focus-visible:outline-zinc-400"
                   />
                 </div>
 
@@ -824,7 +854,7 @@ export function BluetoothScannerModal({
                     <button
                       type="button"
                       onClick={handleStopWifiScan}
-                      className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-md bg-zinc-200 text-zinc-950 hover:bg-white cursor-pointer"
+                      className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-md bg-slate-900 text-white hover:bg-slate-800 cursor-pointer"
                     >
                       <X className="w-3.5 h-3.5" aria-hidden="true" />
                       <span>Stop Scan</span>
@@ -833,7 +863,7 @@ export function BluetoothScannerModal({
                     <button
                       type="button"
                       onClick={() => void handleScanComputerWifi(false)}
-                      className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white cursor-pointer"
+                      className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-md bg-slate-900 text-white hover:bg-slate-800 cursor-pointer"
                     >
                       <Wifi className="w-4 h-4" aria-hidden="true" />
                       <span>Scan Computer Wi-Fi</span>
@@ -844,7 +874,7 @@ export function BluetoothScannerModal({
                     type="button"
                     onClick={() => void handleScanComputerWifi(true)}
                     disabled={isScanningWifi}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-md border border-zinc-800 bg-[#16181D] text-zinc-200 hover:bg-zinc-800 disabled:opacity-60 cursor-pointer"
+                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-md border border-slate-200 bg-slate-100 text-slate-800 hover:bg-slate-100 disabled:opacity-60 cursor-pointer"
                   >
                     <Radio className="w-3.5 h-3.5" aria-hidden="true" />
                     <span>Detect Wireless Phone / Cam Bridges</span>
@@ -853,17 +883,17 @@ export function BluetoothScannerModal({
 
                 {/* Live Scan Progress */}
                 {isScanningWifi && wifiScanProgress ? (
-                  <div className="bg-[#0B0C0F] border border-zinc-800 rounded-lg p-3 space-y-2">
+                  <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-2">
                     <div className="flex items-center justify-between gap-2 text-xs">
-                      <span className="text-zinc-200 flex items-center gap-1.5">
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-zinc-300" aria-hidden="true" />
+                      <span className="text-slate-800 flex items-center gap-1.5">
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-slate-700" aria-hidden="true" />
                         <span>{wifiScanProgress.label}</span>
                       </span>
-                      <span className="font-mono text-[11px] text-zinc-400">
+                      <span className="font-mono text-[11px] text-slate-500">
                         {wifiScanProgress.checked}/{wifiScanProgress.total}
                       </span>
                     </div>
-                    <div className="w-full h-1.5 bg-zinc-900 rounded-full overflow-hidden">
+                    <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
                       <div
                         className="h-full bg-emerald-500 transition-all duration-200"
                         style={{
@@ -884,34 +914,34 @@ export function BluetoothScannerModal({
               {discoveredWifiCameras.length > 0 ? (
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
-                    <h3 className="text-xs font-semibold text-zinc-200">
+                    <h3 className="text-xs font-semibold text-slate-800">
                       Found on Computer Wi-Fi ({discoveredWifiCameras.length})
                     </h3>
-                    <span className="text-[11px] text-emerald-400">Zero-PIN Direct Connect</span>
+                    <span className="text-[11px] text-emerald-600">Zero-PIN Direct Connect</span>
                   </div>
-                  <div className="divide-y divide-zinc-800 border border-zinc-800 rounded-lg overflow-hidden">
+                  <div className="divide-y divide-slate-200 border border-slate-200 rounded-lg overflow-hidden">
                     {discoveredWifiCameras.map((cam) => (
                       <div
                         key={cam.id}
-                        className="p-3 bg-[#0B0C0F] flex items-center justify-between gap-3"
+                        className="p-3 bg-slate-50 flex items-center justify-between gap-3"
                       >
                         <div className="flex items-center gap-3 min-w-0">
                           {cam.previewUrl ? (
                             <img
                               src={cam.previewUrl}
                               alt={`Live preview from ${cam.name}`}
-                              className="w-16 h-10 object-cover rounded border border-zinc-700 shrink-0 bg-black"
+                              className="w-16 h-10 object-cover rounded border border-slate-300 shrink-0 bg-black"
                             />
                           ) : (
-                            <div className="w-10 h-10 rounded bg-[#14161B] border border-zinc-800 flex items-center justify-center shrink-0">
-                              <Wifi className="w-4 h-4 text-emerald-400" aria-hidden="true" />
+                            <div className="w-10 h-10 rounded bg-slate-100 border border-slate-200 flex items-center justify-center shrink-0">
+                              <Wifi className="w-4 h-4 text-emerald-600" aria-hidden="true" />
                             </div>
                           )}
                           <div className="min-w-0">
-                            <div className="text-xs font-semibold text-zinc-100 truncate">
+                            <div className="text-xs font-semibold text-slate-900 truncate">
                               {cam.name}
                             </div>
-                            <div className="text-[11px] text-zinc-400 font-mono truncate mt-0.5">
+                            <div className="text-[11px] text-slate-500 font-mono truncate mt-0.5">
                               {cam.hostLabel}
                               {cam.latencyMs ? ` · ${cam.latencyMs}ms` : ''} · No PIN
                             </div>
@@ -921,7 +951,7 @@ export function BluetoothScannerModal({
                           type="button"
                           onClick={() => void handleConnectDiscoveredWifiCamera(cam)}
                           disabled={connectingWifiId === cam.id}
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white disabled:opacity-60 shrink-0 cursor-pointer"
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-60 shrink-0 cursor-pointer"
                         >
                           <Plus className="w-3.5 h-3.5" aria-hidden="true" />
                           <span>{connectingWifiId === cam.id ? 'Connecting...' : 'Connect'}</span>
@@ -931,13 +961,13 @@ export function BluetoothScannerModal({
                   </div>
                 </div>
               ) : wifiScanCompleted ? (
-                <div className="border border-zinc-800 bg-[#0B0C0F] rounded-lg p-3.5 space-y-2">
-                  <p className="text-xs font-medium text-zinc-200">
+                <div className="border border-slate-200 bg-slate-50 rounded-lg p-3.5 space-y-2">
+                  <p className="text-xs font-medium text-slate-800">
                     No open Wi-Fi CCTV cameras answered automatically on this network.
                   </p>
-                  <p className="text-[11px] text-zinc-400 leading-relaxed">
+                  <p className="text-[11px] text-slate-500 leading-relaxed">
                     Make sure your computer&apos;s Wi-Fi is connected to your camera&apos;s Wi-Fi network (or use{' '}
-                    <strong className="text-zinc-300">Direct Camera Wi-Fi Quick Connect</strong> below with zero IP/PIN typing).
+                    <strong className="text-slate-700">Direct Camera Wi-Fi Quick Connect</strong> below with zero IP/PIN typing).
                     {networkStatus.isHttpsMixedContentRisk
                       ? ' On HTTPS pages, browsers may block automatic scanning of local http://192.168.x.x cameras — wireless camera bridges (Phone Link, Continuity Camera, DroidCam, Iriun) connect directly without restrictions.'
                       : ''}
@@ -947,8 +977,8 @@ export function BluetoothScannerModal({
 
               {/* 1-Click Direct Camera Wi-Fi Hotspot Presets (Zero IP / Zero PIN) */}
               <div className="space-y-2">
-                <div className="text-xs font-medium text-zinc-300">
-                  Direct Camera Wi-Fi Quick Connect <span className="text-zinc-500 font-normal">(1 click · no PIN or IP typing)</span>
+                <div className="text-xs font-medium text-slate-700">
+                  Direct Camera Wi-Fi Quick Connect <span className="text-slate-500 font-normal">(1 click · no PIN or IP typing)</span>
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                   {WIFI_HOTSPOT_QUICK_PRESETS.map((preset) => (
@@ -956,10 +986,10 @@ export function BluetoothScannerModal({
                       key={preset.id}
                       type="button"
                       onClick={() => handleConnectHotspotPreset(preset)}
-                      className="text-left p-2.5 rounded-lg border border-zinc-800 bg-[#14161B] hover:bg-[#1A1D24] hover:border-zinc-600 transition-colors cursor-pointer"
+                      className="text-left p-2.5 rounded-lg border border-slate-200 bg-slate-100 hover:bg-slate-100 hover:border-slate-400 transition-colors cursor-pointer"
                     >
-                      <div className="text-xs font-semibold text-zinc-100">{preset.label}</div>
-                      <div className="text-[11px] font-mono text-zinc-400 mt-0.5">
+                      <div className="text-xs font-semibold text-slate-900">{preset.label}</div>
+                      <div className="text-[11px] font-mono text-slate-500 mt-0.5">
                         {preset.subtitle}
                       </div>
                     </button>
@@ -968,18 +998,18 @@ export function BluetoothScannerModal({
               </div>
 
               {wifiError ? (
-                <p role="alert" className="text-xs text-red-300 bg-red-950/50 border border-red-500/40 rounded-lg p-3">
+                <p role="alert" className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg p-3">
                   {wifiError}
                 </p>
               ) : null}
 
               {/* Collapsible Advanced Manual IP / Credentials (hidden by default so user never sees PIN/password forms) */}
-              <div className="border-t border-zinc-800/90 pt-3">
+              <div className="border-t border-slate-200 pt-3">
                 <button
                   type="button"
                   onClick={() => setShowAdvancedWifi((prev) => !prev)}
                   aria-expanded={showAdvancedWifi}
-                  className="inline-flex items-center gap-1.5 text-xs font-medium text-zinc-400 hover:text-zinc-200 cursor-pointer"
+                  className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-slate-900 cursor-pointer"
                 >
                   {showAdvancedWifi ? (
                     <ChevronUp className="w-3.5 h-3.5" aria-hidden="true" />
@@ -990,17 +1020,17 @@ export function BluetoothScannerModal({
                 </button>
 
                 {showAdvancedWifi ? (
-                  <div className="mt-3 space-y-3 bg-[#0B0C0F] border border-zinc-800 rounded-lg p-3.5">
+                  <div className="mt-3 space-y-3 bg-slate-50 border border-slate-200 rounded-lg p-3.5">
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       <div>
-                        <label htmlFor="wifi-brand-select" className="block text-xs font-medium text-zinc-300 mb-1">
+                        <label htmlFor="wifi-brand-select" className="block text-xs font-medium text-slate-700 mb-1">
                           Wi-Fi Camera Brand / Type
                         </label>
                         <select
                           id="wifi-brand-select"
                           value={wifiBrandId}
                           onChange={(e) => handleSelectWifiBrand(e.target.value)}
-                          className="w-full text-xs px-2.5 py-2.5 border border-zinc-700 rounded-lg bg-[#09090B] text-zinc-100"
+                          className="w-full text-xs px-2.5 py-2.5 border border-slate-300 rounded-lg bg-slate-50 text-slate-900"
                         >
                           {WIFI_CAMERA_BRAND_PRESETS.map((preset) => (
                             <option key={preset.id} value={preset.id}>
@@ -1010,7 +1040,7 @@ export function BluetoothScannerModal({
                         </select>
                       </div>
                       <div>
-                        <label htmlFor="wifi-port-input" className="block text-xs font-medium text-zinc-300 mb-1">
+                        <label htmlFor="wifi-port-input" className="block text-xs font-medium text-slate-700 mb-1">
                           Port (optional)
                         </label>
                         <input
@@ -1019,13 +1049,13 @@ export function BluetoothScannerModal({
                           value={wifiPort}
                           onChange={(e) => setWifiPort(e.target.value)}
                           placeholder={selectedWifiPreset.defaultPort || '80'}
-                          className="w-full text-sm font-mono px-3 py-2 border border-zinc-700 rounded-lg bg-[#09090B] text-zinc-100"
+                          className="w-full text-sm font-mono px-3 py-2 border border-slate-300 rounded-lg bg-slate-50 text-slate-900"
                         />
                       </div>
                     </div>
 
                     <div>
-                      <label htmlFor="wifi-host-input" className="block text-xs font-medium text-zinc-300 mb-1">
+                      <label htmlFor="wifi-host-input" className="block text-xs font-medium text-slate-700 mb-1">
                         Wi-Fi IP Address or Snapshot / MJPEG URL
                       </label>
                       <input
@@ -1037,15 +1067,15 @@ export function BluetoothScannerModal({
                           setWifiTestResult(null);
                         }}
                         placeholder={selectedWifiPreset.exampleHost}
-                        className="w-full text-sm font-mono px-3 py-2 border border-zinc-700 rounded-lg bg-[#09090B] text-zinc-100 focus-visible:outline-2 focus-visible:outline-zinc-400"
+                        className="w-full text-sm font-mono px-3 py-2 border border-slate-300 rounded-lg bg-slate-50 text-slate-900 focus-visible:outline-2 focus-visible:outline-zinc-400"
                       />
                     </div>
 
-                    <p className="text-xs text-zinc-400">{selectedWifiPreset.notes}</p>
+                    <p className="text-xs text-slate-500">{selectedWifiPreset.notes}</p>
 
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       <div>
-                        <label htmlFor="wifi-user-input" className="block text-xs font-medium text-zinc-400 mb-1">
+                        <label htmlFor="wifi-user-input" className="block text-xs font-medium text-slate-500 mb-1">
                           Camera Username (optional)
                         </label>
                         <input
@@ -1054,11 +1084,11 @@ export function BluetoothScannerModal({
                           value={wifiUsername}
                           onChange={(e) => setWifiUsername(e.target.value)}
                           placeholder="admin"
-                          className="w-full text-xs px-3 py-2 border border-zinc-700 rounded-lg bg-[#09090B] text-zinc-100"
+                          className="w-full text-xs px-3 py-2 border border-slate-300 rounded-lg bg-slate-50 text-slate-900"
                         />
                       </div>
                       <div>
-                        <label htmlFor="wifi-pass-input" className="block text-xs font-medium text-zinc-400 mb-1">
+                        <label htmlFor="wifi-pass-input" className="block text-xs font-medium text-slate-500 mb-1">
                           Camera Password (optional)
                         </label>
                         <input
@@ -1067,12 +1097,12 @@ export function BluetoothScannerModal({
                           value={wifiPassword}
                           onChange={(e) => setWifiPassword(e.target.value)}
                           placeholder="••••••••"
-                          className="w-full text-xs px-3 py-2 border border-zinc-700 rounded-lg bg-[#09090B] text-zinc-100"
+                          className="w-full text-xs px-3 py-2 border border-slate-300 rounded-lg bg-slate-50 text-slate-900"
                         />
                       </div>
                     </div>
 
-                    <label className="flex items-start gap-2.5 text-xs text-zinc-300 cursor-pointer select-none">
+                    <label className="flex items-start gap-2.5 text-xs text-slate-700 cursor-pointer select-none">
                       <input
                         type="checkbox"
                         checked={wifiDirectMode}
@@ -1083,28 +1113,28 @@ export function BluetoothScannerModal({
                         className="mt-0.5 accent-zinc-200 rounded cursor-pointer"
                       />
                       <span>
-                        <strong className="text-zinc-100">Direct Computer Wi-Fi Mode</strong> — Load camera directly over your computer&apos;s Wi-Fi LAN without cloud routing.
+                        <strong className="text-slate-900">Direct Computer Wi-Fi Mode</strong> — Load camera directly over your computer&apos;s Wi-Fi LAN without cloud routing.
                       </span>
                     </label>
 
                     {wifiTestResult ? (
-                      <div className="bg-emerald-950/35 border border-emerald-500/40 rounded-lg p-3 flex items-center gap-3">
+                      <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 flex items-center gap-3">
                         {wifiTestResult.previewDataUrl ? (
                           <img
                             src={wifiTestResult.previewDataUrl}
                             alt="Verified Wi-Fi CCTV frame"
-                            className="w-24 h-14 object-cover rounded border border-emerald-500/40 shrink-0"
+                            className="w-24 h-14 object-cover rounded border border-emerald-200 shrink-0"
                           />
                         ) : null}
                         <div className="min-w-0 text-xs">
-                          <div className="font-semibold text-emerald-300 flex items-center gap-1.5">
+                          <div className="font-semibold text-emerald-700 flex items-center gap-1.5">
                             <CheckCircle2 className="w-4 h-4 shrink-0" aria-hidden="true" />
                             <span>Wi-Fi Camera Connected ({wifiTestResult.latencyMs}ms)</span>
                           </div>
-                          <div className="text-zinc-300 font-mono truncate mt-0.5">
+                          <div className="text-slate-700 font-mono truncate mt-0.5">
                             {wifiTestResult.resolvedUrl}
                           </div>
-                          <div className="text-zinc-400 mt-0.5">{wifiTestResult.note}</div>
+                          <div className="text-slate-500 mt-0.5">{wifiTestResult.note}</div>
                         </div>
                       </div>
                     ) : null}
@@ -1114,7 +1144,7 @@ export function BluetoothScannerModal({
                         type="button"
                         onClick={() => void handleTestWifiCamera()}
                         disabled={wifiTesting}
-                        className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-md border border-zinc-800 bg-[#16181D] text-zinc-200 hover:bg-zinc-800 disabled:opacity-60 cursor-pointer"
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-md border border-slate-200 bg-slate-100 text-slate-800 hover:bg-slate-100 disabled:opacity-60 cursor-pointer"
                       >
                         <RefreshCw className={`w-3.5 h-3.5 ${wifiTesting ? 'animate-spin' : ''}`} aria-hidden="true" />
                         <span>{wifiTesting ? 'Testing Connection...' : 'Test Wi-Fi Feed'}</span>
@@ -1122,7 +1152,7 @@ export function BluetoothScannerModal({
                       <button
                         type="button"
                         onClick={handleSubmitWifiCamera}
-                        className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white cursor-pointer"
+                        className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-md bg-slate-900 text-white hover:bg-slate-800 cursor-pointer"
                       >
                         <Wifi className="w-4 h-4" aria-hidden="true" />
                         <span>Add Manual Wi-Fi Camera</span>
@@ -1138,10 +1168,10 @@ export function BluetoothScannerModal({
           {activeTab === 'bluetooth' ? (
             <>
               {blockedByIframe && typeof window !== 'undefined' ? (
-                <div className="bg-amber-950/45 border border-amber-500/40 text-amber-100 rounded-lg p-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                <div className="bg-amber-50 border border-amber-200 text-amber-900 rounded-lg p-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
                   <div>
                     <p className="font-semibold">Embedded preview restricts Web Bluetooth</p>
-                    <p className="text-amber-200/80 mt-0.5">
+                    <p className="text-amber-800 mt-0.5">
                       Open this app in a standalone Chrome or Edge tab to pair nearby Bluetooth CCTV cameras directly.
                     </p>
                   </div>
@@ -1171,7 +1201,7 @@ export function BluetoothScannerModal({
                   type="button"
                   onClick={() => void handleScanBluetooth()}
                   disabled={isScanningBt}
-                  className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium rounded-lg bg-[#182130] border border-slate-700 text-slate-100 hover:bg-slate-700 disabled:opacity-60 transition-colors whitespace-nowrap cursor-pointer"
+                  className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium rounded-lg bg-slate-100 border border-slate-300 text-slate-900 hover:bg-slate-200 disabled:opacity-60 transition-colors whitespace-nowrap cursor-pointer"
                 >
                   <span>Pair Bluetooth Picker</span>
                 </button>
@@ -1179,7 +1209,7 @@ export function BluetoothScannerModal({
                   type="button"
                   onClick={() => void handleSearchNearbyBt(true)}
                   disabled={isScanningBt}
-                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-slate-700 bg-[#0A0E14] text-slate-300 hover:bg-slate-800 disabled:opacity-60 transition-colors whitespace-nowrap cursor-pointer"
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-slate-300 bg-slate-50 text-slate-700 hover:bg-slate-100 disabled:opacity-60 transition-colors whitespace-nowrap cursor-pointer"
                 >
                   <span>Scan Paired BT Audio/Cam</span>
                 </button>
@@ -1191,11 +1221,11 @@ export function BluetoothScannerModal({
                 value={btSearch}
                 onChange={(e) => setBtSearch(e.target.value)}
                 placeholder="Search scanned Bluetooth devices by name or ID..."
-                className="w-full text-xs px-3 py-2 border border-slate-700 rounded-lg bg-[#0A0E14] text-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500"
+                className="w-full text-xs px-3 py-2 border border-slate-300 rounded-lg bg-slate-50 text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500"
               />
 
               {btNotices.length > 0 ? (
-                <div className="text-xs text-slate-300 bg-[#0D121B] border border-slate-800 rounded-lg p-3 space-y-1">
+                <div className="text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-1">
                   {btNotices.map((n, idx) => (
                     <p key={idx}>{n}</p>
                   ))}
@@ -1203,15 +1233,15 @@ export function BluetoothScannerModal({
               ) : null}
 
               {filteredBluetooth.length === 0 ? (
-                <div className="border border-dashed border-slate-700 rounded-xl p-6 text-center">
+                <div className="border border-dashed border-slate-300 rounded-xl p-6 text-center">
                   <Bluetooth className="w-7 h-7 text-slate-500 mx-auto mb-2" aria-hidden="true" />
-                  <p className="text-sm font-medium text-slate-200">No Bluetooth devices scanned yet</p>
-                  <p className="text-xs text-slate-400 mt-1">
+                  <p className="text-sm font-medium text-slate-800">No Bluetooth devices scanned yet</p>
+                  <p className="text-xs text-slate-500 mt-1">
                     Click Search Nearby Bluetooth or Pair Bluetooth Picker in Chrome/Edge.
                   </p>
                 </div>
               ) : (
-                <div className="divide-y divide-slate-800 border border-slate-800 rounded-xl overflow-hidden">
+                <div className="divide-y divide-slate-200 border border-slate-200 rounded-xl overflow-hidden">
                   {filteredBluetooth.map((device) => {
                     const classification = classifyBluetoothCamera(device);
                     const isEligible =
@@ -1219,28 +1249,28 @@ export function BluetoothScannerModal({
                     const alreadyAdded = connectedAddresses.has(device.macAddress);
 
                     return (
-                      <div key={device.id} className="p-3.5 bg-[#0D121B] space-y-2.5">
+                      <div key={device.id} className="p-3.5 bg-slate-50 space-y-2.5">
                         <div className="flex items-start justify-between gap-3">
                           <div className="min-w-0">
                             <div className="flex items-center gap-2">
-                              <span className="text-sm font-semibold text-slate-100 truncate">
+                              <span className="text-sm font-semibold text-slate-900 truncate">
                                 {device.name}
                               </span>
                               {isEligible ? (
-                                <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-400 whitespace-nowrap">
+                                <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-600 whitespace-nowrap">
                                   <CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" />
                                   <span>
                                     {classification.isEligibleMonitor ? 'CCTV Video + Voice' : 'CCTV Override'}
                                   </span>
                                 </span>
                               ) : (
-                                <span className="inline-flex items-center gap-1 text-xs font-medium text-slate-400 whitespace-nowrap">
+                                <span className="inline-flex items-center gap-1 text-xs font-medium text-slate-500 whitespace-nowrap">
                                   <XCircle className="w-3.5 h-3.5 text-slate-500" aria-hidden="true" />
                                   <span>{classification.deviceCategoryLabel}</span>
                                 </span>
                               )}
                             </div>
-                            <div className="text-xs text-slate-400 flex flex-wrap items-center gap-2 mt-0.5">
+                            <div className="text-xs text-slate-500 flex flex-wrap items-center gap-2 mt-0.5">
                               <span className="font-mono">{device.macAddress}</span>
                               <span aria-hidden="true">·</span>
                               <span className="inline-flex items-center gap-1">
@@ -1256,14 +1286,14 @@ export function BluetoothScannerModal({
                           </div>
 
                           {alreadyAdded ? (
-                            <span className="text-xs font-medium text-emerald-400 shrink-0">Connected</span>
+                            <span className="text-xs font-medium text-emerald-600 shrink-0">Connected</span>
                           ) : !isEligible ? (
                             <button
                               type="button"
                               onClick={() =>
                                 setOverrideEligibleIds((prev) => ({ ...prev, [device.id]: true }))
                               }
-                              className="text-xs font-medium text-blue-400 hover:underline shrink-0 cursor-pointer"
+                              className="text-xs font-medium text-blue-600 hover:underline shrink-0 cursor-pointer"
                             >
                               Treat as CCTV
                             </button>
@@ -1279,7 +1309,7 @@ export function BluetoothScannerModal({
                                 setRoomNames((prev) => ({ ...prev, [device.id]: e.target.value }))
                               }
                               placeholder="Zone / Classroom name (required)"
-                              className="text-xs px-2.5 py-1.5 border border-slate-700 rounded-md bg-[#0A0E14] text-slate-100"
+                              className="text-xs px-2.5 py-1.5 border border-slate-300 rounded-md bg-slate-50 text-slate-900"
                             />
                             <input
                               type="url"
@@ -1288,7 +1318,7 @@ export function BluetoothScannerModal({
                                 setBtStreamUrls((prev) => ({ ...prev, [device.id]: e.target.value }))
                               }
                               placeholder="Optional snapshot/MJPEG URL"
-                              className="text-xs px-2.5 py-1.5 border border-slate-700 rounded-md bg-[#0A0E14] text-slate-100"
+                              className="text-xs px-2.5 py-1.5 border border-slate-300 rounded-md bg-slate-50 text-slate-900"
                             />
                             <button
                               type="button"
@@ -1312,31 +1342,42 @@ export function BluetoothScannerModal({
           {activeTab === 'hardware' ? (
             <div className="space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <p className="text-xs text-slate-400 max-w-md">
-                  Detects every wired camera plugged into this device — HDMI capture cards, USB-C / Type-C cameras, SDI / BNC DVR dongles, USB UVC webcams, and built-in lenses. Auto-updates on plug-in.
+                <p className="text-xs text-slate-500 max-w-sm">
+                  Use your device&apos;s built-in camera or any wired camera — HDMI capture cards, USB-C / Type-C, SDI / BNC DVR dongles, and USB webcams.
                 </p>
-                <button
-                  type="button"
-                  onClick={() => void refreshMediaDevices(true, true)}
-                  disabled={isLoadingDevices || isProbingWired}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-blue-500/40 bg-blue-600/20 text-blue-200 hover:bg-blue-600/30 cursor-pointer shrink-0 disabled:opacity-50"
-                >
-                  <RefreshCw
-                    className={`w-3.5 h-3.5 ${isLoadingDevices || isProbingWired ? 'animate-spin' : ''}`}
-                    aria-hidden="true"
-                  />
-                  <span>
-                    {isProbingWired
-                      ? 'Probing Ports...'
-                      : isLoadingDevices
-                        ? 'Scanning...'
-                        : 'Scan All Wired Ports'}
-                  </span>
-                </button>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => void handleStartBuiltInCamera()}
+                    disabled={connectingWiredId === '__builtin__'}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-900 text-white hover:bg-slate-800 cursor-pointer disabled:opacity-50"
+                  >
+                    <Camera className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>{connectingWiredId === '__builtin__' ? 'Opening...' : 'Start Built-in Camera'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void refreshMediaDevices(true, true)}
+                    disabled={isLoadingDevices || isProbingWired}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-blue-500/40 bg-blue-50 text-blue-700 hover:bg-blue-100 cursor-pointer disabled:opacity-50"
+                  >
+                    <RefreshCw
+                      className={`w-3.5 h-3.5 ${isLoadingDevices || isProbingWired ? 'animate-spin' : ''}`}
+                      aria-hidden="true"
+                    />
+                    <span>
+                      {isProbingWired
+                        ? 'Probing Ports...'
+                        : isLoadingDevices
+                          ? 'Scanning...'
+                          : 'Scan Wired Ports'}
+                    </span>
+                  </button>
+                </div>
               </div>
 
               <div>
-                <label htmlFor="hw-room-input" className="block text-xs font-medium text-slate-300 mb-1">
+                <label htmlFor="hw-room-input" className="block text-xs font-medium text-slate-700 mb-1">
                   Zone / Classroom Name
                 </label>
                 <input
@@ -1345,14 +1386,14 @@ export function BluetoothScannerModal({
                   value={hardwareRoomName}
                   onChange={(e) => setHardwareRoomName(e.target.value)}
                   placeholder="e.g., Main Entrance HDMI Cam or Room 204"
-                  className="w-full text-sm px-3 py-2 border border-slate-700 rounded-lg bg-[#0A0E14] text-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500"
+                  className="w-full text-sm px-3 py-2 border border-slate-300 rounded-lg bg-slate-50 text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500"
                 />
               </div>
 
               {/* Detected Wired Ports List */}
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
-                  <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
                     Detected Wired Video Interfaces ({wiredCameras.length})
                   </span>
                   <span className="text-[10px] text-slate-500">
@@ -1361,10 +1402,10 @@ export function BluetoothScannerModal({
                 </div>
 
                 {wiredCameras.length === 0 ? (
-                  <div className="rounded-lg border border-slate-800 bg-[#0A0E14] p-3.5 text-xs text-slate-400 space-y-1.5">
-                    <p className="text-slate-200 font-medium">No wired camera port detected yet.</p>
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 text-xs text-slate-500 space-y-1.5">
+                    <p className="text-slate-800 font-medium">No wired camera port detected yet.</p>
                     <p>
-                      Plug in your USB-C / Type-C camera, USB webcam, or HDMI-to-USB capture card, then click <strong className="text-slate-200">Scan All Wired Ports</strong>.
+                      Plug in your USB-C / Type-C camera, USB webcam, or HDMI-to-USB capture card, then click <strong className="text-slate-800">Scan All Wired Ports</strong>.
                     </p>
                     <p className="text-[11px] text-slate-500">
                       Note: Standard laptop HDMI ports are video-out only — wired HDMI/CCTV cameras require an HDMI-to-USB or USB-C UVC capture adapter.
@@ -1382,35 +1423,35 @@ export function BluetoothScannerModal({
                       return (
                         <div
                           key={cam.deviceId || `${cam.label}-${idx}`}
-                          className="flex items-center justify-between gap-3 rounded-lg border border-slate-800 bg-[#0A0E14] px-3 py-2.5"
+                          className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5"
                         >
                           <div className="min-w-0 flex-1">
                             <div className="flex flex-wrap items-center gap-1.5">
                               <span
                                 className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide ${
                                   cam.interfaceType === 'hdmi'
-                                    ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                                    ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                                     : cam.interfaceType === 'usb-c'
-                                      ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30'
+                                      ? 'bg-sky-50 text-sky-700 border border-sky-200'
                                       : cam.interfaceType === 'sdi-bnc'
-                                        ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                                        ? 'bg-amber-50 text-amber-800 border border-amber-200'
                                         : isExternal
-                                          ? 'bg-indigo-500/15 text-indigo-300 border border-indigo-500/30'
-                                          : 'bg-zinc-800 text-zinc-300 border border-zinc-700'
+                                          ? 'bg-indigo-50 text-indigo-700 border border-indigo-200'
+                                          : 'bg-slate-100 text-slate-700 border border-slate-300'
                                 }`}
                               >
                                 {cam.interfaceBadge}
                               </span>
                               {resLabel ? (
-                                <span className="text-[10px] font-mono text-emerald-400">
+                                <span className="text-[10px] font-mono text-emerald-600">
                                   {resLabel}
                                 </span>
                               ) : null}
                               {cam.probeStatus === 'busy' ? (
-                                <span className="text-[10px] text-amber-400">Port busy</span>
+                                <span className="text-[10px] text-amber-700">Port busy</span>
                               ) : null}
                             </div>
-                            <p className="text-xs font-medium text-slate-100 truncate mt-1">
+                            <p className="text-xs font-medium text-slate-900 truncate mt-1">
                               {cam.label}
                             </p>
                             {cam.matchedAudioLabel ? (
@@ -1436,16 +1477,16 @@ export function BluetoothScannerModal({
                 )}
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1 border-t border-slate-800/80">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1 border-t border-slate-200">
                 <div>
-                  <label htmlFor="hw-video-select" className="block text-xs font-medium text-slate-300 mb-1">
+                  <label htmlFor="hw-video-select" className="block text-xs font-medium text-slate-700 mb-1">
                     Manual Video Port Override
                   </label>
                   <select
                     id="hw-video-select"
                     value={selectedVideoId}
                     onChange={(e) => setSelectedVideoId(e.target.value)}
-                    className="w-full text-xs px-2.5 py-2 border border-slate-700 rounded-lg bg-[#0A0E14] text-slate-100"
+                    className="w-full text-xs px-2.5 py-2 border border-slate-300 rounded-lg bg-slate-50 text-slate-900"
                   >
                     {wiredCameras.length === 0 ? (
                       <option value="">Default system camera</option>
@@ -1460,14 +1501,14 @@ export function BluetoothScannerModal({
                 </div>
 
                 <div>
-                  <label htmlFor="hw-audio-select" className="block text-xs font-medium text-slate-300 mb-1">
+                  <label htmlFor="hw-audio-select" className="block text-xs font-medium text-slate-700 mb-1">
                     Voice Microphone Input
                   </label>
                   <select
                     id="hw-audio-select"
                     value={selectedAudioId}
                     onChange={(e) => setSelectedAudioId(e.target.value)}
-                    className="w-full text-xs px-2.5 py-2 border border-slate-700 rounded-lg bg-[#0A0E14] text-slate-100"
+                    className="w-full text-xs px-2.5 py-2 border border-slate-300 rounded-lg bg-slate-50 text-slate-900"
                   >
                     {audioDevices.length === 0 ? (
                       <option value="">Default system microphone</option>
@@ -1483,7 +1524,7 @@ export function BluetoothScannerModal({
               </div>
 
               {hardwareError ? (
-                <p role="alert" className="text-xs text-red-400 font-medium">
+                <p role="alert" className="text-xs text-red-600 font-medium">
                   {hardwareError}
                 </p>
               ) : null}
@@ -1503,14 +1544,14 @@ export function BluetoothScannerModal({
           {activeTab === 'microphone' ? (
             <div className="space-y-4">
               <div className="flex items-center justify-between gap-2">
-                <p className="text-xs text-zinc-400">
+                <p className="text-xs text-slate-500">
                   Monitor any room purely by microphone (no camera required). Tracks live dB SPL (&gt;90.1 dB for 3s alerts teacher) and real-time voice recognition for distress, bullying, beating, or fighting cues.
                 </p>
                 <button
                   type="button"
                   onClick={() => void refreshMediaDevices(true)}
                   disabled={isLoadingDevices}
-                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md border border-zinc-800 bg-[#16181D] text-zinc-200 hover:bg-zinc-800 cursor-pointer shrink-0"
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md border border-slate-200 bg-slate-100 text-slate-800 hover:bg-slate-100 cursor-pointer shrink-0"
                 >
                   <RefreshCw className="w-3.5 h-3.5" aria-hidden="true" />
                   <span>Detect Mics</span>
@@ -1518,7 +1559,7 @@ export function BluetoothScannerModal({
               </div>
 
               <div>
-                <label htmlFor="mic-room-input" className="block text-xs font-medium text-zinc-300 mb-1">
+                <label htmlFor="mic-room-input" className="block text-xs font-medium text-slate-700 mb-1">
                   Zone / Classroom Name
                 </label>
                 <input
@@ -1527,19 +1568,19 @@ export function BluetoothScannerModal({
                   value={micRoomName}
                   onChange={(e) => setMicRoomName(e.target.value)}
                   placeholder="e.g., Hallway West Mic or Restroom Corridor"
-                  className="w-full text-sm px-3 py-2 border border-zinc-700 rounded-lg bg-[#09090B] text-zinc-100 focus-visible:outline-2 focus-visible:outline-zinc-400"
+                  className="w-full text-sm px-3 py-2 border border-slate-300 rounded-lg bg-slate-50 text-slate-900 focus-visible:outline-2 focus-visible:outline-zinc-400"
                 />
               </div>
 
               <div>
-                <label htmlFor="mic-audio-select" className="block text-xs font-medium text-zinc-300 mb-1">
+                <label htmlFor="mic-audio-select" className="block text-xs font-medium text-slate-700 mb-1">
                   Microphone Input (Built-in, USB, or Bluetooth Mic)
                 </label>
                 <select
                   id="mic-audio-select"
                   value={selectedAudioId}
                   onChange={(e) => setSelectedAudioId(e.target.value)}
-                  className="w-full text-xs px-2.5 py-2.5 border border-zinc-700 rounded-lg bg-[#09090B] text-zinc-100"
+                  className="w-full text-xs px-2.5 py-2.5 border border-slate-300 rounded-lg bg-slate-50 text-slate-900"
                 >
                   {audioDevices.length === 0 ? (
                     <option value="">Default system microphone</option>
@@ -1554,7 +1595,7 @@ export function BluetoothScannerModal({
               </div>
 
               {micOnlyError ? (
-                <p role="alert" className="text-xs text-red-300 bg-red-950/50 border border-red-500/40 rounded-lg p-3">
+                <p role="alert" className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg p-3">
                   {micOnlyError}
                 </p>
               ) : null}
@@ -1564,7 +1605,7 @@ export function BluetoothScannerModal({
                   type="button"
                   onClick={() => void handleConnectMicrophoneOnly(true)}
                   disabled={isConnectingMic}
-                  className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white disabled:opacity-60 transition-colors cursor-pointer"
+                  className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-md bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-60 transition-colors cursor-pointer"
                 >
                   <Mic className="w-4 h-4" aria-hidden="true" />
                   <span>{isConnectingMic ? 'Connecting Mic...' : 'Connect Live Microphone'}</span>
@@ -1573,7 +1614,7 @@ export function BluetoothScannerModal({
                   type="button"
                   onClick={() => void handleConnectMicrophoneOnly(false)}
                   disabled={isConnectingMic}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-md border border-zinc-800 bg-[#16181D] text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer"
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-md border border-slate-200 bg-slate-100 text-slate-800 hover:bg-slate-100 transition-colors cursor-pointer"
                 >
                   <span>Add Standby Mic Zone</span>
                 </button>
@@ -1584,11 +1625,11 @@ export function BluetoothScannerModal({
           {/* TAB 5: UPLOAD SECURITY FOOTAGE */}
           {activeTab === 'upload' ? (
             <div className="space-y-3">
-              <p className="text-xs text-slate-400">
+              <p className="text-xs text-slate-500">
                 Upload a real CCTV video clip or still frame to run live on-device fighting, beating, bullying, and weapon detection.
               </p>
               <div>
-                <label htmlFor="upload-room-input" className="block text-xs font-medium text-slate-300 mb-1">
+                <label htmlFor="upload-room-input" className="block text-xs font-medium text-slate-700 mb-1">
                   Zone / Classroom Name
                 </label>
                 <input
@@ -1597,11 +1638,11 @@ export function BluetoothScannerModal({
                   value={uploadRoomName}
                   onChange={(e) => setUploadRoomName(e.target.value)}
                   placeholder="e.g., Vault Corridor or Room 101"
-                  className="w-full text-sm px-3 py-2 border border-slate-700 rounded-lg bg-[#0A0E14] text-slate-100"
+                  className="w-full text-sm px-3 py-2 border border-slate-300 rounded-lg bg-slate-50 text-slate-900"
                 />
               </div>
               <div>
-                <label htmlFor="upload-media-file" className="block text-xs font-medium text-slate-300 mb-1">
+                <label htmlFor="upload-media-file" className="block text-xs font-medium text-slate-700 mb-1">
                   Video or Image File
                 </label>
                 <input
@@ -1609,11 +1650,11 @@ export function BluetoothScannerModal({
                   type="file"
                   accept="image/*,video/*"
                   onChange={handleFileChange}
-                  className="block w-full text-xs text-slate-400 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border file:border-slate-700 file:text-xs file:font-medium file:bg-[#182130] file:text-slate-200 hover:file:bg-slate-700"
+                  className="block w-full text-xs text-slate-500 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border file:border-slate-300 file:text-xs file:font-medium file:bg-slate-100 file:text-slate-800 hover:file:bg-slate-200"
                 />
               </div>
               <div>
-                <label htmlFor="upload-transcript-input" className="block text-xs font-medium text-slate-300 mb-1">
+                <label htmlFor="upload-transcript-input" className="block text-xs font-medium text-slate-700 mb-1">
                   Voice / Audio Cue (optional)
                 </label>
                 <input
@@ -1622,11 +1663,11 @@ export function BluetoothScannerModal({
                   value={uploadTranscript}
                   onChange={(e) => setUploadTranscript(e.target.value)}
                   placeholder="Optional audio transcript for this recording"
-                  className="w-full text-sm px-3 py-2 border border-slate-700 rounded-lg bg-[#0A0E14] text-slate-100"
+                  className="w-full text-sm px-3 py-2 border border-slate-300 rounded-lg bg-slate-50 text-slate-900"
                 />
               </div>
               {uploadError ? (
-                <p role="alert" className="text-xs text-red-400 font-medium">
+                <p role="alert" className="text-xs text-red-600 font-medium">
                   {uploadError}
                 </p>
               ) : null}

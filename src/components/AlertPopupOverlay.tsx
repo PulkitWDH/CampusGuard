@@ -31,14 +31,14 @@ export function AlertPopupOverlay({
       className="fixed bottom-4 right-4 left-4 sm:left-auto z-[70] w-auto sm:w-[400px] max-w-[calc(100vw-2rem)] flex flex-col-reverse gap-2.5 pointer-events-none"
     >
       {popups.length > 1 ? (
-        <div className="pointer-events-auto flex items-center justify-between px-3 py-1.5 rounded-lg bg-[#101114]/95 text-zinc-200 text-xs shadow-xl border border-zinc-800 backdrop-blur-md">
+        <div className="pointer-events-auto flex items-center justify-between px-3 py-1.5 rounded-lg bg-white text-slate-800 text-xs shadow-lg border border-slate-200">
           <span className="font-mono font-semibold tabular-nums">
             {popups.length} active alerts
           </span>
           <button
             type="button"
             onClick={onDismissAllPopups}
-            className="text-zinc-400 hover:text-white font-medium underline cursor-pointer"
+            className="text-slate-500 hover:text-slate-900 font-medium underline cursor-pointer"
           >
             Dismiss all
           </button>
@@ -52,12 +52,12 @@ export function AlertPopupOverlay({
         const isAttendance = badge.tone === 'attendance';
 
         const cardStyle = isBullying
-          ? 'bg-[#101114] border border-orange-500/90 shadow-2xl shadow-black/80'
+          ? 'bg-white border border-orange-300 shadow-xl'
           : isCritical
-            ? 'animate-alert-critical-pulse bg-[#101114] border border-red-500/90 shadow-2xl shadow-black/80'
+            ? 'animate-alert-critical-pulse bg-white border border-red-400 shadow-xl'
             : isAttendance
-              ? 'bg-[#101114] border border-zinc-600 shadow-xl shadow-black/70'
-              : 'bg-[#101114] border border-amber-500/80 shadow-xl shadow-black/70';
+              ? 'bg-white border border-slate-300 shadow-lg'
+              : 'bg-white border border-amber-300 shadow-lg';
 
         const headerBg = isBullying
           ? 'bg-orange-600 text-white'
@@ -95,7 +95,7 @@ export function AlertPopupOverlay({
                   {badge.label}
                 </span>
                 {typeof alert.threatScore === 'number' && isCritical ? (
-                  <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-black/25 tabular-nums whitespace-nowrap">
+                  <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-black/20 tabular-nums whitespace-nowrap">
                     {alert.threatScore}/100
                   </span>
                 ) : null}
@@ -113,31 +113,31 @@ export function AlertPopupOverlay({
               </button>
             </div>
 
-            <div className="p-3.5 space-y-2.5 text-slate-100">
+            <div className="p-3.5 space-y-2.5 text-slate-800">
               <div className="flex items-start gap-3">
                 {alert.evidenceSnapshotUrl ? (
                   <img
                     src={alert.evidenceSnapshotUrl}
                     alt={`Live capture from ${alert.classroomName}`}
-                    className="w-20 h-14 object-cover rounded-lg border border-slate-700 shrink-0"
+                    className="w-20 h-14 object-cover rounded-lg border border-slate-200 shrink-0"
                   />
                 ) : null}
                 <div className="min-w-0 flex-1 space-y-1">
-                  <p className="text-sm font-semibold leading-snug text-white">
+                  <p className="text-sm font-semibold leading-snug text-slate-900">
                     {cleanHeadline}
                   </p>
-                  <p className="text-xs text-slate-400 leading-relaxed">
-                    <span className="font-mono tabular-nums text-slate-200">{alert.studentCount} present</span>
-                    <span aria-hidden="true" className="mx-1.5 text-slate-600">·</span>
+                  <p className="text-xs text-slate-500 leading-relaxed">
+                    <span className="font-mono tabular-nums text-slate-700">{alert.studentCount} present</span>
+                    <span aria-hidden="true" className="mx-1.5 text-slate-300">·</span>
                     <span>{alert.voiceCue}</span>
                   </p>
                   {alert.details ? (
-                    <p className="text-xs text-slate-300 line-clamp-2">{alert.details}</p>
+                    <p className="text-xs text-slate-600 line-clamp-2">{alert.details}</p>
                   ) : null}
                 </div>
               </div>
 
-              <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t border-slate-800">
+              <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t border-slate-200">
                 <button
                   type="button"
                   onClick={() => {
@@ -146,10 +146,10 @@ export function AlertPopupOverlay({
                   }}
                   className={`inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-lg text-white transition-colors cursor-pointer whitespace-nowrap ${
                     isBullying
-                      ? 'bg-orange-600 hover:bg-orange-500'
+                      ? 'bg-orange-600 hover:bg-orange-700'
                       : isCritical
-                        ? 'bg-red-600 hover:bg-red-500'
-                        : 'bg-blue-600 hover:bg-blue-500'
+                        ? 'bg-red-600 hover:bg-red-700'
+                        : 'bg-blue-600 hover:bg-blue-700'
                   }`}
                 >
                   <Eye className="w-3.5 h-3.5" aria-hidden="true" />
@@ -158,7 +158,7 @@ export function AlertPopupOverlay({
                 <button
                   type="button"
                   onClick={() => onNotifyTeacher(alert)}
-                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-lg bg-slate-800 border border-slate-700 text-slate-100 hover:bg-slate-700 transition-colors cursor-pointer whitespace-nowrap"
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-lg bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 transition-colors cursor-pointer whitespace-nowrap"
                 >
                   <Mail className="w-3.5 h-3.5" aria-hidden="true" />
                   <span>{alert.teacherNotified ? 'Notified' : 'Notify'}</span>
@@ -166,7 +166,7 @@ export function AlertPopupOverlay({
                 <button
                   type="button"
                   onClick={() => onAcknowledge(alert.id)}
-                  className="ml-auto inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-lg border border-slate-700 bg-transparent text-slate-300 hover:bg-slate-800 hover:text-white transition-colors cursor-pointer whitespace-nowrap"
+                  className="ml-auto inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-lg border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer whitespace-nowrap"
                 >
                   <Check className="w-3.5 h-3.5" aria-hidden="true" />
                   <span>Acknowledge</span>

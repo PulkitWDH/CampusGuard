@@ -14,6 +14,7 @@ import {
   Route,
   ScanSearch,
   ShieldAlert,
+  SlidersHorizontal,
   Trash2,
   UserPlus,
   Video,
@@ -264,6 +265,7 @@ export function CameraFeedCard({
   const speechRestartTimerRef = useRef<number | null>(null);
   const speechClearTimerRef = useRef<number | null>(null);
   const [loudHoldSeconds, setLoudHoldSeconds] = useState(0);
+  const [showAdvancedTools, setShowAdvancedTools] = useState(false);
   const loudHoldStartRef = useRef<number | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
 
@@ -559,11 +561,11 @@ export function CameraFeedCard({
     const canvas = canvasRef.current;
     if (!canvas) return { x: 0, y: 0 };
     const rect = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / Math.max(1, rect.width);
-    const scaleY = canvas.height / Math.max(1, rect.height);
+    const scaleX = 640 / Math.max(1, rect.width);
+    const scaleY = 360 / Math.max(1, rect.height);
     return {
-      x: Math.max(0, Math.min(canvas.width, (e.clientX - rect.left) * scaleX)),
-      y: Math.max(0, Math.min(canvas.height, (e.clientY - rect.top) * scaleY)),
+      x: Math.max(0, Math.min(640, (e.clientX - rect.left) * scaleX)),
+      y: Math.max(0, Math.min(360, (e.clientY - rect.top) * scaleY)),
     };
   };
 
@@ -635,11 +637,8 @@ export function CameraFeedCard({
       srcW = loadedImageRef.current.naturalWidth;
       srcH = loadedImageRef.current.naturalHeight;
       sourceEl = loadedImageRef.current;
-    } else if (canvasRef.current) {
-      srcW = canvasRef.current.width;
-      srcH = canvasRef.current.height;
-      sourceEl = canvasRef.current;
     } else {
+      // Never fall back to canvasRef.current (it contains HUD boxes & Auto-PTZ inset which would double-count people)
       return null;
     }
 
@@ -649,7 +648,7 @@ export function CameraFeedCard({
     if (targetCanvas.width !== fitted.width) targetCanvas.width = fitted.width;
     if (targetCanvas.height !== fitted.height) targetCanvas.height = fitted.height;
 
-    const ctx = targetCanvas.getContext('2d');
+    const ctx = targetCanvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return null;
     ctx.drawImage(sourceEl, 0, 0, targetCanvas.width, targetCanvas.height);
 
@@ -1229,9 +1228,31 @@ export function CameraFeedCard({
       vid.playsInline = true;
       vid.setAttribute('playsinline', 'true');
       vid.setAttribute('webkit-playsinline', 'true');
-      vid.srcObject = liveMediaStream;
-      void vid.play().catch(() => {});
-      return;
+      if (vid.srcObject !== liveMediaStream) {
+        vid.srcObject = liveMediaStream;
+      }
+      const ensurePlaying = () => {
+        if (
+          vid.srcObject === liveMediaStream &&
+          liveMediaStream.active &&
+          liveMediaStream.getVideoTracks().some((t) => t.readyState === 'live') &&
+          vid.paused
+        ) {
+          void vid.play().catch(() => {});
+        }
+      };
+      ensurePlaying();
+      const handleVisibility = () => {
+        if (document.visibilityState === 'visible') {
+          ensurePlaying();
+        }
+      };
+      vid.addEventListener('pause', ensurePlaying);
+      document.addEventListener('visibilitychange', handleVisibility);
+      return () => {
+        vid.removeEventListener('pause', ensurePlaying);
+        document.removeEventListener('visibilitychange', handleVisibility);
+      };
     }
 
     if (camera.customMediaUrl && camera.customMediaType === 'video' && videoRef.current) {
@@ -1255,8 +1276,11 @@ export function CameraFeedCard({
           hasLiveFrameRef.current = true;
           setHasLiveSignal(true);
           const canvas = canvasRef.current;
-          const ctx = canvas?.getContext('2d', { willReadFrequently: true });
+          const ctx = canvas?.getContext('2d');
           if (canvas && ctx) {
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
             ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
           }
         }
@@ -1410,11 +1434,34 @@ export function CameraFeedCard({
     const drawFrame = (timestamp: number) => {
       const canvas = canvasRef.current;
       if (!canvas) return;
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+      // Dynamically match Full HD backing resolution (up to 1920x1080) so live cameras stay razor-sharp
+      const activeVideo = videoRef.current;
+      const activeImg = loadedImageRef.current;
+      const sourceW =
+        activeVideo && activeVideo.videoWidth > 0
+          ? activeVideo.videoWidth
+          : activeImg && activeImg.naturalWidth > 0
+            ? activeImg.naturalWidth
+            : 1280;
+      const dpr = typeof window !== 'undefined' ? Math.min(2, window.devicePixelRatio || 1) : 1;
+      const wantFullHd = sourceW >= 1400 || dpr >= 1.5;
+      const targetPixelW = wantFullHd ? 1920 : 1280;
+      const targetPixelH = wantFullHd ? 1080 : 720;
+      if (canvas.width !== targetPixelW || canvas.height !== targetPixelH) {
+        canvas.width = targetPixelW;
+        canvas.height = targetPixelH;
+      }
+
+      const ctx = canvas.getContext('2d');
       if (!ctx) return;
 
-      const width = canvas.width;
-      const height = canvas.height;
+      // Render in logical 640x360 HUD coordinates mapped 1:1 onto the Full HD GPU canvas
+      const width = 640;
+      const height = 360;
+      ctx.setTransform(canvas.width / width, 0, 0, canvas.height / height, 0, 0);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
       ctx.fillStyle = '#070A0F';
       ctx.fillRect(0, 0, width, height);
 
@@ -1547,6 +1594,30 @@ export function CameraFeedCard({
             hasLiveFrameRef.current = true;
             setHasLiveSignal(true);
           }
+        } else if (
+          (camera.customMediaType === 'video' && Boolean(camera.customMediaUrl) && video && !video.error) ||
+          (Boolean(liveMediaStream?.active) &&
+            liveMediaStream!.getVideoTracks().some((t) => t.readyState === 'live'))
+        ) {
+          // Hold last frame seamlessly while looping video seeks or live stream negotiates resolution
+          if (
+            rawCaptureCanvasRef.current &&
+            rawCaptureCanvasRef.current.width > 0 &&
+            rawCaptureCanvasRef.current.height > 0
+          ) {
+            const held = rawCaptureCanvasRef.current;
+            const drawRect = computeContainDrawRect(held.width, held.height, width, height);
+            lastDrawRectRef.current = drawRect;
+            ctx.drawImage(held, drawRect.x, drawRect.y, drawRect.width, drawRect.height);
+          } else {
+            ctx.fillStyle = '#0D131D';
+            ctx.fillRect(0, 0, width, height);
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '500 13px "DM Sans", sans-serif';
+            const msg = 'Connecting live HD camera...';
+            const m = ctx.measureText(msg);
+            ctx.fillText(msg, Math.max(20, (width - m.width) / 2), height / 2);
+          }
         } else {
           if (hasLiveFrameRef.current) {
             hasLiveFrameRef.current = false;
@@ -1561,7 +1632,9 @@ export function CameraFeedCard({
               ? 'Connecting to Wi-Fi CCTV stream...'
               : camera.sourceKind === 'stream-url'
                 ? 'Connecting to IP camera stream...'
-                : 'Feed offline · Click Reconnect Live Camera';
+                : camera.customMediaType === 'video' && Boolean(camera.customMediaUrl)
+                  ? 'Loading uploaded video clip...'
+                  : 'Feed offline · Click Reconnect Live Camera';
           const m = ctx.measureText(message);
           ctx.fillText(message, Math.max(20, (width - m.width) / 2), height / 2);
         }
@@ -2081,14 +2154,21 @@ export function CameraFeedCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAudioOnly, liveMediaStream]);
 
+  const hasLiveVideoStream =
+    Boolean(liveMediaStream?.active) &&
+    Boolean(liveMediaStream?.getVideoTracks().some((t) => t.readyState === 'live'));
+
   const isAudioStreamLive =
-    isAudioOnly && (Boolean(liveMediaStream?.getAudioTracks().length) || micActive);
+    isAudioOnly &&
+    ((Boolean(liveMediaStream?.active) &&
+      Boolean(liveMediaStream?.getAudioTracks().some((t) => t.readyState === 'live'))) ||
+      micActive);
 
   const needsStreamReconnect =
     !isAudioOnly &&
     (camera.sourceKind === 'device-camera' ||
       (camera.sourceKind === 'bluetooth-cctv' && !camera.streamUrl && !camera.customMediaUrl)) &&
-    !liveMediaStream;
+    !hasLiveVideoStream;
 
   const needsMicConnect = isAudioOnly && !isAudioStreamLive;
 
@@ -2096,12 +2176,12 @@ export function CameraFeedCard({
   const isBullyingStatus = camera.status === 'fighting' && activeCategory === 'bullying';
   const statusBorderClass =
     isBullyingStatus
-      ? 'border-orange-500 ring-1 ring-orange-500/40'
+      ? 'border-orange-400 ring-1 ring-orange-400/40'
       : camera.status === 'fighting'
         ? 'animate-alert-critical-pulse border-red-500 ring-1 ring-red-500/40'
         : camera.status === 'warning'
-          ? 'border-amber-500/70'
-          : 'border-zinc-800/90 hover:border-zinc-700';
+          ? 'border-amber-400'
+          : 'border-slate-200 hover:border-slate-300';
 
   const countWord = camera.studentCount === 1 ? labels.personSingular : labels.personPlural;
   const modelLabel = camera.lastAnalysis?.modelUsed
@@ -2127,7 +2207,7 @@ export function CameraFeedCard({
   return (
     <article
       data-testid={`camera-card-${camera.id}`}
-      className={`bg-[#101114] border rounded-lg overflow-hidden flex flex-col transition-colors ${statusBorderClass}`}
+      className={`bg-white border rounded-xl overflow-hidden flex flex-col transition-colors shadow-2xs ${statusBorderClass}`}
     >
       {/* Dominant 16:9 Live CCTV or Acoustic Monitor */}
       <div className="relative bg-black aspect-video w-full overflow-hidden">
@@ -2165,8 +2245,8 @@ export function CameraFeedCard({
         ) : null}
         <canvas
           ref={canvasRef}
-          width={640}
-          height={360}
+          width={1280}
+          height={720}
           data-testid={`camera-canvas-${camera.id}`}
           onPointerDown={handleCanvasPointerDown}
           onPointerMove={handleCanvasPointerMove}
@@ -2302,22 +2382,22 @@ export function CameraFeedCard({
         </div>
       </div>
 
-      {/* Single Clean NVR Monitor Control Bar */}
-      <div className="px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t border-zinc-800/80">
+      {/* Clean Simple Monitor Control Bar */}
+      <div className="px-4 py-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t border-slate-200 bg-white">
         <div className="min-w-0 flex-1 basis-[170px]">
           <div className="flex items-center gap-2 min-w-0">
-            <h3 className="text-xs sm:text-sm font-semibold text-zinc-100 truncate">
+            <h3 className="text-sm font-semibold text-slate-900 truncate">
               {camera.classroomName}
             </h3>
             <span
               className={`inline-flex items-center gap-1 text-[11px] font-medium whitespace-nowrap shrink-0 ${
                 isBullyingStatus
-                  ? 'text-orange-400'
+                  ? 'text-orange-600'
                   : camera.status === 'fighting'
-                    ? 'text-red-400'
+                    ? 'text-red-600'
                     : camera.status === 'warning'
-                      ? 'text-amber-400'
-                      : 'text-emerald-400'
+                      ? 'text-amber-600'
+                      : 'text-emerald-600'
               }`}
             >
               {camera.status === 'fighting' ? (
@@ -2330,13 +2410,13 @@ export function CameraFeedCard({
               <span>{statusLabel}</span>
             </span>
           </div>
-          <p className="text-[11px] text-zinc-500 mt-0.5 truncate">
+          <p className="text-[11px] text-slate-500 mt-0.5 truncate">
             {isAudioOnly ? (
-              <span className="font-mono text-zinc-300" data-testid={`camera-live-count-${camera.id}`}>
+              <span className="font-mono text-slate-700 font-medium" data-testid={`camera-live-count-${camera.id}`}>
                 Mic Only
               </span>
             ) : (
-              <span className="font-mono text-zinc-300 tabular-nums" data-testid={`camera-live-count-${camera.id}`}>
+              <span className="font-mono text-slate-700 font-medium tabular-nums" data-testid={`camera-live-count-${camera.id}`}>
                 {camera.studentCount} {countWord}
               </span>
             )}
@@ -2347,7 +2427,7 @@ export function CameraFeedCard({
             {!isAudioOnly && contactPairsCount > 0 ? (
               <>
                 <span aria-hidden="true"> · </span>
-                <span className="font-mono text-amber-400">{contactPairsCount} overlap</span>
+                <span className="font-mono text-amber-600 font-medium">{contactPairsCount} overlap</span>
               </>
             ) : null}
           </p>
@@ -2360,27 +2440,10 @@ export function CameraFeedCard({
             disabled={camera.isAnalyzing}
             aria-label={`Scan AI safety for ${camera.classroomName}`}
             title="Scan frame now"
-            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white disabled:opacity-50 transition-colors whitespace-nowrap cursor-pointer"
+            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-md bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50 transition-colors whitespace-nowrap cursor-pointer"
           >
             <ScanSearch className="w-3.5 h-3.5" aria-hidden="true" />
             <span className="hidden sm:inline">{camera.isAnalyzing ? 'Scanning' : 'Scan'}</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={handleManualLockClick}
-            aria-label={`Lock forensic DVR evidence for ${camera.classroomName}`}
-            title="Save rolling WebM DVR video clip & forensic frames to Evidence Vault (SHA-256)"
-            className={`inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
-              justLockedEvidence
-                ? 'bg-emerald-950/70 border-emerald-500/60 text-emerald-300'
-                : 'bg-[#17181C] border-zinc-800 text-zinc-200 hover:text-white hover:border-zinc-700'
-            }`}
-          >
-            <Video className="w-3.5 h-3.5" aria-hidden="true" />
-            <span className="hidden sm:inline">
-              {justLockedEvidence ? 'Clip Saved' : 'Save Clip'}
-            </span>
           </button>
 
           <button
@@ -2394,8 +2457,8 @@ export function CameraFeedCard({
             title={micActive ? 'Stop live mic' : 'Enable live mic'}
             className={`inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
               micActive
-                ? 'bg-emerald-950/60 border-emerald-500/50 text-emerald-300'
-                : 'bg-[#17181C] border-zinc-800 text-zinc-300 hover:text-white hover:border-zinc-700'
+                ? 'bg-emerald-50 border-emerald-300 text-emerald-700'
+                : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-50'
             }`}
           >
             {micActive ? (
@@ -2406,28 +2469,13 @@ export function CameraFeedCard({
             <span className="hidden xl:inline">{micActive ? 'Live' : 'Mic'}</span>
           </button>
 
-          <button
-            type="button"
-            role="switch"
-            aria-checked={isAutoAiOn}
-            aria-label={`Toggle autonomous AI for ${camera.classroomName}`}
-            onClick={() => onUpdateCameraSettings(camera.id, { autoAiEnabled: !isAutoAiOn })}
-            className={`px-2 py-1.5 text-[11px] font-medium rounded-md border cursor-pointer whitespace-nowrap ${
-              isAutoAiOn
-                ? 'bg-emerald-950/50 text-emerald-300 border-emerald-700/60'
-                : 'bg-[#17181C] text-zinc-400 border-zinc-800 hover:text-zinc-200'
-            }`}
-          >
-            {isAutoAiOn ? 'Armed' : 'Paused'}
-          </button>
-
           {!isFocused ? (
             <button
               type="button"
               onClick={() => onToggleFocus(camera.id)}
               aria-label={`Open dedicated place for ${camera.classroomName}`}
               title="Inspect camera details"
-              className="inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md border border-zinc-800 bg-[#17181C] text-zinc-300 hover:text-white hover:border-zinc-700 transition-colors whitespace-nowrap cursor-pointer"
+              className="inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 transition-colors whitespace-nowrap cursor-pointer"
             >
               <FolderOpen className="w-3.5 h-3.5" aria-hidden="true" />
               <span className="hidden sm:inline">Inspect</span>
@@ -2436,118 +2484,167 @@ export function CameraFeedCard({
 
           <button
             type="button"
+            aria-expanded={showAdvancedTools}
+            onClick={() => setShowAdvancedTools((prev) => !prev)}
+            title="Advanced tracking, Auto-PTZ, Heatmap, Perimeter Zone & DVR Clip tools"
+            className={`inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
+              showAdvancedTools
+                ? 'bg-slate-100 border-slate-400 text-slate-900'
+                : 'bg-white border-slate-300 text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+            }`}
+          >
+            <SlidersHorizontal className="w-3.5 h-3.5" aria-hidden="true" />
+            <span className="hidden sm:inline">Advanced</span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => onRemoveCamera(camera.id)}
             aria-label={`Remove ${camera.classroomName}`}
             title="Remove camera"
-            className="p-1.5 text-zinc-500 hover:text-red-400 rounded-md hover:bg-zinc-800/80 transition-colors cursor-pointer"
+            className="p-1.5 text-slate-400 hover:text-red-600 rounded-md hover:bg-red-50 transition-colors cursor-pointer"
           >
             <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
           </button>
         </div>
       </div>
 
-      {/* Real-Time Tracking, Auto-PTZ Zoom, Heatmap & Restricted Perimeter Strip (video feeds) */}
-      {!isAudioOnly ? (
-        <div className="px-3.5 py-2 border-t border-zinc-800/80 bg-[#0C0D11] space-y-2 text-[11px]">
+      {/* Collapsible Advanced Camera Controls (Hidden by default so card stays ultra-simple) */}
+      {showAdvancedTools ? (
+        <div className="px-4 py-2.5 border-t border-slate-200 bg-slate-50 space-y-2.5 text-[11px]">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex flex-wrap items-center gap-1.5">
               <button
                 type="button"
-                onClick={() =>
-                  onUpdateCameraSettings(camera.id, {
-                    ptzAutoTrackEnabled: !ptzAutoTrackEnabled,
-                  })
-                }
-                aria-pressed={ptzAutoTrackEnabled}
-                aria-label={`Toggle digital Auto-PTZ zoom tracking for ${camera.classroomName}`}
-                className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded border transition-colors cursor-pointer whitespace-nowrap ${
-                  ptzAutoTrackEnabled
-                    ? 'bg-sky-950/60 border-sky-500/60 text-sky-200'
-                    : 'bg-[#14161B] border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                onClick={handleManualLockClick}
+                aria-label={`Lock forensic DVR evidence for ${camera.classroomName}`}
+                title="Save rolling WebM DVR video clip & forensic frames to Evidence Vault (SHA-256)"
+                className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
+                  justLockedEvidence
+                    ? 'bg-emerald-50 border-emerald-300 text-emerald-700'
+                    : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-100'
                 }`}
               >
-                <Focus className="w-3 h-3" aria-hidden="true" />
-                <span>Auto-PTZ</span>
+                <Video className="w-3 h-3" aria-hidden="true" />
+                <span>{justLockedEvidence ? 'Clip Saved' : 'Save Clip'}</span>
               </button>
 
               <button
                 type="button"
-                onClick={() =>
-                  onUpdateCameraSettings(camera.id, { trailsEnabled: !trailsEnabled })
-                }
-                aria-pressed={trailsEnabled}
-                aria-label={`Toggle movement trajectory trails for ${camera.classroomName}`}
-                className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded border transition-colors cursor-pointer whitespace-nowrap ${
-                  trailsEnabled
-                    ? 'bg-sky-950/60 border-sky-500/60 text-sky-200'
-                    : 'bg-[#14161B] border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                role="switch"
+                aria-checked={isAutoAiOn}
+                aria-label={`Toggle autonomous AI for ${camera.classroomName}`}
+                onClick={() => onUpdateCameraSettings(camera.id, { autoAiEnabled: !isAutoAiOn })}
+                className={`px-2 py-1 text-[11px] font-medium rounded-md border cursor-pointer whitespace-nowrap ${
+                  isAutoAiOn
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-300'
+                    : 'bg-white text-slate-500 border-slate-300 hover:text-slate-900'
                 }`}
               >
-                <Route className="w-3 h-3" aria-hidden="true" />
-                <span>Trails</span>
+                {isAutoAiOn ? 'AI Armed' : 'AI Paused'}
               </button>
 
-              <button
-                type="button"
-                onClick={() =>
-                  onUpdateCameraSettings(camera.id, { heatmapEnabled: !heatmapEnabled })
-                }
-                aria-pressed={heatmapEnabled}
-                aria-label={`Toggle activity heatmap for ${camera.classroomName}`}
-                className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded border transition-colors cursor-pointer whitespace-nowrap ${
-                  heatmapEnabled
-                    ? 'bg-amber-950/60 border-amber-500/60 text-amber-300'
-                    : 'bg-[#14161B] border-zinc-800 text-zinc-400 hover:text-zinc-200'
-                }`}
-              >
-                <Flame className="w-3 h-3" aria-hidden="true" />
-                <span>Heatmap</span>
-              </button>
+              {!isAudioOnly ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onUpdateCameraSettings(camera.id, {
+                        ptzAutoTrackEnabled: !ptzAutoTrackEnabled,
+                      })
+                    }
+                    aria-pressed={ptzAutoTrackEnabled}
+                    aria-label={`Toggle digital Auto-PTZ zoom tracking for ${camera.classroomName}`}
+                    className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-md border transition-colors cursor-pointer whitespace-nowrap ${
+                      ptzAutoTrackEnabled
+                        ? 'bg-blue-50 border-blue-300 text-blue-700'
+                        : 'bg-white border-slate-300 text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <Focus className="w-3 h-3" aria-hidden="true" />
+                    <span>Auto-PTZ</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onUpdateCameraSettings(camera.id, { trailsEnabled: !trailsEnabled })
+                    }
+                    aria-pressed={trailsEnabled}
+                    aria-label={`Toggle movement trajectory trails for ${camera.classroomName}`}
+                    className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-md border transition-colors cursor-pointer whitespace-nowrap ${
+                      trailsEnabled
+                        ? 'bg-blue-50 border-blue-300 text-blue-700'
+                        : 'bg-white border-slate-300 text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <Route className="w-3 h-3" aria-hidden="true" />
+                    <span>Trails</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onUpdateCameraSettings(camera.id, { heatmapEnabled: !heatmapEnabled })
+                    }
+                    aria-pressed={heatmapEnabled}
+                    aria-label={`Toggle activity heatmap for ${camera.classroomName}`}
+                    className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-md border transition-colors cursor-pointer whitespace-nowrap ${
+                      heatmapEnabled
+                        ? 'bg-amber-50 border-amber-300 text-amber-800'
+                        : 'bg-white border-slate-300 text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <Flame className="w-3 h-3" aria-hidden="true" />
+                    <span>Heatmap</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (perimeterZone && !isDrawingZone) {
+                        onUpdateCameraSettings(camera.id, { perimeterZone: null });
+                      } else {
+                        setIsDrawingZone((prev) => !prev);
+                      }
+                    }}
+                    aria-label={
+                      perimeterZone && !isDrawingZone
+                        ? `Clear restricted perimeter on ${camera.classroomName}`
+                        : `Draw restricted perimeter on ${camera.classroomName}`
+                    }
+                    className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-md border transition-colors cursor-pointer whitespace-nowrap ${
+                      perimeterBreached
+                        ? 'bg-red-50 border-red-300 text-red-700'
+                        : isDrawingZone || perimeterZone
+                          ? 'bg-amber-50 border-amber-300 text-amber-800'
+                          : 'bg-white border-slate-300 text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <Crosshair className="w-3 h-3" aria-hidden="true" />
+                    <span>
+                      {isDrawingZone
+                        ? 'Cancel Draw'
+                        : perimeterZone
+                          ? 'Clear Zone'
+                          : 'Draw Zone'}
+                    </span>
+                  </button>
+                </>
+              ) : null}
             </div>
 
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  if (perimeterZone && !isDrawingZone) {
-                    onUpdateCameraSettings(camera.id, { perimeterZone: null });
-                  } else {
-                    setIsDrawingZone((prev) => !prev);
-                  }
-                }}
-                aria-label={
-                  perimeterZone && !isDrawingZone
-                    ? `Clear restricted perimeter on ${camera.classroomName}`
-                    : `Draw restricted perimeter on ${camera.classroomName}`
-                }
-                className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded border transition-colors cursor-pointer whitespace-nowrap ${
-                  perimeterBreached
-                    ? 'bg-red-950/80 border-red-500/70 text-red-200'
-                    : isDrawingZone || perimeterZone
-                      ? 'bg-amber-950/60 border-amber-500/60 text-amber-200'
-                      : 'bg-[#14161B] border-zinc-800 text-zinc-300 hover:text-white hover:border-zinc-700'
-                }`}
-              >
-                <Crosshair className="w-3 h-3" aria-hidden="true" />
-                <span>
-                  {isDrawingZone
-                    ? 'Cancel Draw'
-                    : perimeterZone
-                      ? 'Clear Zone'
-                      : 'Draw Zone'}
-                </span>
-              </button>
-
-              <span className="font-mono text-[10px] text-zinc-500 tabular-nums hidden sm:inline">
+            {!isAudioOnly ? (
+              <span className="font-mono text-[10px] text-slate-400 tabular-nums hidden sm:inline">
                 {isRecordingVideo ? `REC · ${dvrFrameCount}f` : `DVR ${dvrFrameCount}f`}
               </span>
-            </div>
+            ) : null}
           </div>
 
-          {/* Live Tracked Subjects Strip: Click to lock Auto-PTZ or Flag to Cross-Camera Re-ID Watchlist */}
-          {liveTrackedSubjects.length > 0 ? (
-            <div className="pt-1.5 border-t border-zinc-800/70 flex flex-wrap items-center gap-1.5">
-              <span className="text-[10px] font-mono text-zinc-500 uppercase mr-1">Tracked:</span>
+          {/* Tracked Subjects & Watchlist Flagging */}
+          {!isAudioOnly && liveTrackedSubjects.length > 0 ? (
+            <div className="pt-2 border-t border-slate-200 flex flex-wrap items-center gap-1.5">
+              <span className="text-[10px] font-mono text-slate-500 uppercase mr-1">Tracked:</span>
               {liveTrackedSubjects.map((subj) => {
                 const isLocked =
                   lockedPtzSubjectId === subj.id ||
@@ -2558,10 +2655,10 @@ export function CameraFeedCard({
                     key={subj.id}
                     className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded border text-[11px] font-mono tabular-nums ${
                       isHit
-                        ? 'bg-red-950/70 border-red-500/70 text-red-100'
+                        ? 'bg-red-50 border-red-300 text-red-700'
                         : isLocked && ptzAutoTrackEnabled
-                          ? 'bg-sky-950/50 border-sky-500/50 text-sky-100'
-                          : 'bg-[#14161B] border-zinc-800 text-zinc-300'
+                          ? 'bg-blue-50 border-blue-300 text-blue-700'
+                          : 'bg-white border-slate-300 text-slate-700'
                     }`}
                   >
                     <button
@@ -2578,7 +2675,7 @@ export function CameraFeedCard({
                         type="button"
                         onClick={() => handleFlagLiveSubject(subj)}
                         title={`Flag ${subj.id} to Cross-Camera Re-ID Watchlist`}
-                        className="inline-flex items-center gap-0.5 pl-1.5 border-l border-zinc-700 text-amber-300 hover:text-amber-200 cursor-pointer font-sans font-medium"
+                        className="inline-flex items-center gap-0.5 pl-1.5 border-l border-slate-300 text-amber-700 hover:text-amber-900 cursor-pointer font-sans font-medium"
                       >
                         <UserPlus className="w-3 h-3" aria-hidden="true" />
                         <span>Flag</span>
@@ -2594,29 +2691,29 @@ export function CameraFeedCard({
 
       {/* Stream / Error Alerts (only rendered if present) */}
       {streamError || camera.errorMessage || micError ? (
-        <div className="px-3.5 py-2 border-t border-zinc-800/80 bg-[#0D0E12] text-xs space-y-1">
+        <div className="px-4 py-2 border-t border-slate-200 bg-amber-50/70 text-xs space-y-1">
           {streamError ? (
-            <p role="alert" className="text-amber-400 font-medium">
+            <p role="alert" className="text-amber-800 font-medium">
               {streamError}
             </p>
           ) : null}
           {camera.errorMessage ? (
-            <p role="alert" className="text-red-400 font-medium">
+            <p role="alert" className="text-red-700 font-medium">
               {camera.errorMessage}
             </p>
           ) : null}
-          {micError ? <p className="text-amber-400">{micError}</p> : null}
+          {micError ? <p className="text-amber-800">{micError}</p> : null}
         </div>
       ) : null}
 
-      {/* Focused Command Strip: Live Voice Cue Editor & Threat Assessment (shown cleanly only in Focused Inspect View) */}
+      {/* Focused Command Strip: Live Voice Cue Editor & Threat Assessment */}
       {isFocused ? (
-        <div className="px-3.5 py-3 border-t border-zinc-800/80 bg-[#0C0D10] space-y-2 text-xs">
+        <div className="px-4 py-3 border-t border-slate-200 bg-slate-50 space-y-2 text-xs">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2 min-w-0">
-              <span className="text-zinc-400 font-medium">Audio Cue</span>
-              <span className="text-zinc-600" aria-hidden="true">·</span>
-              <span className="font-mono text-[11px] text-zinc-500">
+              <span className="text-slate-700 font-medium">Audio Cue</span>
+              <span className="text-slate-400" aria-hidden="true">·</span>
+              <span className="font-mono text-[11px] text-slate-500">
                 {camera.bluetoothDeviceName} ({camera.bluetoothAddress})
               </span>
             </div>
@@ -2640,11 +2737,11 @@ export function CameraFeedCard({
                     aria-label={`Class total for ${camera.classroomName}`}
                     value={totalDraft}
                     onChange={(e) => setTotalDraft(e.target.value)}
-                    className="w-14 text-xs px-1.5 py-0.5 border border-zinc-700 rounded bg-[#09090B] text-zinc-100"
+                    className="w-14 text-xs px-1.5 py-0.5 border border-slate-300 rounded bg-white text-slate-900"
                   />
                   <button
                     type="submit"
-                    className="text-[11px] font-semibold text-zinc-100 hover:underline cursor-pointer"
+                    className="text-[11px] font-semibold text-blue-600 hover:underline cursor-pointer"
                   >
                     Save
                   </button>
@@ -2653,10 +2750,10 @@ export function CameraFeedCard({
                 <button
                   type="button"
                   onClick={() => setEditingTotal(true)}
-                  className="text-xs text-zinc-400 hover:text-zinc-100 cursor-pointer whitespace-nowrap"
+                  className="text-xs text-slate-500 hover:text-slate-900 cursor-pointer whitespace-nowrap"
                 >
                   Total:{' '}
-                  <span className="font-mono text-zinc-200 tabular-nums">
+                  <span className="font-mono text-slate-800 tabular-nums">
                     {typeof camera.expectedTotalCount === 'number' && camera.expectedTotalCount > 0
                       ? camera.expectedTotalCount
                       : 'Set'}
@@ -2667,7 +2764,7 @@ export function CameraFeedCard({
                 <button
                   type="button"
                   onClick={() => onUpdateTranscript(camera.id, '', undefined, 'audio-meter')}
-                  className="text-xs text-zinc-500 hover:text-zinc-200 cursor-pointer"
+                  className="text-xs text-slate-500 hover:text-slate-900 cursor-pointer"
                 >
                   Clear
                 </button>
@@ -2675,14 +2772,14 @@ export function CameraFeedCard({
               <button
                 type="button"
                 onClick={() => setEditingVoice((prev) => !prev)}
-                className="text-xs text-zinc-300 hover:text-white cursor-pointer whitespace-nowrap"
+                className="text-xs text-slate-700 hover:text-slate-950 cursor-pointer whitespace-nowrap"
               >
                 {editingVoice ? 'Cancel' : 'Edit cue'}
               </button>
               <button
                 type="button"
                 onClick={() => onToggleVoiceListening(camera.id)}
-                className="text-xs text-zinc-300 hover:text-white font-medium cursor-pointer whitespace-nowrap"
+                className="text-xs text-slate-700 hover:text-slate-950 font-medium cursor-pointer whitespace-nowrap"
               >
                 {camera.voiceListeningEnabled ? 'Mute' : 'Unmute'}
               </button>
@@ -2703,12 +2800,12 @@ export function CameraFeedCard({
                 aria-label={`Voice transcript for ${camera.classroomName}`}
                 value={voiceDraft}
                 onChange={(e) => setVoiceDraft(e.target.value)}
-                className="flex-1 min-w-0 text-xs px-2.5 py-1.5 border border-zinc-700 rounded-md bg-[#09090B] text-zinc-100 focus-visible:outline-2 focus-visible:outline-zinc-400"
+                className="flex-1 min-w-0 text-xs px-2.5 py-1.5 border border-slate-300 rounded-md bg-white text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-600"
                 placeholder="Type speech or distress phrase..."
               />
               <button
                 type="submit"
-                className="px-3 py-1.5 text-xs font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white cursor-pointer shrink-0"
+                className="px-3 py-1.5 text-xs font-semibold rounded-md bg-slate-900 text-white hover:bg-slate-800 cursor-pointer shrink-0"
               >
                 Save
               </button>
@@ -2716,7 +2813,7 @@ export function CameraFeedCard({
           ) : (
             <p
               data-testid={`live-speech-${camera.id}`}
-              className="text-zinc-300 leading-relaxed"
+              className="text-slate-700 leading-relaxed"
             >
               {camera.voiceListeningEnabled
                 ? camera.liveTranscript ||
@@ -2728,9 +2825,9 @@ export function CameraFeedCard({
           )}
 
           {camera.lastAnalysis ? (
-            <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-zinc-800/70">
-              <p className="text-zinc-400 leading-relaxed flex-1 min-w-0">
-                <span className="text-zinc-200 font-medium">
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-200">
+              <p className="text-slate-600 leading-relaxed flex-1 min-w-0">
+                <span className="text-slate-900 font-medium">
                   Assessment{modelLabel ? ` (${modelLabel})` : ''}:
                 </span>{' '}
                 {camera.lastAnalysis.summary}
@@ -2741,7 +2838,7 @@ export function CameraFeedCard({
                 onChange={(e) =>
                   onUpdateCameraSettings(camera.id, { aiModel: e.target.value as AiEngineModel })
                 }
-                className="text-[11px] bg-[#17181C] border border-zinc-800 rounded px-2 py-1 text-zinc-300 shrink-0"
+                className="text-[11px] bg-white border border-slate-300 rounded px-2 py-1 text-slate-700 shrink-0"
               >
                 <option value="gemini-4-neon">Gemini 4 Neon</option>
                 <option value="gemini-4-hydrogen">Gemini 4 Hydrogen</option>

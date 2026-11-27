@@ -106,13 +106,13 @@ export function TeacherAlertDispatchModal({
       role="dialog"
       aria-modal="true"
       aria-labelledby="teacher-dispatch-title"
-      className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 bg-slate-900/45 backdrop-blur-xs flex items-center justify-center p-4"
     >
-      <div className="bg-[#111722] border border-slate-700 rounded-xl w-full max-w-xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
-        <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between gap-3">
+      <div className="bg-white border border-slate-300 rounded-xl w-full max-w-xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+        <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2 min-w-0">
-            <MessageSquareWarning className="w-5 h-5 text-red-400 shrink-0" aria-hidden="true" />
-            <h2 id="teacher-dispatch-title" className="text-base font-semibold text-slate-100 truncate">
+            <MessageSquareWarning className="w-5 h-5 text-red-600 shrink-0" aria-hidden="true" />
+            <h2 id="teacher-dispatch-title" className="text-base font-semibold text-slate-900 truncate">
               Confirm Teacher Alert Dispatch
             </h2>
           </div>
@@ -120,23 +120,23 @@ export function TeacherAlertDispatchModal({
             type="button"
             onClick={onClose}
             aria-label="Close dispatch confirmation"
-            className="p-1.5 text-slate-400 hover:text-slate-200 rounded-md hover:bg-slate-800 cursor-pointer"
+            className="p-1.5 text-slate-500 hover:text-slate-900 rounded-md hover:bg-slate-100 cursor-pointer"
           >
             <X className="w-4 h-4" aria-hidden="true" />
           </button>
         </div>
 
         <div className="p-5 space-y-4 overflow-y-auto">
-          <div className="bg-red-950/60 border border-red-800/70 rounded-lg p-3 text-xs text-red-100">
+          <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-xs text-red-900">
             <p className="font-semibold">{alert.headline}</p>
-            <p className="mt-0.5 text-red-200/80">
+            <p className="mt-0.5 text-red-700">
               Review the exact message below before sending externally via Gmail or Google Classroom.
             </p>
           </div>
 
           {!hasAccessToken ? (
-            <div className="bg-[#0D121B] border border-slate-800 rounded-lg p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div className="text-xs text-slate-300">
+            <div className="bg-slate-50 border border-slate-200 rounded-lg p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="text-xs text-slate-700">
                 Sign in with Google to authorize sending alerts via Gmail or posting to Google Classroom.
               </div>
               <GoogleSignInButton compact onClick={() => void onGoogleSignIn()} />
@@ -149,8 +149,8 @@ export function TeacherAlertDispatchModal({
               onClick={() => setChannel('gmail')}
               className={`flex-1 inline-flex items-center justify-center gap-1.5 py-2 px-3 text-xs font-medium rounded-lg border cursor-pointer transition-colors ${
                 channel === 'gmail'
-                  ? 'bg-blue-600/20 border-blue-500 text-blue-300'
-                  : 'bg-[#0D121B] border-slate-700 text-slate-300 hover:bg-slate-800'
+                  ? 'bg-blue-600/20 border-blue-500 text-blue-700'
+                  : 'bg-slate-50 border-slate-300 text-slate-700 hover:bg-slate-100'
               }`}
             >
               <Mail className="w-3.5 h-3.5" aria-hidden="true" />
@@ -161,8 +161,8 @@ export function TeacherAlertDispatchModal({
               onClick={() => setChannel('classroom')}
               className={`flex-1 inline-flex items-center justify-center gap-1.5 py-2 px-3 text-xs font-medium rounded-lg border cursor-pointer transition-colors ${
                 channel === 'classroom'
-                  ? 'bg-blue-600/20 border-blue-500 text-blue-300'
-                  : 'bg-[#0D121B] border-slate-700 text-slate-300 hover:bg-slate-800'
+                  ? 'bg-blue-600/20 border-blue-500 text-blue-700'
+                  : 'bg-slate-50 border-slate-300 text-slate-700 hover:bg-slate-100'
               }`}
             >
               <Send className="w-3.5 h-3.5" aria-hidden="true" />
@@ -172,7 +172,7 @@ export function TeacherAlertDispatchModal({
 
           {channel === 'gmail' ? (
             <div>
-              <label htmlFor="teacher-email-input" className="block text-xs font-medium text-slate-300 mb-1">
+              <label htmlFor="teacher-email-input" className="block text-xs font-medium text-slate-700 mb-1">
                 Teacher Recipient Email
               </label>
               <input
@@ -181,19 +181,19 @@ export function TeacherAlertDispatchModal({
                 value={recipientEmail}
                 onChange={(e) => setRecipientEmail(e.target.value)}
                 placeholder="teacher@school.edu"
-                className="w-full text-sm px-3 py-2 border border-slate-700 bg-[#0D121B] rounded-lg text-slate-100 placeholder:text-slate-500 focus-visible:outline-2 focus-visible:outline-blue-500"
+                className="w-full text-sm px-3 py-2 border border-slate-300 bg-slate-50 rounded-lg text-slate-900 placeholder:text-slate-500 focus-visible:outline-2 focus-visible:outline-blue-500"
               />
             </div>
           ) : (
             <div>
-              <label htmlFor="classroom-course-select" className="block text-xs font-medium text-slate-300 mb-1">
+              <label htmlFor="classroom-course-select" className="block text-xs font-medium text-slate-700 mb-1">
                 Google Classroom Course
               </label>
               <select
                 id="classroom-course-select"
                 value={selectedCourseId}
                 onChange={(e) => setSelectedCourseId(e.target.value)}
-                className="w-full text-sm px-3 py-2 border border-slate-700 rounded-lg bg-[#0D121B] text-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500"
+                className="w-full text-sm px-3 py-2 border border-slate-300 rounded-lg bg-slate-50 text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500"
               >
                 {courses.length === 0 ? (
                   <option value="">No active Classroom courses loaded</option>
@@ -209,7 +209,7 @@ export function TeacherAlertDispatchModal({
           )}
 
           <div>
-            <label htmlFor="alert-subject-input" className="block text-xs font-medium text-slate-300 mb-1">
+            <label htmlFor="alert-subject-input" className="block text-xs font-medium text-slate-700 mb-1">
               Alert Subject
             </label>
             <input
@@ -217,12 +217,12 @@ export function TeacherAlertDispatchModal({
               type="text"
               value={subject}
               onChange={(e) => setSubject(e.target.value)}
-              className="w-full text-sm px-3 py-2 border border-slate-700 bg-[#0D121B] rounded-lg text-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500"
+              className="w-full text-sm px-3 py-2 border border-slate-300 bg-slate-50 rounded-lg text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500"
             />
           </div>
 
           <div>
-            <label htmlFor="alert-body-textarea" className="block text-xs font-medium text-slate-300 mb-1">
+            <label htmlFor="alert-body-textarea" className="block text-xs font-medium text-slate-700 mb-1">
               Alert Message to Teacher
             </label>
             <textarea
@@ -230,22 +230,22 @@ export function TeacherAlertDispatchModal({
               rows={6}
               value={body}
               onChange={(e) => setBody(e.target.value)}
-              className="w-full text-sm px-3 py-2 border border-slate-700 bg-[#0D121B] rounded-lg text-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500"
+              className="w-full text-sm px-3 py-2 border border-slate-300 bg-slate-50 rounded-lg text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500"
             />
           </div>
 
           {error ? (
-            <p role="alert" className="text-xs font-medium text-red-200 bg-red-950/60 border border-red-800/70 rounded-lg p-2.5">
+            <p role="alert" className="text-xs font-medium text-red-800 bg-red-50 border border-red-200 rounded-lg p-2.5">
               {error}
             </p>
           ) : null}
         </div>
 
-        <div className="px-5 py-3.5 border-t border-slate-800 bg-[#0D121B] flex items-center justify-end gap-2">
+        <div className="px-5 py-3.5 border-t border-slate-200 bg-slate-50 flex items-center justify-end gap-2">
           <button
             type="button"
             onClick={onClose}
-            className="px-3.5 py-2 text-xs font-medium rounded-lg border border-slate-700 bg-[#182130] text-slate-200 hover:bg-slate-700 cursor-pointer"
+            className="px-3.5 py-2 text-xs font-medium rounded-lg border border-slate-300 bg-slate-100 text-slate-800 hover:bg-slate-200 cursor-pointer"
           >
             Cancel
           </button>

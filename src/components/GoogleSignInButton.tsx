@@ -17,7 +17,7 @@ export function GoogleSignInButton({
       onClick={onClick}
       disabled={loading}
       data-testid="google-signin-button"
-      className={`gsi-material-button inline-flex items-center justify-center gap-2 rounded-lg bg-[#182130] border border-slate-700 text-slate-100 hover:bg-slate-800 hover:border-slate-600 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-blue-500 ${
+      className={`gsi-material-button inline-flex items-center justify-center gap-2 rounded-lg bg-white border border-slate-300 text-slate-800 hover:bg-slate-50 hover:border-slate-400 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-blue-600 ${
         compact ? 'w-full h-8 px-3 text-xs font-medium' : 'h-9 px-3.5 text-xs sm:text-sm font-medium'
       }`}
     >

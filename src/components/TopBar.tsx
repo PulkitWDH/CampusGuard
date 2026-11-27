@@ -1,4 +1,4 @@
-import { Plus } from 'lucide-react';
+import { Moon, Plus, Sun } from 'lucide-react';
 import type { ActiveWorkspaceView } from '../types';
 
 interface TopBarProps {
@@ -7,6 +7,8 @@ interface TopBarProps {
   unreadAlertsCount: number;
   evidenceCount: number;
   onOpenScanner: () => void;
+  themeMode: 'light' | 'dark';
+  onToggleThemeMode: () => void;
 }
 
 export function TopBar({
@@ -15,6 +17,8 @@ export function TopBar({
   unreadAlertsCount,
   evidenceCount,
   onOpenScanner,
+  themeMode,
+  onToggleThemeMode,
 }: TopBarProps) {
   const navItems: Array<{
     id: ActiveWorkspaceView;
@@ -23,17 +27,17 @@ export function TopBar({
     count?: number;
     countTone?: 'red' | 'neutral';
   }> = [
-    { id: 'grid', label: 'Command Wall', mobileLabel: 'Wall' },
+    { id: 'grid', label: 'Cameras', mobileLabel: 'Cameras' },
     {
       id: 'alerts',
-      label: 'Incidents',
+      label: 'Alerts',
       mobileLabel: 'Alerts',
       count: unreadAlertsCount > 0 ? unreadAlertsCount : undefined,
       countTone: 'red',
     },
     {
       id: 'evidence',
-      label: 'Evidence Vault',
+      label: 'Evidence',
       mobileLabel: 'Vault',
       count: evidenceCount > 0 ? evidenceCount : undefined,
       countTone: 'neutral',
@@ -43,8 +47,8 @@ export function TopBar({
   ];
 
   return (
-    <header className="sticky top-0 z-30 bg-[#09090B]/95 backdrop-blur-md border-b border-zinc-800/90">
-      <div className="h-13 px-4 lg:px-5 flex items-center justify-between gap-4 md:gap-8">
+    <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-md border-b border-slate-200">
+      <div className="h-14 px-4 lg:px-6 flex items-center justify-between gap-4 md:gap-8">
         {/* Zone 1: Single-line Brand Wordmark */}
         <a
           href="#top"
@@ -52,12 +56,12 @@ export function TopBar({
             e.preventDefault();
             onSelectView('grid');
           }}
-          className="font-display font-semibold text-base tracking-tight text-zinc-100 hover:text-white transition-colors whitespace-nowrap shrink-0"
+          className="font-display font-semibold text-base tracking-tight text-slate-900 hover:text-slate-700 transition-colors whitespace-nowrap shrink-0"
         >
           CampusGuard
         </a>
 
-        {/* Zone 2 (Desktop): Clean typographic nav links with subtle bottom active rule */}
+        {/* Zone 2 (Desktop): Clean typographic nav links */}
         <nav
           aria-label="Primary navigation"
           className="hidden md:flex items-center gap-6 lg:gap-7 h-full"
@@ -71,14 +75,14 @@ export function TopBar({
                 onClick={() => onSelectView(item.id)}
                 aria-current={isActive ? 'page' : undefined}
                 className={`relative h-full inline-flex items-center gap-1.5 text-sm font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  isActive ? 'text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+                  isActive ? 'text-slate-950' : 'text-slate-500 hover:text-slate-900'
                 }`}
               >
                 <span>{item.label}</span>
                 {typeof item.count === 'number' ? (
                   <span
                     className={`font-mono text-[11px] font-semibold tabular-nums ${
-                      item.countTone === 'red' ? 'text-red-400' : 'text-zinc-300'
+                      item.countTone === 'red' ? 'text-red-600' : 'text-slate-500'
                     }`}
                   >
                     {item.count}
@@ -87,7 +91,7 @@ export function TopBar({
                 {isActive ? (
                   <span
                     aria-hidden="true"
-                    className="absolute inset-x-0 bottom-0 h-[2px] bg-zinc-100"
+                    className="absolute inset-x-0 bottom-0 h-[2px] bg-slate-900"
                   />
                 ) : null}
               </button>
@@ -95,12 +99,26 @@ export function TopBar({
           })}
         </nav>
 
-        {/* Zone 3: Single Primary Action */}
-        <div className="flex items-center shrink-0">
+        {/* Zone 3: Theme Toggle + Primary Action */}
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={onToggleThemeMode}
+            data-testid="topbar-theme-toggle"
+            aria-label={themeMode === 'dark' ? 'Switch to light interface' : 'Switch to dark interface'}
+            title={themeMode === 'dark' ? 'Switch to Light Mode' : 'Switch to Low-Light Dark Mode'}
+            className="p-2 rounded-lg border border-slate-200 bg-white text-slate-600 hover:text-slate-900 hover:bg-slate-50 transition-colors cursor-pointer shrink-0"
+          >
+            {themeMode === 'dark' ? (
+              <Sun className="w-4 h-4" aria-hidden="true" />
+            ) : (
+              <Moon className="w-4 h-4" aria-hidden="true" />
+            )}
+          </button>
           <button
             type="button"
             onClick={onOpenScanner}
-            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold rounded-md bg-zinc-100 text-zinc-950 hover:bg-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-lg bg-slate-900 text-white hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             <Plus className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
             <span>Add Camera</span>
@@ -108,10 +126,10 @@ export function TopBar({
         </div>
       </div>
 
-      {/* Mobile Navigation Row (zero clipping on 390px viewports) */}
+      {/* Mobile Navigation Row */}
       <nav
         aria-label="Mobile navigation"
-        className="flex md:hidden items-center justify-between border-t border-zinc-800/80 px-3 h-10 gap-1"
+        className="flex md:hidden items-center justify-between border-t border-slate-200 px-3 h-10 gap-1 bg-white"
       >
         {navItems.map((item) => {
           const isActive = activeView === item.id;
@@ -122,7 +140,7 @@ export function TopBar({
               onClick={() => onSelectView(item.id)}
               aria-current={isActive ? 'page' : undefined}
               className={`relative h-full inline-flex items-center gap-1 px-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                isActive ? 'text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+                isActive ? 'text-slate-950' : 'text-slate-500 hover:text-slate-900'
               }`}
             >
               <span className="sm:hidden">{item.mobileLabel}</span>
@@ -130,7 +148,7 @@ export function TopBar({
               {typeof item.count === 'number' ? (
                 <span
                   className={`font-mono text-[10px] font-semibold tabular-nums ${
-                    item.countTone === 'red' ? 'text-red-400' : 'text-zinc-300'
+                    item.countTone === 'red' ? 'text-red-600' : 'text-slate-500'
                   }`}
                 >
                   {item.count}
@@ -139,7 +157,7 @@ export function TopBar({
               {isActive ? (
                 <span
                   aria-hidden="true"
-                  className="absolute inset-x-0 bottom-0 h-[2px] bg-zinc-100"
+                  className="absolute inset-x-0 bottom-0 h-[2px] bg-slate-900"
                 />
               ) : null}
             </button>

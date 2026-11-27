@@ -145,12 +145,12 @@ export function BluetoothDirectoryView({
 
   return (
     <section aria-label="Wi-Fi and Bluetooth CCTV discovery" className="space-y-5">
-      <div className="bg-[#111722] border border-slate-800 rounded-xl p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+      <div className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div>
-          <h1 className="text-xl font-bold text-slate-100">
+          <h1 className="text-xl font-bold text-slate-900">
             Wi-Fi &amp; Bluetooth CCTV Discovery
           </h1>
-          <p className="text-sm text-slate-400 mt-1">
+          <p className="text-sm text-slate-500 mt-1">
             Connect Wi-Fi-only IP CCTV cameras (Hikvision, Reolink, Dahua, ESP32-CAM, IP Webcam) or scan nearby Bluetooth video/voice hardware.
           </p>
         </div>
@@ -168,7 +168,7 @@ export function BluetoothDirectoryView({
             type="button"
             onClick={() => void handleSearchNearby(false)}
             disabled={isScanning}
-            className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium rounded-lg bg-[#182130] border border-slate-700 text-slate-100 hover:bg-slate-700 disabled:opacity-60 transition-colors whitespace-nowrap cursor-pointer"
+            className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium rounded-lg bg-slate-100 border border-slate-300 text-slate-900 hover:bg-slate-200 disabled:opacity-60 transition-colors whitespace-nowrap cursor-pointer"
           >
             <BluetoothSearching className="w-4 h-4" aria-hidden="true" />
             <span>{isScanning ? 'Searching...' : 'Search Bluetooth'}</span>
@@ -177,7 +177,7 @@ export function BluetoothDirectoryView({
             type="button"
             onClick={() => void handleHardwarePicker()}
             disabled={isScanning}
-            className="inline-flex items-center gap-2 px-3 py-2 text-xs font-medium rounded-lg border border-slate-700 bg-[#0A0E14] text-slate-300 hover:bg-slate-800 disabled:opacity-60 transition-colors whitespace-nowrap cursor-pointer"
+            className="inline-flex items-center gap-2 px-3 py-2 text-xs font-medium rounded-lg border border-slate-300 bg-slate-50 text-slate-700 hover:bg-slate-100 disabled:opacity-60 transition-colors whitespace-nowrap cursor-pointer"
           >
             <Bluetooth className="w-4 h-4" aria-hidden="true" />
             <span>Pair Picker</span>
@@ -186,7 +186,7 @@ export function BluetoothDirectoryView({
             type="button"
             onClick={() => void handleSearchNearby(true)}
             disabled={isScanning}
-            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-slate-700 bg-[#0A0E14] text-slate-300 hover:bg-slate-800 disabled:opacity-60 transition-colors whitespace-nowrap cursor-pointer"
+            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-slate-300 bg-slate-50 text-slate-700 hover:bg-slate-100 disabled:opacity-60 transition-colors whitespace-nowrap cursor-pointer"
           >
             <span>Scan Paired Audio/Cam</span>
           </button>
@@ -196,13 +196,13 @@ export function BluetoothDirectoryView({
       {blockedByIframe && typeof window !== 'undefined' ? (
         <div
           role="status"
-          className="bg-amber-950/45 border border-amber-500/40 text-amber-100 rounded-xl px-4 py-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+          className="bg-amber-50 border border-amber-200 text-amber-900 rounded-xl px-4 py-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3"
         >
           <div>
             <p className="font-semibold">
               Embedded preview blocks browser Web Bluetooth hardware access
             </p>
-            <p className="text-amber-200/80 mt-0.5">
+            <p className="text-amber-800 mt-0.5">
               Use &quot;Connect Wi-Fi CCTV&quot; directly, or open in a standalone Chrome/Edge tab to pair Bluetooth CCTV cameras.
             </p>
           </div>
@@ -221,7 +221,7 @@ export function BluetoothDirectoryView({
       {scanNotices.length > 0 ? (
         <div
           role="status"
-          className="text-xs text-slate-300 bg-[#111722] border border-slate-800 rounded-xl px-4 py-3 space-y-1.5"
+          className="text-xs text-slate-700 bg-white border border-slate-200 rounded-xl px-4 py-3 space-y-1.5"
         >
           {scanNotices.map((note, idx) => (
             <p key={idx}>{note}</p>
@@ -229,8 +229,8 @@ export function BluetoothDirectoryView({
         </div>
       ) : null}
 
-      <div className="bg-[#111722] border border-slate-800 rounded-xl overflow-hidden">
-        <div className="px-5 py-3.5 border-b border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+      <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+        <div className="px-5 py-3.5 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="flex items-center gap-3 flex-1 min-w-0">
             <div className="relative w-full sm:max-w-xs">
               <Search
@@ -243,22 +243,22 @@ export function BluetoothDirectoryView({
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="Search scanned devices..."
-                className="w-full pl-8 pr-3 py-1.5 text-xs border border-slate-700 rounded-lg bg-[#0A0E14] text-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500"
+                className="w-full pl-8 pr-3 py-1.5 text-xs border border-slate-300 rounded-lg bg-slate-50 text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500"
               />
             </div>
-            <span className="text-xs font-mono text-slate-400 tabular-nums whitespace-nowrap">
+            <span className="text-xs font-mono text-slate-500 tabular-nums whitespace-nowrap">
               {displayedDevices.length} found
             </span>
           </div>
 
-          <div className="flex items-center gap-0.5 p-0.5 bg-[#0A0E14] border border-slate-800 rounded-lg shrink-0">
+          <div className="flex items-center gap-0.5 p-0.5 bg-slate-50 border border-slate-200 rounded-lg shrink-0">
             <button
               type="button"
               onClick={() => setFilterOnlyEligible(false)}
               className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
                 !filterOnlyEligible
-                  ? 'bg-slate-700 text-white'
-                  : 'text-slate-400 hover:text-slate-100'
+                  ? 'bg-slate-200 text-white'
+                  : 'text-slate-500 hover:text-slate-900'
               }`}
             >
               All Scanned
@@ -268,8 +268,8 @@ export function BluetoothDirectoryView({
               onClick={() => setFilterOnlyEligible(true)}
               className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
                 filterOnlyEligible
-                  ? 'bg-slate-700 text-white'
-                  : 'text-slate-400 hover:text-slate-100'
+                  ? 'bg-slate-200 text-white'
+                  : 'text-slate-500 hover:text-slate-900'
               }`}
             >
               CCTV Video + Voice
@@ -280,12 +280,12 @@ export function BluetoothDirectoryView({
         {displayedDevices.length === 0 ? (
           <div className="p-10 text-center">
             <Bluetooth className="w-7 h-7 text-slate-500 mx-auto mb-2" aria-hidden="true" />
-            <p className="text-sm font-medium text-slate-200">
+            <p className="text-sm font-medium text-slate-800">
               {discoveredDevices.length === 0
                 ? 'No Bluetooth devices discovered yet'
                 : 'No discovered devices match your search'}
             </p>
-            <p className="text-xs text-slate-400 mt-1 max-w-md mx-auto">
+            <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
               Use &quot;Connect Wi-Fi CCTV&quot; for Wi-Fi-only cameras, or scan Bluetooth hardware above.
             </p>
           </div>
@@ -293,7 +293,7 @@ export function BluetoothDirectoryView({
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse">
               <thead>
-                <tr className="border-b border-slate-800 text-[11px] font-semibold uppercase tracking-wider text-slate-400 bg-[#0D121B]">
+                <tr className="border-b border-slate-200 text-[11px] font-semibold uppercase tracking-wider text-slate-500 bg-slate-50">
                   <th className="py-2.5 px-4">Device</th>
                   <th className="py-2.5 px-4">Identification</th>
                   <th className="py-2.5 px-4">Capabilities</th>
@@ -301,7 +301,7 @@ export function BluetoothDirectoryView({
                   <th className="py-2.5 px-4 text-right">Action</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-800/80 text-sm">
+              <tbody className="divide-y divide-slate-200 text-sm">
                 {displayedDevices.map((device) => {
                   const classification = classifyBluetoothCamera(device);
                   const isEligible =
@@ -309,29 +309,29 @@ export function BluetoothDirectoryView({
                   const isConnected = connectedMacs.has(device.macAddress);
 
                   return (
-                    <tr key={device.id} className="hover:bg-slate-800/30">
+                    <tr key={device.id} className="hover:bg-slate-50">
                       <td className="py-3 px-4">
-                        <div className="font-medium text-slate-100">{device.name}</div>
+                        <div className="font-medium text-slate-900">{device.name}</div>
                         <div className="text-xs text-slate-500 font-mono mt-0.5">
                           {device.macAddress}
                         </div>
                       </td>
                       <td className="py-3 px-4">
                         {isEligible ? (
-                          <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-400 whitespace-nowrap">
+                          <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-600 whitespace-nowrap">
                             <CheckCircle2 className="w-4 h-4" aria-hidden="true" />
                             <span>
                               {classification.isEligibleMonitor ? 'CCTV Ready' : 'Manual Override'}
                             </span>
                           </span>
                         ) : (
-                          <span className="inline-flex items-center gap-1.5 text-xs text-slate-400 whitespace-nowrap">
+                          <span className="inline-flex items-center gap-1.5 text-xs text-slate-500 whitespace-nowrap">
                             <XCircle className="w-4 h-4 text-slate-500" aria-hidden="true" />
                             <span>{classification.deviceCategoryLabel}</span>
                           </span>
                         )}
                       </td>
-                      <td className="py-3 px-4 text-xs text-slate-400">
+                      <td className="py-3 px-4 text-xs text-slate-500">
                         <div className="flex items-center gap-3 whitespace-nowrap">
                           <span className="inline-flex items-center gap-1">
                             <Video className="w-3.5 h-3.5" aria-hidden="true" />
@@ -354,7 +354,7 @@ export function BluetoothDirectoryView({
                                 setRoomDrafts((prev) => ({ ...prev, [device.id]: e.target.value }))
                               }
                               placeholder="Zone / Classroom name"
-                              className="w-48 text-xs px-2.5 py-1.5 border border-slate-700 rounded-md bg-[#0A0E14] text-slate-100"
+                              className="w-48 text-xs px-2.5 py-1.5 border border-slate-300 rounded-md bg-slate-50 text-slate-900"
                             />
                             <input
                               type="url"
@@ -364,7 +364,7 @@ export function BluetoothDirectoryView({
                                 setStreamDrafts((prev) => ({ ...prev, [device.id]: e.target.value }))
                               }
                               placeholder="Optional snapshot/MJPEG URL"
-                              className="w-48 text-xs px-2.5 py-1 border border-slate-700 rounded-md bg-[#0A0E14] text-slate-100"
+                              className="w-48 text-xs px-2.5 py-1 border border-slate-300 rounded-md bg-slate-50 text-slate-900"
                             />
                           </div>
                         ) : (
@@ -375,7 +375,7 @@ export function BluetoothDirectoryView({
                       </td>
                       <td className="py-3 px-4 text-right">
                         {isConnected ? (
-                          <span className="text-xs font-medium text-emerald-400 whitespace-nowrap">
+                          <span className="text-xs font-medium text-emerald-600 whitespace-nowrap">
                             Connected
                           </span>
                         ) : isEligible ? (
@@ -393,7 +393,7 @@ export function BluetoothDirectoryView({
                             onClick={() =>
                               setOverrideEligibleIds((prev) => ({ ...prev, [device.id]: true }))
                             }
-                            className="text-xs font-medium text-blue-400 hover:underline whitespace-nowrap cursor-pointer"
+                            className="text-xs font-medium text-blue-600 hover:underline whitespace-nowrap cursor-pointer"
                           >
                             Treat as CCTV
                           </button>
