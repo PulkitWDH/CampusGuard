@@ -9,6 +9,7 @@ import {
   X,
 } from 'lucide-react';
 import { useOnlineStatus, usePWAInstall } from '../hooks/usePWAInstall';
+import { getOfflineResilienceStatus } from '../utils/localPersonDetector';
 import { buildWindowsLauncherEntries, buildZipArchive } from '../utils/zipBuilder';
 
 interface AppDownloadControlsProps {
@@ -271,19 +272,22 @@ export function AppDownloadControls({
   );
 }
 
-export function OfflineBanner() {
-  const isOnline = useOnlineStatus();
+export function OfflineBanner({ isOnlineOverride }: { isOnlineOverride?: boolean } = {}) {
+  const hookOnline = useOnlineStatus();
+  const isOnline = typeof isOnlineOverride === 'boolean' ? isOnlineOverride : hookOnline;
   if (isOnline) return null;
+
+  const status = getOfflineResilienceStatus(false);
 
   return (
     <div
       role="status"
       data-testid="offline-banner"
-      className="bg-amber-50 border-b border-amber-200 text-amber-900 px-4 py-1.5 text-xs flex items-center justify-center gap-2"
+      className="bg-amber-50 border-b border-amber-200 text-amber-950 px-4 py-2 text-xs flex items-center justify-center gap-2.5"
     >
-      <WifiOff className="w-3.5 h-3.5 shrink-0 text-amber-600" aria-hidden="true" />
-      <span>
-        Offline mode — local Edge AI person tracking, acoustic alarms, and DVR recording remain active.
+      <WifiOff className="w-4 h-4 shrink-0 text-amber-600" aria-hidden="true" />
+      <span className="leading-snug">
+        <strong className="font-semibold">{status.bannerTitle}:</strong> {status.bannerDetail}
       </span>
     </div>
   );

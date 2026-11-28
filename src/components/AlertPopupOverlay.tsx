@@ -1,9 +1,10 @@
 import { AlertTriangle, Check, ClipboardCheck, Eye, Mail, ShieldAlert, Volume2, X } from 'lucide-react';
-import type { IncidentAlert } from '../types';
-import { formatAlertCategoryBadge } from '../utils/monitoringLogic';
+import type { IncidentAlert, OperationMode } from '../types';
+import { classifyDisasterPhase, formatAlertCategoryBadge } from '../utils/monitoringLogic';
 
 interface AlertPopupOverlayProps {
   popups: IncidentAlert[];
+  operationMode?: OperationMode;
   onDismissPopup: (alertId: string) => void;
   onDismissAllPopups: () => void;
   onInspectCamera: (cameraId: string) => void;
@@ -13,6 +14,7 @@ interface AlertPopupOverlayProps {
 
 export function AlertPopupOverlay({
   popups,
+  operationMode = 'school',
   onDismissPopup,
   onDismissAllPopups,
   onInspectCamera,
@@ -20,6 +22,7 @@ export function AlertPopupOverlay({
   onAcknowledge,
 }: AlertPopupOverlayProps) {
   if (popups.length === 0) return null;
+  const isDisaster = operationMode === 'disaster';
 
   const visiblePopups = popups.slice(0, 4);
 
@@ -94,6 +97,11 @@ export function AlertPopupOverlay({
                 <span className="text-[11px] font-mono font-bold tracking-wider uppercase whitespace-nowrap">
                   {badge.label}
                 </span>
+                {isDisaster ? (
+                  <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-black/25 whitespace-nowrap">
+                    P{classifyDisasterPhase(alert).phase}
+                  </span>
+                ) : null}
                 {typeof alert.threatScore === 'number' && isCritical ? (
                   <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-black/20 tabular-nums whitespace-nowrap">
                     {alert.threatScore}/100
@@ -158,10 +166,26 @@ export function AlertPopupOverlay({
                 <button
                   type="button"
                   onClick={() => onNotifyTeacher(alert)}
-                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-lg bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 transition-colors cursor-pointer whitespace-nowrap"
+                  className={`inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors cursor-pointer whitespace-nowrap ${
+                    isDisaster
+                      ? 'bg-red-50 border-red-300 text-red-700 hover:bg-red-100'
+                      : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-50'
+                  }`}
                 >
-                  <Mail className="w-3.5 h-3.5" aria-hidden="true" />
-                  <span>{alert.teacherNotified ? 'Notified' : 'Notify'}</span>
+                  {isDisaster ? (
+                    <Volume2 className="w-3.5 h-3.5" aria-hidden="true" />
+                  ) : (
+                    <Mail className="w-3.5 h-3.5" aria-hidden="true" />
+                  )}
+                  <span>
+                    {alert.teacherNotified
+                      ? isDisaster
+                        ? 'PA Sent'
+                        : 'Notified'
+                      : isDisaster
+                        ? 'PA Broadcast'
+                        : 'Notify'}
+                  </span>
                 </button>
                 <button
                   type="button"

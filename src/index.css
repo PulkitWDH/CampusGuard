@@ -172,7 +172,8 @@ html.dark .hover\:text-slate-700:hover {
 }
 
 /* Semantic dark tints for alerts, status pills, and wired port badges */
-html.dark .bg-emerald-50 {
+html.dark .bg-emerald-50,
+html.dark [class*="bg-emerald-50/"] {
   background-color: rgba(16, 185, 129, 0.14) !important;
 }
 html.dark .border-emerald-200 {
@@ -187,12 +188,15 @@ html.dark .text-emerald-600 {
   color: #34d399 !important;
 }
 
-html.dark .bg-amber-50 {
+html.dark .bg-amber-50,
+html.dark [class*="bg-amber-50/"] {
   background-color: rgba(245, 158, 11, 0.14) !important;
 }
-html.dark .border-amber-200 {
-  border-color: rgba(245, 158, 11, 0.35) !important;
+html.dark .border-amber-200,
+html.dark .border-amber-300 {
+  border-color: rgba(245, 158, 11, 0.38) !important;
 }
+html.dark .text-amber-950,
 html.dark .text-amber-900,
 html.dark .text-amber-800,
 html.dark .text-amber-700,
@@ -200,13 +204,15 @@ html.dark .text-amber-600 {
   color: #fbbf24 !important;
 }
 
-html.dark .bg-red-50 {
+html.dark .bg-red-50,
+html.dark [class*="bg-red-50/"] {
   background-color: rgba(239, 68, 68, 0.14) !important;
 }
 html.dark .border-red-200,
 html.dark .border-red-300 {
-  border-color: rgba(239, 68, 68, 0.4) !important;
+  border-color: rgba(239, 68, 68, 0.42) !important;
 }
+html.dark .text-red-950,
 html.dark .text-red-900,
 html.dark .text-red-800,
 html.dark .text-red-700,

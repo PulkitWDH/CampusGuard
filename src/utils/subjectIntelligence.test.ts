@@ -3,9 +3,12 @@ import test from 'node:test';
 import type { DetectedPersonBox, WatchlistSubject } from '../types';
 import {
   computeAppearanceSimilarity,
+  computePeakTrailVelocity,
   computeSmoothPtzViewport,
   easePtzViewportToFull,
   extractAppearanceSignature,
+  getDefaultWatchlistLabelMode,
+  getWatchlistModeMeta,
   mapBoxThroughPtzViewport,
   mapPointThroughPtzViewport,
   matchSubjectsToWatchlist,
@@ -175,4 +178,76 @@ test('computeSmoothPtzViewport preserves exact aspect ratio, eliminates micro-ji
     vp = easePtzViewportToFull(vp, 0.2);
   }
   assert.equal(vp, null, 'PTZ should ease cleanly back to full frame');
+});
+
+test('getDefaultWatchlistLabelMode and getWatchlistModeMeta switch between Security Watchlist and Missing Person / Evacuee Re-ID', () => {
+  assert.equal(getDefaultWatchlistLabelMode('school'), 'security');
+  assert.equal(getDefaultWatchlistLabelMode('disaster'), 'missing-person');
+
+  const securityMeta = getWatchlistModeMeta('security');
+  assert.equal(securityMeta.title, 'Security Watchlist');
+  assert.equal(securityMeta.matchTagPrefix, 'WATCHLIST');
+
+  const missingMeta = getWatchlistModeMeta('missing-person');
+  assert.equal(missingMeta.title, 'Missing Person / Evacuee Re-Identification');
+  assert.equal(missingMeta.matchTagPrefix, 'EVACUEE FOUND');
+  assert.match(missingMeta.description, /HSV/i);
+});
+
+test('Phase 2 Fallen / Collapsed Victim Detection flags stationary horizontal victims after >1.5s while ignoring close-up seated webcam presenters', () => {
+  // 1. Standing person collapses onto the floor and stays stationary for >1.5s -> isFallenVictim === true
+  const standing: DetectedPersonBox[] = [
+    { label: 'Person 1', box_2d: [220, 380, 820, 560], confidence: 90 },
+  ];
+  let tracker = updateTrackedSubjects([], standing, 1000, 1);
+  assert.equal(tracker.subjects[0].isFallenVictim, false);
+  assert.equal(tracker.subjects[0].seenUpright, true);
+
+  // Flips horizontal on ground at t=1600ms (width=420, height=200 => aspect 2.1)
+  const fallenBox: DetectedPersonBox[] = [
+    { label: 'Person 1', box_2d: [640, 260, 840, 680], confidence: 86 },
+  ];
+  tracker = updateTrackedSubjects(tracker.subjects, fallenBox, 1600, tracker.nextNumericId);
+  // Still moving down / just fell -> not yet >1.5s
+  assert.equal(tracker.subjects[0].isFallenVictim, false);
+
+  // Remains stationary on ground at t=2400ms (0.8s elapsed) -> still below 1.5s threshold
+  tracker = updateTrackedSubjects(tracker.subjects, fallenBox, 2400, tracker.nextNumericId);
+  assert.equal(tracker.subjects[0].isFallenVictim, false);
+
+  // Remains stationary on ground at t=3600ms (>1.5s stationary) -> MUST trigger Fallen Victim!
+  tracker = updateTrackedSubjects(tracker.subjects, fallenBox, 3600, tracker.nextNumericId);
+  assert.equal(tracker.subjects[0].isFallenVictim, true);
+  assert.ok((tracker.subjects[0].fallenDurationMs ?? 0) >= 1500);
+
+  // 2. Close-up seated webcam presenter (ymin=140, h=820, wide shoulders) sitting still for 3s -> NEVER false triggers!
+  const seatedWebcam: DetectedPersonBox[] = [
+    { label: 'Person 1', box_2d: [140, 60, 960, 940], confidence: 91 },
+  ];
+  let camTracker = updateTrackedSubjects([], seatedWebcam, 5000, 1);
+  camTracker = updateTrackedSubjects(camTracker.subjects, seatedWebcam, 6200, camTracker.nextNumericId);
+  camTracker = updateTrackedSubjects(camTracker.subjects, seatedWebcam, 8500, camTracker.nextNumericId);
+  assert.equal(camTracker.subjects[0].isFallenVictim, false);
+
+  // 3. computePeakTrailVelocity measures fast panic movement accurately
+  let sprintTracker = updateTrackedSubjects(
+    [],
+    [{ label: 'Person 1', box_2d: [250, 100, 750, 240], confidence: 90 }],
+    10000,
+    1
+  );
+  sprintTracker = updateTrackedSubjects(
+    sprintTracker.subjects,
+    [{ label: 'Person 1', box_2d: [250, 180, 750, 320], confidence: 90 }],
+    10250,
+    sprintTracker.nextNumericId
+  );
+  sprintTracker = updateTrackedSubjects(
+    sprintTracker.subjects,
+    [{ label: 'Person 1', box_2d: [250, 260, 750, 400], confidence: 90 }],
+    10500,
+    sprintTracker.nextNumericId
+  );
+  const peakVel = computePeakTrailVelocity(sprintTracker.subjects);
+  assert.ok(peakVel >= 180, `Expected high panic velocity >= 180 u/s, got ${peakVel}`);
 });

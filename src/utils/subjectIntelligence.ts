@@ -1,10 +1,57 @@
 import type {
   AppearanceSignature,
   DetectedPersonBox,
+  OperationMode,
   TrackedSubject,
+  WatchlistLabelMode,
   WatchlistSubject,
 } from '../types';
 import { computeNoseAnchor } from './bodySilhouette';
+import { filterNoseSample } from './trailSmoothing';
+
+export interface WatchlistModeMeta {
+  mode: WatchlistLabelMode;
+  title: string;
+  shortLabel: string;
+  enrollButtonLabel: string;
+  flagActionLabel: string;
+  matchTagPrefix: string;
+  matchHeadlinePrefix: string;
+  description: string;
+}
+
+export function getDefaultWatchlistLabelMode(
+  operationMode: OperationMode = 'school'
+): WatchlistLabelMode {
+  return operationMode === 'disaster' ? 'missing-person' : 'security';
+}
+
+export function getWatchlistModeMeta(mode: WatchlistLabelMode): WatchlistModeMeta {
+  if (mode === 'missing-person') {
+    return {
+      mode: 'missing-person',
+      title: 'Missing Person / Evacuee Re-Identification',
+      shortLabel: 'Evacuee Re-ID',
+      enrollButtonLabel: 'Enroll Missing Person Photo',
+      flagActionLabel: 'Track Evacuee',
+      matchTagPrefix: 'EVACUEE FOUND',
+      matchHeadlinePrefix: 'MISSING PERSON / EVACUEE LOCATED',
+      description:
+        'Phase 3 Post-Disaster Relief: 36-bin spatial HSV clothing-color Re-Identification locates separated children, elderly, and evacuees across relief camp cameras without needing facial visibility.',
+    };
+  }
+  return {
+    mode: 'security',
+    title: 'Security Watchlist',
+    shortLabel: 'Watchlist Re-ID',
+    enrollButtonLabel: 'Enroll Photo',
+    flagActionLabel: 'Flag',
+    matchTagPrefix: 'WATCHLIST',
+    matchHeadlinePrefix: 'WATCHLIST MATCH',
+    description:
+      '36-bin spatial HSV appearance Re-ID tracks flagged individuals across campus cameras even if faces are occluded.',
+  };
+}
 
 export interface PtzViewportRect {
   /** Normalized 0..1000 crop coordinates inside active video draw rect */
@@ -50,19 +97,81 @@ function boxCenter(box: [number, number, number, number]): { x: number; y: numbe
   };
 }
 
+export const FALLEN_VICTIM_MIN_DURATION_MS = 1500;
+export const FALLEN_VICTIM_HORIZONTAL_ASPECT = 1.28;
+export const FALLEN_VICTIM_MAX_STATIONARY_SPEED = 40;
+
+function isUprightBox(box: [number, number, number, number]): boolean {
+  const [ymin, xmin, ymax, xmax] = box;
+  const w = Math.max(1, xmax - xmin);
+  const h = Math.max(1, ymax - ymin);
+  // Upright standing/seated posture (not a flat floor-lying horizontal rectangle)
+  return w / h <= 1.08 && h >= 120;
+}
+
+function isHorizontalFloorPosture(
+  box: [number, number, number, number],
+  seenUpright: boolean,
+  alreadyHorizontal: boolean
+): boolean {
+  const [ymin, xmin, ymax, xmax] = box;
+  const w = Math.max(1, xmax - xmin);
+  const h = Math.max(1, ymax - ymin);
+  const aspect = w / h;
+  const aspectThreshold = alreadyHorizontal ? 1.22 : FALLEN_VICTIM_HORIZONTAL_ASPECT;
+  if (aspect < aspectThreshold) return false;
+
+  // Guard against false positives from close-up seated webcam presenters whose upper torso
+  // spans the full frame height (e.g. ymin=140..ymax=980, h=840): a person fallen on the floor
+  // either transitioned from an upright posture to a lower/horizontal box OR occupies the lower
+  // ground band with compact vertical height.
+  const isCloseUpWebcamBust = ymin < 260 && h > 520;
+  if (isCloseUpWebcamBust) return false;
+
+  if (seenUpright) {
+    return ymin >= 300 || h <= 520;
+  }
+  return h <= 440 && ymin >= 420;
+}
+
+/**
+ * Computes the peak nose-trail velocity (normalized 0..1000 units/sec) across active tracked subjects
+ * so the Phase 1 Stampede Risk Meter detects sudden crowd panic velocity spikes instantaneously.
+ */
+export function computePeakTrailVelocity(subjects: TrackedSubject[]): number {
+  let peak = 0;
+  for (const subj of subjects) {
+    if (subj.speedNormPerSec > peak) {
+      peak = subj.speedNormPerSec;
+    }
+    const pts = subj.trail;
+    if (pts && pts.length >= 2) {
+      const last = pts[pts.length - 1];
+      const prev = pts[pts.length - 2];
+      const dtSec = Math.max(0.05, (last.atMs - prev.atMs) / 1000);
+      if (dtSec <= 1.5) {
+        const noseVel = Math.hypot(last.x - prev.x, last.y - prev.y) / dtSec;
+        if (noseVel > peak) peak = Math.round(noseVel);
+      }
+    }
+  }
+  return Math.round(peak);
+}
+
 /**
  * Maintains persistent Subject IDs (SUBJ-01, SUBJ-02...), nose-anchored movement trajectory trails,
- * dwell time, and normalized movement speed across frames.
+ * dwell time, normalized movement speed, and Phase 2 Fallen / Collapsed Victim posture across frames.
  */
 export function updateTrackedSubjects(
   prevSubjects: TrackedSubject[],
   detections: DetectedPersonBox[],
   nowMs: number,
   nextNumericIdStart: number,
-  options?: { maxAgeMs?: number; maxTrailPoints?: number }
+  options?: { maxAgeMs?: number; maxTrailPoints?: number; trailMaxAgeMs?: number }
 ): { subjects: TrackedSubject[]; nextNumericId: number } {
   const maxAgeMs = options?.maxAgeMs ?? 6000;
   const maxTrailPoints = options?.maxTrailPoints ?? 36;
+  const trailMaxAgeMs = options?.trailMaxAgeMs ?? 8000;
 
   const activePrev = prevSubjects.filter((s) => nowMs - s.lastSeenAtMs <= maxAgeMs);
   const matchedPrevIds = new Set<string>();
@@ -98,23 +207,52 @@ export function updateTrackedSubjects(
     const det = detections[pair.detIdx];
     const prevCenter = boxCenter(prev.box_2d);
     const nextCenter = boxCenter(det.box_2d);
-    const nextNose = computeNoseAnchor(det.box_2d);
+    const rawNose = computeNoseAnchor(det.box_2d);
     const dtSec = Math.max(0.05, (nowMs - prev.lastSeenAtMs) / 1000);
     const stepDist = Math.hypot(nextCenter.x - prevCenter.x, nextCenter.y - prevCenter.y);
     const instantSpeed = stepDist / dtSec;
     const smoothedSpeed = prev.speedNormPerSec * 0.6 + instantSpeed * 0.4;
 
-    const lastTrail = prev.trail[prev.trail.length - 1];
-    const trailDist = lastTrail
-      ? Math.hypot(nextNose.x - lastTrail.x, nextNose.y - lastTrail.y)
+    const prevFilteredNose = prev.smoothedNose ?? prev.trail[prev.trail.length - 1] ?? null;
+    const filteredNose = filterNoseSample(prevFilteredNose, rawNose, dtSec);
+
+    // Trim expired waypoints so stationary subjects don't keep tangled old scribbles forever
+    const freshTrail = prev.trail.filter((pt) => nowMs - pt.atMs <= trailMaxAgeMs);
+    const activeLast = freshTrail[freshTrail.length - 1] ?? null;
+    const trailDist = activeLast
+      ? Math.hypot(filteredNose.x - activeLast.x, filteredNose.y - activeLast.y)
       : 999;
 
     const nextTrail =
-      trailDist >= 6 || prev.trail.length === 0
-        ? [...prev.trail, { x: Math.round(nextNose.x), y: Math.round(nextNose.y), atMs: nowMs }].slice(
+      trailDist >= 11 || freshTrail.length === 0
+        ? [...freshTrail, { x: filteredNose.x, y: filteredNose.y, atMs: nowMs }].slice(
             -maxTrailPoints
           )
-        : prev.trail;
+        : freshTrail;
+
+    // Phase 2 Fallen / Collapsed Victim Detection:
+    // Horizontal bounding box that stays stationary on the ground for > 1.5 seconds
+    const seenUpright = Boolean(prev.seenUpright || isUprightBox(det.box_2d));
+    const wasHorizontal = typeof prev.horizontalSinceMs === 'number';
+    const horizontalNow = isHorizontalFloorPosture(det.box_2d, seenUpright, wasHorizontal);
+    const stationaryNow =
+      instantSpeed <= FALLEN_VICTIM_MAX_STATIONARY_SPEED ||
+      smoothedSpeed <= FALLEN_VICTIM_MAX_STATIONARY_SPEED;
+
+    let horizontalSinceMs: number | undefined;
+    let fallenDurationMs = 0;
+    let isFallenVictim = false;
+
+    if (horizontalNow && stationaryNow) {
+      horizontalSinceMs = prev.horizontalSinceMs ?? nowMs;
+      fallenDurationMs = Math.max(0, nowMs - horizontalSinceMs);
+      isFallenVictim = fallenDurationMs >= FALLEN_VICTIM_MIN_DURATION_MS;
+    } else if (horizontalNow) {
+      // Just dropped/flipped horizontally or crawling — anchor stationary ground timer at touchdown
+      horizontalSinceMs = nowMs;
+      fallenDurationMs = 0;
+      isFallenVictim = false;
+    }
 
     nextSubjects.push({
       ...prev,
@@ -126,6 +264,11 @@ export function updateTrackedSubjects(
       dwellSeconds: Math.max(0, Math.round((nowMs - prev.firstSeenAtMs) / 1000)),
       speedNormPerSec: Math.round(smoothedSpeed),
       trail: nextTrail,
+      smoothedNose: filteredNose,
+      seenUpright,
+      horizontalSinceMs,
+      fallenDurationMs,
+      isFallenVictim,
     });
   }
 
@@ -135,6 +278,8 @@ export function updateTrackedSubjects(
     const det = detections[d];
     const nose = computeNoseAnchor(det.box_2d);
     const numericId = nextNumericId++;
+    const seenUpright = isUprightBox(det.box_2d);
+    const horizontalNow = isHorizontalFloorPosture(det.box_2d, false, false);
     nextSubjects.push({
       id: `SUBJ-${String(numericId).padStart(2, '0')}`,
       numericId,
@@ -146,7 +291,12 @@ export function updateTrackedSubjects(
       lastSeenAtMs: nowMs,
       dwellSeconds: 0,
       speedNormPerSec: 0,
-      trail: [{ x: Math.round(nose.x), y: Math.round(nose.y), atMs: nowMs }],
+      trail: [{ x: Math.round(nose.x * 10) / 10, y: Math.round(nose.y * 10) / 10, atMs: nowMs }],
+      smoothedNose: { x: Math.round(nose.x * 10) / 10, y: Math.round(nose.y * 10) / 10 },
+      seenUpright,
+      horizontalSinceMs: horizontalNow ? nowMs : undefined,
+      fallenDurationMs: 0,
+      isFallenVictim: false,
     });
   }
 

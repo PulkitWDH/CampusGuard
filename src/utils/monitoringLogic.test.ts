@@ -4,6 +4,7 @@ import {
   DEFAULT_DB_CALIBRATION_OFFSET,
   SOUND_ALERT_THRESHOLD_DB,
   classifyBluetoothCamera,
+  classifyDisasterPhase,
   computeAspectPreservingSize,
   computeBoxIoU,
   computeCalibratedOffsetFromDbfs,
@@ -17,10 +18,12 @@ import {
   createInitialEdgeThreatState,
   deriveSafetyStatus,
   evaluateAttendanceReportAlert,
+  evaluateFallenVictimAlert,
   evaluateFightNotification,
   evaluateLocalSafetyAnalysis,
   evaluateRealtimeEdgeThreat,
   evaluateSoundThresholdAlert,
+  evaluateStampedeRiskAlert,
   evaluateVoiceCueThreatAlert,
   filterIncidentAlerts,
   filterVerifiedPersonDetections,
@@ -29,7 +32,9 @@ import {
   formatAlertCategoryBadge,
   formatCameraAttendanceLabel,
   formatFacilityLabels,
+  formatOperationModeBranding,
   mapNormalizedBoxToRect,
+  matchDisasterDistressKeyword,
   mergeTiledPersonDetections,
   parseSafeJsonText,
   shouldRunScheduledAttendance,
@@ -38,6 +43,7 @@ import {
   stepPersonTracker,
 } from './monitoringLogic';
 import type { ClassroomAnalysis, ClassroomCamera, IncidentAlert } from '../types';
+import { getOfflineResilienceStatus } from './localPersonDetector';
 import { buildWifiCameraUrl, isPrivateLanHost } from './wifiCameraPresets';
 
 test('classifyBluetoothCamera detects CCTV camera with video and voice recognition', () => {
@@ -739,46 +745,91 @@ test('evaluateRealtimeEdgeThreat ignores normal movement and reliably detects ge
     assert.equal(res.shouldEmitAlert, false);
   }
 
-  // 2. Genuine silent visual fight (1 initial frame + 4 consecutive overlapping clash frames with high velocity)
+  // 1c. Two people walking smoothly in the SAME direction (passing behind booth) -> ZERO false fight alert
+  let walkState = createInitialEdgeThreatState();
+  for (let i = 0; i < 6; i += 1) {
+    const walkShift = i * 42;
+    const walkingPair = [
+      { label: 'Person (left)', box_2d: [160, 120 + walkShift, 820, 380 + walkShift] as [number, number, number, number], confidence: 90 },
+      { label: 'Person (right)', box_2d: [170, 290 + walkShift, 830, 550 + walkShift] as [number, number, number, number], confidence: 88 },
+    ];
+    const res = evaluateRealtimeEdgeThreat(walkState, {
+      people: walkingPair,
+      dangerousObjects: [],
+      frameDeltaPercent: 18.0,
+      voiceTranscript: '',
+      audioLevel: 58,
+      facilityMode: 'school',
+      nowMs: 7000 + i * 300,
+    });
+    walkState = res.nextState;
+    assert.equal(res.analysis, null);
+    assert.equal(res.shouldEmitAlert, false);
+  }
+
+  // 1d. Three calm exhibition visitors standing side-by-side with small jitter -> ZERO false bullying alert
+  let calmCrowdState = createInitialEdgeThreatState();
+  for (let i = 0; i < 6; i += 1) {
+    const jitter = i % 2 === 0 ? 0 : 4;
+    const calmVisitors = [
+      { label: 'Person (left)', box_2d: [180, 160 + jitter, 820, 400 + jitter] as [number, number, number, number], confidence: 88 },
+      { label: 'Person (center)', box_2d: [200, 390 - jitter, 820, 610 - jitter] as [number, number, number, number], confidence: 86 },
+      { label: 'Person (right)', box_2d: [180, 600 + jitter, 820, 840 + jitter] as [number, number, number, number], confidence: 87 },
+    ];
+    const res = evaluateRealtimeEdgeThreat(calmCrowdState, {
+      people: calmVisitors,
+      dangerousObjects: [],
+      frameDeltaPercent: 8.0,
+      voiceTranscript: '',
+      audioLevel: 60,
+      facilityMode: 'school',
+      nowMs: 8500 + i * 300,
+    });
+    calmCrowdState = res.nextState;
+    assert.equal(res.analysis, null);
+    assert.equal(res.shouldEmitAlert, false);
+  }
+
+  // 2. Genuine silent visual fight (opposing relative clash with overlapping contact across 5 frames)
   let fightState = createInitialEdgeThreatState();
   let fightResult = null as ReturnType<typeof evaluateRealtimeEdgeThreat> | null;
-  for (let i = 0; i < 5; i += 1) {
-    const shift = i % 2 === 0 ? 0 : 75;
+  for (let i = 0; i < 6; i += 1) {
+    const lungeA = i % 2 === 0 ? 0 : 34;
+    const lungeB = i % 2 === 0 ? 0 : -32;
     const clashingPeople = [
-      { label: 'Person (center)', box_2d: [160, 280 + shift, 820, 560 + shift] as [number, number, number, number], confidence: 91 },
-      { label: 'Person (center)', box_2d: [170, 410 + shift, 830, 690 + shift] as [number, number, number, number], confidence: 87 },
+      { label: 'Person (center)', box_2d: [160, 280 + lungeA, 820, 560 + lungeA] as [number, number, number, number], confidence: 91 },
+      { label: 'Person (center)', box_2d: [170, 420 + lungeB, 830, 700 + lungeB] as [number, number, number, number], confidence: 87 },
     ];
     fightResult = evaluateRealtimeEdgeThreat(fightState, {
       people: clashingPeople,
       dangerousObjects: [],
-      frameDeltaPercent: 18.5,
+      frameDeltaPercent: 21.0,
       voiceTranscript: '',
       audioLevel: 0,
       facilityMode: 'school',
       nowMs: 10000 + i * 300,
     });
     fightState = fightResult.nextState;
-    if (i < 4) {
-      assert.equal(fightResult.shouldEmitAlert, false);
-    }
   }
   assert.equal(fightResult?.shouldEmitAlert, true);
   assert.equal(fightResult?.analysis?.threatCategory, 'fight');
   assert.equal(fightResult?.analysis?.severity, 'critical');
 
-  // 3. Genuine silent visual beating (victim collapsed horizontally under overlapping contact + motion over 4 frames)
-  const beatingPeople = [
-    { label: 'Person (center)', box_2d: [160, 310, 820, 580] as [number, number, number, number], confidence: 92 },
-    // Horizontal fallen victim box (width 440 / height 240 = 1.83 >= 1.35, ymin 540 >= 340) overlapping attacker
-    { label: 'Person (center)', box_2d: [540, 340, 780, 780] as [number, number, number, number], confidence: 84 },
-  ];
+  // 3. Genuine silent visual beating (victim collapsed horizontally on floor under active opposing strikes)
   let beatState = createInitialEdgeThreatState();
   let beatResult = null as ReturnType<typeof evaluateRealtimeEdgeThreat> | null;
-  for (let i = 0; i < 4; i += 1) {
+  for (let i = 0; i < 5; i += 1) {
+    const strikeShift = i % 2 === 0 ? 0 : 48;
+    const victimShift = i % 2 === 0 ? 0 : -24;
+    const beatingPeople = [
+      { label: 'Person (center)', box_2d: [160, 310 + strikeShift, 820, 580 + strikeShift] as [number, number, number, number], confidence: 92 },
+      // Horizontal fallen victim box (width 440 / height 240 = 1.83 >= 1.42, ymin 540 >= 370)
+      { label: 'Person (center)', box_2d: [540, 350 + victimShift, 780, 790 + victimShift] as [number, number, number, number], confidence: 84 },
+    ];
     beatResult = evaluateRealtimeEdgeThreat(beatState, {
       people: beatingPeople,
       dangerousObjects: [],
-      frameDeltaPercent: 16.5,
+      frameDeltaPercent: 18.5,
       voiceTranscript: '',
       audioLevel: 0,
       facilityMode: 'school',
@@ -789,19 +840,44 @@ test('evaluateRealtimeEdgeThreat ignores normal movement and reliably detects ge
   assert.equal(beatResult?.shouldEmitAlert, true);
   assert.equal(beatResult?.analysis?.threatCategory, 'beating');
 
-  // 4. Genuine silent visual bullying (3 distinct people tightly surrounding 1 target across 5 frames with motion)
-  const crowdingPeople = [
-    { label: 'Person (left)', box_2d: [180, 180, 820, 420] as [number, number, number, number], confidence: 88 },
-    { label: 'Person (center)', box_2d: [220, 410, 820, 610] as [number, number, number, number], confidence: 85 },
-    { label: 'Person (right)', box_2d: [180, 600, 820, 840] as [number, number, number, number], confidence: 87 },
-  ];
+  // 4a. Genuine 2-person visual bullying (aggressor shoving/advancing into retreating & crouching victim)
+  let pairBullyState = createInitialEdgeThreatState();
+  let pairBullyResult = null as ReturnType<typeof evaluateRealtimeEdgeThreat> | null;
+  for (let i = 0; i < 5; i += 1) {
+    const aggressorX = 240 + i * 28;
+    const victimX = 480 + i * 22;
+    const victimTop = 210 + i * 32; // crouching/flinching downward while retreating
+    pairBullyResult = evaluateRealtimeEdgeThreat(pairBullyState, {
+      people: [
+        { label: 'Person (left)', box_2d: [150, aggressorX, 840, aggressorX + 240], confidence: 90 },
+        { label: 'Person (right)', box_2d: [victimTop, victimX, 840, victimX + 200], confidence: 86 },
+      ],
+      dangerousObjects: [],
+      frameDeltaPercent: 12.5,
+      voiceTranscript: '',
+      audioLevel: 0,
+      facilityMode: 'school',
+      nowMs: 26000 + i * 300,
+    });
+    pairBullyState = pairBullyResult.nextState;
+  }
+  assert.equal(pairBullyResult?.shouldEmitAlert, true);
+  assert.equal(pairBullyResult?.analysis?.threatCategory, 'bullying');
+
+  // 4b. Genuine 3-person group visual bullying (bilateral flankers closing inward around center target)
   let bullyState = createInitialEdgeThreatState();
   let bullyResult = null as ReturnType<typeof evaluateRealtimeEdgeThreat> | null;
   for (let i = 0; i < 5; i += 1) {
+    const press = i * 16;
+    const crowdingPeople = [
+      { label: 'Person (left)', box_2d: [180, 180 + press, 820, 420 + press] as [number, number, number, number], confidence: 88 },
+      { label: 'Person (center)', box_2d: [220 + i * 8, 410, 820, 610] as [number, number, number, number], confidence: 85 },
+      { label: 'Person (right)', box_2d: [180, 600 - press, 820, 840 - press] as [number, number, number, number], confidence: 87 },
+    ];
     bullyResult = evaluateRealtimeEdgeThreat(bullyState, {
       people: crowdingPeople,
       dangerousObjects: [],
-      frameDeltaPercent: 7.5,
+      frameDeltaPercent: 12.5,
       voiceTranscript: '',
       audioLevel: 0,
       facilityMode: 'school',
@@ -1136,4 +1212,211 @@ test('microphone-only zones trigger voice-cue beating alerts and >90.1 dB sound 
   assert.equal(sustainedLoud.measuredDb, 93.4);
 });
 
+test('Disaster Management Mode adapts branding, distress keywords, >90.1 dB structural collapse alerts, 3-phase classification, fallen victim alerts, stampede alerts, and offline resilience badge', () => {
+  const schoolBrand = formatOperationModeBranding('school', 'school');
+  assert.equal(schoolBrand.workspaceNavLabel, 'Teacher Hub');
+
+  const disasterBrand = formatOperationModeBranding('disaster', 'school');
+  assert.equal(disasterBrand.workspaceNavLabel, 'PA & Rescue');
+  assert.equal(disasterBrand.workspaceFullTitle, 'Emergency Command & PA Speaker Dispatch');
+  assert.equal(disasterBrand.dispatchButtonLabel, 'PA Broadcast');
+  assert.equal(
+    disasterBrand.headerSubtitle,
+    'AI-Powered Disaster Management, Stampede Prevention & Emergency Rescue System (Campus & Public Safety)'
+  );
+
+  // Disaster distress cues trigger in Disaster Mode (including 'collapse')
+  for (const cue of ['help', 'trapped', 'fire', 'earthquake', 'flood', 'collapse', 'medical', 'emergency']) {
+    assert.equal(matchDisasterDistressKeyword(`Please send ${cue} immediately!`), cue);
+  }
+
+  const shelterCam = {
+    id: 'cam-shelter-1',
+    cameraCode: 'CAM-1',
+    classroomName: 'Relief Camp Gate A',
+    studentCount: 22,
+    lastAnalysis: null,
+  };
+
+  const trappedAlert = evaluateVoiceCueThreatAlert(
+    shelterCam,
+    'Someone is trapped under the stairwell after the collapse!',
+    78.2,
+    'all',
+    { nowMs: 90000, lastAlertAtMs: 0, operationMode: 'disaster' }
+  );
+  assert.ok(trappedAlert);
+  assert.equal(trappedAlert.severity, 'critical');
+  assert.equal(trappedAlert.disasterPhase, 2);
+  assert.equal(classifyDisasterPhase(trappedAlert).phase, 2);
+  assert.match(trappedAlert.headline, /DISASTER DISTRESS VOICE ALERT/i);
+
+  // >90.1 dB spike in Disaster Mode labels as ACOUSTIC DISTRESS / STRUCTURAL COLLAPSE ALERT (Phase 2)
+  const collapseSpike = evaluateSoundThresholdAlert(shelterCam, 94.8, {
+    nowMs: 95000,
+    sustainedSeconds: 3.4,
+    operationMode: 'disaster',
+  });
+  assert.ok(collapseSpike);
+  assert.equal(collapseSpike.disasterPhase, 2);
+  assert.match(collapseSpike.headline, /ACOUSTIC DISTRESS \/ STRUCTURAL COLLAPSE ALERT/i);
+
+  // Stampede alert captures live count, threshold & Phase 1 classification (plus panic velocity spike support)
+  const stampedeAlert = evaluateStampedeRiskAlert(shelterCam, 22, 15, { nowMs: 96000 });
+  assert.equal(stampedeAlert.severity, 'critical');
+  assert.equal(stampedeAlert.disasterPhase, 1);
+  assert.equal(classifyDisasterPhase(stampedeAlert).phase, 1);
+  assert.match(stampedeAlert.headline, /STAMPEDE \/ OVERCROWDING RISK/i);
+  assert.match(stampedeAlert.details, /22 people/);
+  assert.match(stampedeAlert.details, /threshold of 15/);
+
+  const panicAlert = evaluateStampedeRiskAlert(shelterCam, 4, 15, {
+    nowMs: 96500,
+    panicVelocitySpike: true,
+    peakTrailVelocity: 340,
+  });
+  assert.equal(panicAlert.disasterPhase, 1);
+  assert.match(panicAlert.headline, /PANIC VELOCITY SPIKE/i);
+
+  // Phase 2 Fallen / Collapsed Victim Alert fires instantly and respects cooldown
+  const fallenAlert = evaluateFallenVictimAlert(
+    shelterCam,
+    { id: 'SUBJ-03', fallenDurationMs: 1850, confidence: 88 },
+    { nowMs: 97000, lastAlertAtMs: 0 }
+  );
+  assert.ok(fallenAlert);
+  assert.equal(fallenAlert.severity, 'critical');
+  assert.equal(fallenAlert.disasterPhase, 2);
+  assert.equal(classifyDisasterPhase(fallenAlert).phase, 2);
+  assert.match(fallenAlert.headline, /FALLEN \/ COLLAPSED VICTIM DETECTED/i);
+
+  const fallenCooldownBlocked = evaluateFallenVictimAlert(
+    shelterCam,
+    { id: 'SUBJ-03', fallenDurationMs: 2500 },
+    { nowMs: 100000, lastAlertAtMs: 97000, cooldownMs: 15000 }
+  );
+  assert.equal(fallenCooldownBlocked, null);
+
+  // Phase 3 classification for Missing Person / Evacuee Re-ID
+  assert.equal(
+    classifyDisasterPhase({
+      alertType: 'ai-vision',
+      headline: 'MISSING PERSON / EVACUEE LOCATED: Child in Red Jacket',
+      threatCategory: 'intrusion',
+      details: 'Cross-camera HSV Re-ID match',
+    }).phase,
+    3
+  );
+
+  // Offline resilience status badge strings
+  const online = getOfflineResilienceStatus(true);
+  assert.equal(online.badgeLabel, 'ONLINE: Edge + Cloud AI Synced');
+  assert.equal(online.isOnline, true);
+
+  const offline = getOfflineResilienceStatus(false);
+  assert.equal(offline.badgeLabel, 'OFFLINE RESILIENCE MODE: 100% Local Edge AI Active');
+  assert.equal(offline.isOnline, false);
+  assert.match(offline.bannerDetail, /TensorFlow\.js/i);
+});
+
+test('still uploaded photos, mixed-height stationary people near frame edges, and Disaster Mode crowds NEVER trigger false bullying alerts', () => {
+  // 1. Tall adult + shorter child/person standing completely still next to frame edge -> ZERO bullying!
+  const tallAndShortStatic: Array<{ label: string; box_2d: [number, number, number, number]; confidence: number }> = [
+    { label: 'Person (left)', box_2d: [120, 120, 860, 360], confidence: 90 }, // taller (h=740)
+    { label: 'Person (left)', box_2d: [340, 15, 860, 175], confidence: 88 },  // shorter (h=520) near left edge (xmin=15)
+  ];
+  let staticState = createInitialEdgeThreatState();
+  for (let i = 0; i < 8; i += 1) {
+    const res = evaluateRealtimeEdgeThreat(staticState, {
+      people: tallAndShortStatic,
+      dangerousObjects: [],
+      frameDeltaPercent: 1.5,
+      voiceTranscript: '',
+      audioLevel: 45,
+      facilityMode: 'school',
+      operationMode: 'school',
+      nowMs: 100000 + i * 300,
+    });
+    staticState = res.nextState;
+    assert.equal(res.analysis, null);
+    assert.equal(res.shouldEmitAlert, false);
+  }
+
+  // 2. Uploaded STILL PHOTO (isStillImage: true) with dense overlapping crowd -> NEVER fires bullying/fight/beating,
+  //    but STILL detects weapons!
+  const densePhotoCrowd: Array<{ label: string; box_2d: [number, number, number, number]; confidence: number }> = [
+    { label: 'Person', box_2d: [160, 180, 820, 420], confidence: 88 },
+    { label: 'Person', box_2d: [220, 360, 820, 560], confidence: 86 },
+    { label: 'Person', box_2d: [160, 520, 820, 760], confidence: 87 },
+  ];
+  let stillState = createInitialEdgeThreatState();
+  for (let i = 0; i < 6; i += 1) {
+    const res = evaluateRealtimeEdgeThreat(stillState, {
+      people: densePhotoCrowd,
+      dangerousObjects: [],
+      frameDeltaPercent: 25,
+      voiceTranscript: 'stop bullying me',
+      audioLevel: 85,
+      facilityMode: 'school',
+      operationMode: 'school',
+      isStillImage: true,
+      nowMs: 110000 + i * 300,
+    });
+    stillState = res.nextState;
+    assert.equal(res.analysis, null);
+    assert.equal(res.shouldEmitAlert, false);
+  }
+
+  // Still photo local safety evaluation stays nominal (no kinetic bullying/fight) and reports Count & Density mode
+  const stillLocal = evaluateLocalSafetyAnalysis({
+    detectedPeople: densePhotoCrowd,
+    detectedObjects: [],
+    frameDeltaPercent: 30,
+    voiceTranscript: '',
+    audioLevel: 0,
+    facilityMode: 'school',
+    operationMode: 'school',
+    isStillImage: true,
+  });
+  assert.equal(stillLocal.threatCategory, 'none');
+  assert.equal(stillLocal.isFighting, false);
+  assert.match(stillLocal.summary, /still image/i);
+
+  // Weapon inside a still photo STILL triggers robbery_or_weapon
+  const stillWeapon = evaluateLocalSafetyAnalysis({
+    detectedPeople: densePhotoCrowd,
+    detectedObjects: [
+      { label: 'Knife / Blade', category: 'weapon', box_2d: [380, 400, 490, 470], confidence: 89 },
+    ],
+    frameDeltaPercent: 0,
+    voiceTranscript: '',
+    audioLevel: 0,
+    facilityMode: 'all',
+    operationMode: 'school',
+    isStillImage: true,
+  });
+  assert.equal(stillWeapon.threatCategory, 'robbery_or_weapon');
+
+  // 3. Disaster & Rescue Mode NEVER triggers school-style visual bullying on moving public crowds
+  let disasterCrowdState = createInitialEdgeThreatState();
+  for (let i = 0; i < 6; i += 1) {
+    const press = i * 16;
+    const res = evaluateRealtimeEdgeThreat(disasterCrowdState, {
+      people: [
+        { label: 'Person', box_2d: [180, 180 + press, 820, 420 + press], confidence: 88 },
+        { label: 'Person', box_2d: [220 + i * 8, 410, 820, 610], confidence: 85 },
+        { label: 'Person', box_2d: [180, 600 - press, 820, 840 - press], confidence: 87 },
+      ],
+      dangerousObjects: [],
+      frameDeltaPercent: 14,
+      voiceTranscript: '',
+      audioLevel: 76,
+      facilityMode: 'all',
+      operationMode: 'disaster',
+      nowMs: 120000 + i * 300,
+    });
+    disasterCrowdState = res.nextState;
+    assert.notEqual(res.analysis?.threatCategory, 'bullying');
+  }
+});
 

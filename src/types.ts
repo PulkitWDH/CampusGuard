@@ -18,6 +18,38 @@ export type AiEngineModel =
 
 export type FacilityMode = 'all' | 'bank' | 'school';
 
+export type OperationMode = 'school' | 'disaster';
+
+export type CrowdDensityStatus = 'SAFE' | 'ELEVATED' | 'CRITICAL CRUSH RISK';
+
+export type DisasterPhase = 1 | 2 | 3;
+
+export type StampedeRiskLevel = 'NORMAL' | 'BOTTLENECK WARNING' | 'CRITICAL STAMPEDE RISK';
+
+export type WatchlistLabelMode = 'security' | 'missing-person';
+
+export type PerimeterZonePreset =
+  | 'Restricted Area'
+  | 'Collapsed Structure Zone'
+  | 'Flood / Live Wire Hazard'
+  | 'Fire / Smoke Exclusion Zone'
+  | 'Evacuation Bottleneck';
+
+export interface DisasterSituationReport {
+  cameraId: string;
+  cameraCode: string;
+  zoneName: string;
+  modelUsed: string;
+  generatedAt: string;
+  summary: string;
+  crowdPanicDetected: boolean;
+  blockedExitsDetected: boolean;
+  fireOrSmokeDetected: boolean;
+  structuralDamageDetected: boolean;
+  recommendedAction: string;
+  source: 'gemini-vision' | 'gemini-cloud' | 'local-edge-fallback';
+}
+
 export type ThreatCategory =
   | 'none'
   | 'fight'
@@ -62,6 +94,15 @@ export interface TrackedSubject {
   dwellSeconds: number;
   speedNormPerSec: number;
   trail: SubjectTrailPoint[];
+  smoothedNose?: { x: number; y: number };
+  /** Tracks whether subject was ever observed upright (prevents false fall alerts on close-up seated webcams) */
+  seenUpright?: boolean;
+  /** Timestamp when subject flipped horizontal and became stationary on the ground */
+  horizontalSinceMs?: number;
+  /** Duration in milliseconds the subject has stayed horizontal & stationary */
+  fallenDurationMs?: number;
+  /** True when horizontal & stationary on ground for > 1.5 seconds (Phase 2 Rescue Alert) */
+  isFallenVictim?: boolean;
   matchedWatchlistId?: string;
   matchedWatchlistLabel?: string;
   matchedSimilarity?: number;
@@ -246,6 +287,7 @@ export interface IncidentAlert {
   teacherMessageSubject?: string;
   teacherMessageBody?: string;
   teacherNotified?: boolean;
+  disasterPhase?: DisasterPhase;
   timestamp: string;
   acknowledged: boolean;
 }

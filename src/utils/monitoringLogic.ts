@@ -8,6 +8,7 @@ import type {
   DetectedPersonBox,
   FacilityMode,
   IncidentAlert,
+  OperationMode,
   ThreatCategory,
   ThreatSensitivity,
 } from '../types';
@@ -457,6 +458,7 @@ export interface SoundThresholdAlertOptions {
   nowMs?: number;
   cooldownMs?: number;
   liveTranscript?: string;
+  operationMode?: OperationMode;
 }
 
 export function evaluateSoundThresholdAlert(
@@ -477,29 +479,42 @@ export function evaluateSoundThresholdAlert(
   }
 
   alertSequenceCounter += 1;
+  const isDisaster = options.operationMode === 'disaster';
   const formattedDb = audioLevel.toFixed(1);
   const sustainedSec =
     typeof options.sustainedSeconds === 'number' && options.sustainedSeconds > 0
       ? options.sustainedSeconds.toFixed(1)
       : (SOUND_ALERT_SUSTAINED_MS / 1000).toFixed(1);
   const timestamp = new Date(nowMs).toISOString();
-  const teacherGreeting = options.teacherName ? `Hello ${options.teacherName},` : 'Hello Teacher,';
-  const courseLine = options.courseName ? `Course: ${options.courseName}\n` : '';
+  const teacherGreeting = isDisaster
+    ? 'Emergency Command & Rescue Dispatch,'
+    : options.teacherName
+      ? `Hello ${options.teacherName},`
+      : 'Hello Teacher,';
+  const courseLine = options.courseName ? `${isDisaster ? 'Sector / Unit' : 'Course'}: ${options.courseName}\n` : '';
   const transcriptLine = options.liveTranscript
     ? `Captured speech cue: "${options.liveTranscript}"\n`
-    : 'Captured speech cue: Sustained loud noise detected (no speech transcript).\n';
+    : isDisaster
+      ? 'Captured acoustic cue: Sustained >90.1 dB acoustic distress or structural collapse spike.\n'
+      : 'Captured speech cue: Sustained loud noise detected (no speech transcript).\n';
 
-  const teacherMessageSubject = `[Urgent Sound Alert] ${camera.classroomName} stayed above ${thresholdDb.toFixed(1)} dB (${formattedDb} dB for ${sustainedSec}s)`;
+  const teacherMessageSubject = isDisaster
+    ? `[ACOUSTIC DISTRESS / STRUCTURAL COLLAPSE ALERT] ${camera.classroomName} reached ${formattedDb} dB (${sustainedSec}s)`
+    : `[Urgent Sound Alert] ${camera.classroomName} stayed above ${thresholdDb.toFixed(1)} dB (${formattedDb} dB for ${sustainedSec}s)`;
   const teacherMessageBody = [
     teacherGreeting,
     '',
-    `An automated sustained-noise alert was triggered in ${camera.classroomName} (${camera.cameraCode}).`,
+    isDisaster
+      ? `An automated ACOUSTIC DISTRESS / STRUCTURAL COLLAPSE ALERT was triggered in ${camera.classroomName} (${camera.cameraCode}).`
+      : `An automated sustained-noise alert was triggered in ${camera.classroomName} (${camera.cameraCode}).`,
     `Measured sound level: ${formattedDb} dB (stayed above ${thresholdDb.toFixed(1)} dB for ${sustainedSec}s).`,
     `${courseLine}Estimated occupancy: ${camera.studentCount} present.`,
     transcriptLine.trim(),
     `Logged at: ${timestamp}`,
     '',
-    'Please check on the classroom/zone immediately.',
+    isDisaster
+      ? 'Dispatch rescue / structural assessment team and verify evacuee safety immediately.'
+      : 'Please check on the classroom/zone immediately.',
   ].join('\n');
 
   return {
@@ -508,20 +523,288 @@ export function evaluateSoundThresholdAlert(
     cameraCode: camera.cameraCode,
     classroomName: camera.classroomName,
     alertType: 'sound-threshold',
+    disasterPhase: isDisaster ? 2 : undefined,
     severity: 'critical',
     threatCategory: 'disturbance',
     studentCount: camera.studentCount,
     measuredDb: Number(formattedDb),
-    headline: `Teacher Sound Alert: ${camera.classroomName} stayed over ${thresholdDb.toFixed(1)} dB (${formattedDb} dB · ${sustainedSec}s)`,
+    headline: isDisaster
+      ? `ACOUSTIC DISTRESS / STRUCTURAL COLLAPSE ALERT: ${camera.classroomName} (${formattedDb} dB · ${sustainedSec}s)`
+      : `Teacher Sound Alert: ${camera.classroomName} stayed over ${thresholdDb.toFixed(1)} dB (${formattedDb} dB · ${sustainedSec}s)`,
     voiceCue: options.liveTranscript
       ? `${formattedDb} dB (${sustainedSec}s) — "${options.liveTranscript}"`
-      : `Sustained sound ${formattedDb} dB exceeded ${thresholdDb.toFixed(1)} dB for ${sustainedSec}s`,
-    details: `Sustained noise exceeded ${thresholdDb.toFixed(1)} dB for over ${(SOUND_ALERT_SUSTAINED_MS / 1000).toFixed(0)} seconds. Alert prepared for teacher${options.teacherEmail ? ` (${options.teacherEmail})` : ''}.`,
+      : isDisaster
+        ? `ACOUSTIC DISTRESS / STRUCTURAL COLLAPSE ALERT: ${formattedDb} dB (> ${thresholdDb.toFixed(1)} dB for ${sustainedSec}s)`
+        : `Sustained sound ${formattedDb} dB exceeded ${thresholdDb.toFixed(1)} dB for ${sustainedSec}s`,
+    details: isDisaster
+      ? `Sustained >90.1 dB acoustic distress / structural collapse alert exceeded ${thresholdDb.toFixed(1)} dB for over ${(SOUND_ALERT_SUSTAINED_MS / 1000).toFixed(0)} seconds (supports Microphone-Only rubble/smoke rescue zones). Rescue dispatch prepared${options.teacherEmail ? ` (${options.teacherEmail})` : ''}.`
+      : `Sustained noise exceeded ${thresholdDb.toFixed(1)} dB for over ${(SOUND_ALERT_SUSTAINED_MS / 1000).toFixed(0)} seconds. Alert prepared for teacher${options.teacherEmail ? ` (${options.teacherEmail})` : ''}.`,
     teacherMessageSubject,
     teacherMessageBody,
     teacherNotified: false,
     timestamp,
     acknowledged: false,
+  };
+}
+
+export interface DisasterPhaseMeta {
+  phase: 1 | 2 | 3;
+  shortTag: string;
+  title: string;
+  description: string;
+}
+
+export function getDisasterPhaseMeta(phase: 1 | 2 | 3): DisasterPhaseMeta {
+  if (phase === 1) {
+    return {
+      phase: 1,
+      shortTag: 'PHASE 1 · PREVENTION',
+      title: 'Phase 1 — Prevention & Early Warning',
+      description: 'Stampede Risk Meter, Multi-Scale Crowd AI Pyramid, and Hazard Perimeter Zones.',
+    };
+  }
+  if (phase === 2) {
+    return {
+      phase: 2,
+      shortTag: 'PHASE 2 · RESPONSE',
+      title: 'Phase 2 — Emergency Response & Victim Detection',
+      description: 'Zero-delay Edge AI Fallen Victim detection, Acoustic Collapse (>90.1 dB), and Disaster Speech cues.',
+    };
+  }
+  return {
+    phase: 3,
+    shortTag: 'PHASE 3 · RELIEF & RE-ID',
+    title: 'Phase 3 — Post-Disaster Relief & Missing Person Re-ID',
+    description: 'Cross-camera Missing Person / Evacuee Re-Identification and Tamper-Proof SHA-256 Rescue Logs.',
+  };
+}
+
+export function classifyDisasterPhase(
+  alert: Pick<IncidentAlert, 'disasterPhase' | 'alertType' | 'headline' | 'threatCategory' | 'details'>
+): DisasterPhaseMeta {
+  if (alert.disasterPhase === 1 || alert.disasterPhase === 2 || alert.disasterPhase === 3) {
+    return getDisasterPhaseMeta(alert.disasterPhase);
+  }
+  const text = `${alert.headline || ''} ${alert.details || ''}`.toLowerCase();
+  if (
+    text.includes('missing person') ||
+    text.includes('evacuee') ||
+    text.includes('watchlist') ||
+    text.includes('re-id') ||
+    text.includes('sha-256')
+  ) {
+    return getDisasterPhaseMeta(3);
+  }
+  if (
+    text.includes('stampede') ||
+    text.includes('crush') ||
+    text.includes('bottleneck') ||
+    text.includes('overcrowding') ||
+    text.includes('hazard zone') ||
+    text.includes('perimeter') ||
+    text.includes('collapsed structure') ||
+    text.includes('flood / live wire') ||
+    text.includes('fire / smoke') ||
+    text.includes('evacuation dispatch')
+  ) {
+    return getDisasterPhaseMeta(1);
+  }
+  return getDisasterPhaseMeta(2);
+}
+
+export function evaluateFallenVictimAlert(
+  camera: Pick<ClassroomCamera, 'id' | 'cameraCode' | 'classroomName' | 'studentCount'>,
+  subject: { id: string; fallenDurationMs?: number; confidence?: number },
+  options?: {
+    nowMs?: number;
+    lastAlertAtMs?: number;
+    cooldownMs?: number;
+  }
+): IncidentAlert | null {
+  const nowMs = options?.nowMs ?? Date.now();
+  const cooldownMs = options?.cooldownMs ?? 15000;
+  const lastAlertAtMs = options?.lastAlertAtMs ?? 0;
+  if (lastAlertAtMs > 0 && nowMs - lastAlertAtMs < cooldownMs) {
+    return null;
+  }
+
+  alertSequenceCounter += 1;
+  const timestamp = new Date(nowMs).toISOString();
+  const fallenSec = Math.max(1.5, ((subject.fallenDurationMs ?? 1500) / 1000)).toFixed(1);
+
+  return {
+    id: `alert-fallen-${camera.id}-${nowMs}-${alertSequenceCounter}`,
+    cameraId: camera.id,
+    cameraCode: camera.cameraCode,
+    classroomName: camera.classroomName,
+    alertType: 'ai-vision',
+    disasterPhase: 2,
+    severity: 'critical',
+    threatCategory: 'disturbance',
+    threatScore: 97,
+    detectedBehaviors: [
+      `Fallen / collapsed victim (${subject.id}) horizontal & stationary on ground for ${fallenSec}s`,
+      'Zero-delay local Edge AI medical rescue trigger',
+    ],
+    recommendedAction:
+      'Dispatch medical / rescue team immediately to check fallen or unconscious individual and clear surrounding pathway.',
+    studentCount: Math.max(1, camera.studentCount || 1),
+    headline: `FALLEN / COLLAPSED VICTIM DETECTED: ${subject.id} in ${camera.classroomName} (${fallenSec}s)`,
+    voiceCue: `Local Edge AI Victim Alert: ${subject.id} stationary on ground (${fallenSec}s)`,
+    details: `Phase 2 Emergency Response: Tracked subject ${subject.id} flipped horizontal and remained stationary on the ground for ${fallenSec}s in ${camera.classroomName} (${camera.cameraCode}). Immediate rescue team check required.`,
+    teacherMessageSubject: `[RESCUE DISPATCH] Fallen / Collapsed Victim (${subject.id}) in ${camera.classroomName}`,
+    teacherMessageBody: [
+      'Emergency Command & Medical Rescue Dispatch,',
+      '',
+      `Phase 2 Fallen / Collapsed Victim Alert triggered in ${camera.classroomName} (${camera.cameraCode}).`,
+      `Tracked Subject: ${subject.id}`,
+      `Stationary Ground Duration: ${fallenSec}s`,
+      `Logged at: ${timestamp}`,
+      '',
+      'Action Required: Dispatch nearest medical / search-and-rescue responders immediately.',
+    ].join('\n'),
+    teacherNotified: false,
+    timestamp,
+    acknowledged: false,
+  };
+}
+
+export function evaluateStampedeRiskAlert(
+  camera: Pick<ClassroomCamera, 'id' | 'cameraCode' | 'classroomName' | 'studentCount'>,
+  personCount: number,
+  threshold: number,
+  options?: {
+    dispatcherEmail?: string;
+    nowMs?: number;
+    panicVelocitySpike?: boolean;
+    peakTrailVelocity?: number;
+  }
+): IncidentAlert {
+  alertSequenceCounter += 1;
+  const nowMs = options?.nowMs ?? Date.now();
+  const timestamp = new Date(nowMs).toISOString();
+  const safeCount = Math.max(0, Math.round(personCount));
+  const safeThreshold = Math.max(1, Math.round(threshold));
+  const panicSpike = Boolean(options?.panicVelocitySpike);
+  const thresholdExceeded = safeCount >= safeThreshold || panicSpike;
+  const velocityNote =
+    panicSpike && options?.peakTrailVelocity
+      ? ` · panic trail velocity ${options.peakTrailVelocity} u/s`
+      : '';
+
+  const headline = panicSpike
+    ? `CRITICAL STAMPEDE RISK (PANIC VELOCITY SPIKE): ${camera.classroomName} (${safeCount} people${velocityNote})`
+    : thresholdExceeded
+      ? `STAMPEDE / OVERCROWDING RISK: ${camera.classroomName} (${safeCount} people · limit ${safeThreshold})`
+      : `EVACUATION DISPATCH: ${camera.classroomName} (${safeCount} people · limit ${safeThreshold})`;
+  const details = panicSpike
+    ? `Phase 1 Stampede Prevention: Sudden nose-trail panic velocity spike (${options?.peakTrailVelocity ?? 0} u/s) detected on ${camera.classroomName} (${camera.cameraCode}) with ${safeCount} people tracked. Automated evacuation alert triggered.`
+    : thresholdExceeded
+      ? `CRITICAL STAMPEDE RISK detected on ${camera.classroomName} (${camera.cameraCode}): ${safeCount} people detected by Multi-Scale Crowd AI Pyramid (exceeds threshold of ${safeThreshold}). Automated evacuation dispatch ready.`
+      : `Manual precautionary evacuation dispatch initiated on ${camera.classroomName} (${camera.cameraCode}): ${safeCount} people tracked against crowd density threshold of ${safeThreshold}.`;
+  const teacherMessageSubject = thresholdExceeded
+    ? `[EVACUATION DISPATCH] CRITICAL STAMPEDE / OVERCROWDING RISK in ${camera.classroomName} (${safeCount} people)`
+    : `[EVACUATION DISPATCH] Precautionary Evacuation Order for ${camera.classroomName}`;
+  const teacherMessageBody = [
+    'Emergency Command & Rescue Dispatch,',
+    '',
+    thresholdExceeded
+      ? `CRITICAL STAMPEDE RISK / OVERCROWDING WARNING triggered in ${camera.classroomName} (${camera.cameraCode}).`
+      : `Precautionary Evacuation Dispatch initiated for ${camera.classroomName} (${camera.cameraCode}).`,
+    `Live Multi-Scale Crowd AI Headcount: ${safeCount} people`,
+    `Configured Crowd Density Threshold: ${safeThreshold} people`,
+    `Density Classification: ${thresholdExceeded ? 'CRITICAL STAMPEDE RISK' : 'PRECAUTIONARY DISPATCH'}${velocityNote}`,
+    `Logged at: ${timestamp}`,
+    '',
+    'Action Required: Open auxiliary emergency exits immediately, halt incoming foot traffic, and deploy crowd-control & rescue personnel.',
+  ].join('\n');
+
+  return {
+    id: `alert-stampede-${camera.id}-${nowMs}-${alertSequenceCounter}`,
+    cameraId: camera.id,
+    cameraCode: camera.cameraCode,
+    classroomName: camera.classroomName,
+    alertType: 'ai-vision',
+    disasterPhase: 1,
+    severity: 'critical',
+    threatCategory: 'disturbance',
+    threatScore: thresholdExceeded ? 98 : 88,
+    detectedBehaviors: panicSpike
+      ? [
+          `CRITICAL STAMPEDE RISK — Panic velocity spike (${options?.peakTrailVelocity ?? 0} u/s)`,
+          `${safeCount} people tracked by Multi-Scale Crowd AI Pyramid`,
+        ]
+      : thresholdExceeded
+        ? [
+            `CRITICAL STAMPEDE RISK (${safeCount} people >= threshold ${safeThreshold})`,
+            'Stampede & bottleneck overcrowding risk',
+          ]
+        : [`Precautionary evacuation dispatch (${safeCount}/${safeThreshold} people)`],
+    recommendedAction:
+      'Trigger immediate evacuation broadcast, open secondary exits, and dispatch Emergency Command & Rescue teams.',
+    studentCount: safeCount,
+    headline,
+    voiceCue: panicSpike
+      ? `Panic velocity spike (${options?.peakTrailVelocity ?? 0} u/s) — CRITICAL STAMPEDE RISK`
+      : thresholdExceeded
+        ? `Crowd density ${safeCount}/${safeThreshold} — CRITICAL STAMPEDE RISK`
+        : `Precautionary evacuation dispatch (${safeCount}/${safeThreshold})`,
+    details,
+    teacherMessageSubject,
+    teacherMessageBody,
+    teacherNotified: false,
+    timestamp,
+    acknowledged: false,
+  };
+}
+
+export interface OperationModeBranding {
+  mode: OperationMode;
+  headerSubtitle: string;
+  workspaceNavLabel: string;
+  workspaceNavMobileLabel: string;
+  workspaceFullTitle: string;
+  dispatchModalTitle: string;
+  dispatchButtonLabel: string;
+  recipientLabel: string;
+  standbyTitle: string;
+  standbySubtitle: string;
+}
+
+export function formatOperationModeBranding(
+  operationMode: OperationMode,
+  facilityMode: FacilityMode = 'all'
+): OperationModeBranding {
+  if (operationMode === 'disaster') {
+    return {
+      mode: 'disaster',
+      headerSubtitle:
+        'AI-Powered Disaster Management, Stampede Prevention & Emergency Rescue System (Campus & Public Safety)',
+      workspaceNavLabel: 'PA & Rescue',
+      workspaceNavMobileLabel: 'PA Hub',
+      workspaceFullTitle: 'Emergency Command & PA Speaker Dispatch',
+      dispatchModalTitle: 'PA Speaker & Evacuation Broadcast',
+      dispatchButtonLabel: 'PA Broadcast',
+      recipientLabel: 'Emergency Command / PA Zone Target',
+      standbyTitle: 'Venue Emergency Command & PA Speaker Monitor',
+      standbySubtitle:
+        'Connect mall, campus, or relief-camp cameras and microphones for 100% offline stampede early warning, fallen-victim detection, automated PA voice evacuation broadcasts, hazard zones, and missing-person Re-ID.',
+    };
+  }
+
+  const facility = formatFacilityLabels(facilityMode);
+  return {
+    mode: 'school',
+    headerSubtitle: 'Multi-Zone Edge + Cloud School Safety, Attendance & Acoustic Monitor',
+    workspaceNavLabel: 'Teacher Hub',
+    workspaceNavMobileLabel: 'Hub',
+    workspaceFullTitle: 'Teacher Alerts · Classroom & Gmail',
+    dispatchModalTitle: 'Confirm Teacher Alert Dispatch',
+    dispatchButtonLabel: 'Send to Teacher',
+    recipientLabel: 'Teacher Alert Recipient Email',
+    standbyTitle: facility.monitorTitle,
+    standbySubtitle:
+      'Choose a camera or microphone source to start live on-device human detection and safety monitoring.',
   };
 }
 
@@ -960,6 +1243,52 @@ export function computeBoxContainment(
   return minArea > 0 ? interArea / minArea : 0;
 }
 
+/**
+ * Detects when two medium/large foreground person boxes are actually the vertically-split
+ * upper half (head/forehead) and lower half (glasses/torso) of the SAME person — typically
+ * produced across horizontal 2x2 tile seams when a user sits close to the camera.
+ * Safe for dense crowds (requires minW >= 180) and distinct front/back or side-by-side people.
+ */
+export function isVerticallySplitSamePerson(
+  a: [number, number, number, number],
+  b: [number, number, number, number]
+): boolean {
+  const wA = Math.max(1, a[3] - a[1]);
+  const hA = Math.max(1, a[2] - a[0]);
+  const wB = Math.max(1, b[3] - b[1]);
+  const hB = Math.max(1, b[2] - b[0]);
+  const minW = Math.min(wA, wB);
+  const maxW = Math.max(wA, wB);
+
+  // Only applies to foreground/mid-ground people — never tiny distant rows in a dense crowd
+  if (minW < 180) return false;
+
+  // Must occupy virtually the same horizontal column and closely matched width (same body sliced at seam)
+  const interX = Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1]));
+  const cxA = (a[1] + a[3]) / 2;
+  const cxB = (b[1] + b[3]) / 2;
+  if (interX / minW < 0.72 || minW / maxW < 0.72 || Math.abs(cxA - cxB) > maxW * 0.2) {
+    return false;
+  }
+
+  // Must vertically overlap or tightly abut at the seam
+  const interY = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0]));
+  const vGap = a[2] < b[0] ? b[0] - a[2] : b[2] < a[0] ? a[0] - b[2] : 0;
+  if (interY <= 0 && vGap > 20) {
+    return false;
+  }
+
+  // Upper half must look like a chopped head/forehead slice (wide/square aspect >= 0.78),
+  // NOT a tall slender distinct standing person (aspect ~0.35-0.55) rising behind the foreground person
+  const combinedH = Math.max(a[2], b[2]) - Math.min(a[0], b[0]);
+  const upperBox = a[0] <= b[0] ? a : b;
+  const upperW = Math.max(1, upperBox[3] - upperBox[1]);
+  const upperH = Math.max(1, upperBox[2] - upperBox[0]);
+  const upperLooksLikeHeadSlice = upperW / upperH >= 0.78;
+
+  return upperLooksLikeHeadSlice && combinedH <= 1000 && Math.min(hA, hB) <= 720;
+}
+
 export function isSamePersonDuplicate(
   a: [number, number, number, number],
   b: [number, number, number, number]
@@ -988,6 +1317,125 @@ export function isSamePersonDuplicate(
   const minW = Math.max(1, Math.min(a[3] - a[1], b[3] - b[1]));
   const minH = Math.max(1, Math.min(a[2] - a[0], b[2] - b[0]));
   if (interX / minW >= 0.76 && interY / minH >= 0.68) {
+    return true;
+  }
+
+  // Merge vertically-split upper/lower seam halves of the exact same close-up person
+  if (isVerticallySplitSamePerson(a, b)) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Detects when a weaker box is an outstretched hand, raised forearm, or sliced shoulder
+ * attached to a close-up foreground person (e.g. holding a hand up or waving toward the camera),
+ * preventing single-person feeds from flickering between 1 and 2 people while preserving
+ * distinct 2nd humans and distant background visitors.
+ */
+export function isAttachedLimbOrHandFragment(
+  primary: DetectedPersonBox,
+  candidate: DetectedPersonBox
+): boolean {
+  const [pYmin, pXmin, pYmax, pXmax] = primary.box_2d;
+  const [cYmin, cXmin, cYmax, cXmax] = candidate.box_2d;
+  const pW = Math.max(1, pXmax - pXmin);
+  const pH = Math.max(1, pYmax - pYmin);
+  const cW = Math.max(1, cXmax - cXmin);
+  const cH = Math.max(1, cYmax - cYmin);
+  const pArea = pW * pH;
+
+  // Only applies when primary is a close-up foreground human (even if a fast hand temporarily lowers face confidence)
+  if ((pArea < 140_000 && pH < 520) || primary.confidence < 45) {
+    return false;
+  }
+
+  // Real distinct people with clear visible heads/faces score high (>= 72%) — never drop them
+  const confDiff = primary.confidence - candidate.confidence;
+  if (candidate.confidence >= 72 || confDiff < 0) {
+    return false;
+  }
+
+  // Preserve small distant background visitors standing behind/above a close-up presenter's shoulder
+  if (cYmax < pYmax - pH * 0.38 && cH < pH * 0.45) {
+    return false;
+  }
+
+  const containment = computeBoxContainment(primary.box_2d, candidate.box_2d);
+  const iou = computeBoxIoU(primary.box_2d, candidate.box_2d);
+  const hGap =
+    pXmax < cXmin ? cXmin - pXmax : cXmax < pXmin ? pXmin - cXmax : 0;
+  const interTop = Math.max(pYmin, cYmin);
+  const interBottom = Math.min(pYmax, cYmax);
+  const interY = Math.max(0, interBottom - interTop);
+  const minH = Math.max(1, Math.min(pH, cH));
+  const vOverlap = interY / minH;
+  const interX = Math.max(0, Math.min(pXmax, cXmax) - Math.max(pXmin, cXmin));
+  const minW = Math.max(1, Math.min(pW, cW));
+
+  const startsBelowHead = cYmin >= pYmin + pH * 0.14;
+  const bothBottomAnchored = pYmax >= 820 && cYmax >= 800;
+  const handLikeAspect = cW / cH >= 0.62;
+  const isCompactFragment = cH <= pH * 0.58;
+  const isForearmFromBottom = cYmax >= 820 && (cH <= pH * 0.66 || handLikeAspect);
+
+  // Rule A: Raised hand/forearm in front of chest/face/lens overlapping primary.
+  // Even during a fast hand swipe that momentarily lowers body confidence (confDiff >= 0),
+  // a compact/hand-shaped/below-head fragment deeply inside the body (containment >= 0.45)
+  // is a hand/arm, while a tall distinct person standing behind the shoulder is preserved.
+  if (
+    (containment >= 0.45 &&
+      candidate.confidence < 70 &&
+      (handLikeAspect || isCompactFragment || startsBelowHead)) ||
+    (containment >= 0.38 &&
+      confDiff >= 10 &&
+      (startsBelowHead || handLikeAspect || isCompactFragment))
+  ) {
+    return true;
+  }
+
+  // Rule B: Fast outstretched or waving arm/hand extending to the left or right of the body.
+  // Catches both attached sleeves (hGap <= 24) and motion-blurred hands reaching up to ~95 units
+  // off the torso edge when shaped like a hand/palm or forearm from the bottom edge — while
+  // preserving slender portrait background visitors (cW/cH < 0.62, cH > 0.36*pH) standing behind!
+  const sideCompactOrForearm =
+    hGap <= 95 &&
+    startsBelowHead &&
+    vOverlap >= 0.35 &&
+    candidate.confidence < 70 &&
+    (handLikeAspect || cH <= pH * 0.36 || isForearmFromBottom);
+  const sideAttachedLimb =
+    hGap <= 24 &&
+    startsBelowHead &&
+    vOverlap >= 0.42 &&
+    candidate.confidence < 68 &&
+    confDiff >= 10;
+  if (sideCompactOrForearm || sideAttachedLimb) {
+    return true;
+  }
+
+  // Rule C: Raised or swinging arm shifting/splitting a close-up person's bounding box into 2 overlapping detections
+  if (
+    confDiff >= 8 &&
+    (iou >= 0.28 || (interX / minW >= 0.45 && interY / minH >= 0.58)) &&
+    (bothBottomAnchored || startsBelowHead)
+  ) {
+    return true;
+  }
+
+  // Rule D: Fast waving hand raised high next to head/ear/shoulder.
+  // Detached boxes (hGap > 18) must have hand-like shape or small palm height so slender
+  // background visitors standing beside the presenter's shoulder are never dropped.
+  if (
+    hGap <= 55 &&
+    vOverlap >= 0.38 &&
+    cYmax >= pYmin + pH * 0.42 &&
+    candidate.confidence < 66 &&
+    ((hGap <= 18 && cH <= pH * 0.66 && (handLikeAspect || confDiff >= 10)) ||
+      (hGap > 18 && (handLikeAspect || cH <= pH * 0.36) && confDiff >= 8) ||
+      (hGap === 0 && candidate.confidence < 58 && confDiff >= 24 && cW / cH >= 0.48))
+  ) {
     return true;
   }
 
@@ -1053,8 +1501,10 @@ export function filterVerifiedPersonDetections(
   validCandidates.sort((a, b) => b.confidence - a.confidence);
   const kept: DetectedPersonBox[] = [];
   for (const candidate of validCandidates) {
-    const isDuplicate = kept.some((existing) =>
-      isSamePersonDuplicate(existing.box_2d, candidate.box_2d)
+    const isDuplicate = kept.some(
+      (existing) =>
+        isSamePersonDuplicate(existing.box_2d, candidate.box_2d) ||
+        isAttachedLimbOrHandFragment(existing, candidate)
     );
     if (!isDuplicate) {
       kept.push(candidate);
@@ -1341,8 +1791,29 @@ export function stepPersonTracker(
       continue;
     }
 
+    // Check if this brand-new candidate sits right beside/overlapping an existing close-up person:
+    // fast waving hands often produce a 1-frame 50-75% motion-blur flash right next to the user.
+    // Requiring 2 consecutive stable frames (unless >= 78% confident) blocks 1-frame hand flashes
+    // while real people walking in still lock on smoothly within ~250ms!
+    const nearExistingCloseUp =
+      prevState.confirmed.length > 0 &&
+      instantConfidence >= 35 &&
+      prevState.confirmed.some((track) => {
+        const tb = track.box.box_2d;
+        const tw = Math.max(1, tb[3] - tb[1]);
+        const th = Math.max(1, tb[2] - tb[0]);
+        if (tw * th < 140_000 && th < 520) return false;
+        const rb = raw.box_2d;
+        const hGap = tb[3] < rb[1] ? rb[1] - tb[3] : rb[3] < tb[1] ? tb[1] - rb[3] : 0;
+        const interY = Math.max(0, Math.min(tb[2], rb[2]) - Math.max(tb[0], rb[0]));
+        return hGap <= 130 && interY > 0;
+      });
+    const effectiveInstantConf = nearExistingCloseUp
+      ? Math.max(instantConfidence, 78)
+      : instantConfidence;
+
     // High-confidence person locks in immediately on frame 1
-    if (raw.confidence >= instantConfidence) {
+    if (raw.confidence >= effectiveInstantConf) {
       nextConfirmed.push({
         box: taggedBox,
         missedFrames: 0,
@@ -1354,7 +1825,7 @@ export function stepPersonTracker(
       continue;
     }
 
-    // Secondary/partially occluded person (48-61%) confirms once seen in 2 consecutive frames
+    // Secondary/partially occluded person confirms once seen in 2 consecutive frames
     const matchedPending = prevState.pending.some((p) =>
       boxesSpatiallyMatch(p.box_2d, raw.box_2d)
     );
@@ -1451,17 +1922,19 @@ export function stepPersonTracker(
         ? computeTorsoPatchSimilarity(prev.torsoSignature, liveTorso)
         : 0;
 
-    const isInteriorPerson = prevBox[1] > 30 && prevBox[3] < 970;
+    const isInteriorPerson = prevBox[1] > 35 && prevBox[3] < 965;
     const isSolidTrack = (prev.confirmedFrames ?? 1) >= 2;
-    const torsoStillPresent = torsoSim >= 0.74;
+    // Require genuine handheld occluder for extended hold; torso-only continuity holds briefly (<= 4 frames)
+    // so departed people NEVER freeze as phantom counts on textured exhibition booth backgrounds!
+    const torsoStillPresent = torsoSim >= 0.8;
     const occludedButPresent =
       isSolidTrack &&
       isInteriorPerson &&
       (Boolean(faceOccluder) || torsoStillPresent);
 
     if (occludedButPresent) {
-      const strongHold = Boolean(faceOccluder) && (torsoSim >= 0.58 || !prev.torsoSignature);
-      const effectiveCap = faceOccluder ? maxOccludedFrames : Math.min(18, maxOccludedFrames);
+      const strongHold = Boolean(faceOccluder) && (torsoSim >= 0.62 || !prev.torsoSignature);
+      const effectiveCap = faceOccluder ? Math.min(maxOccludedFrames, 14) : Math.min(4, maxOccludedFrames);
       const nextMissed = strongHold ? Math.min(prev.missedFrames, 1) : prev.missedFrames + 1;
       if (nextMissed <= effectiveCap) {
         const occluderName = faceOccluder?.label ?? prev.occludedBy ?? 'Object / Hand';
@@ -1526,12 +1999,20 @@ export function stepPersonTracker(
     }
   }
 
-  // Deduplicate any tracks that converged onto the same person and sort left-to-right
-  nextConfirmed.sort((a, b) => b.box.confidence - a.box.confidence);
+  // Deduplicate any tracks that converged onto the same person and sort left-to-right.
+  // Give established multi-frame tracks a small stability edge so a brand-new 1-frame fast-hand
+  // detection never outranks the real person whose face briefly blurred while waving!
+  nextConfirmed.sort((a, b) => {
+    const scoreA = a.box.confidence + Math.min(10, (a.confirmedFrames ?? 1) * 2);
+    const scoreB = b.box.confidence + Math.min(10, (b.confirmedFrames ?? 1) * 2);
+    return scoreB - scoreA;
+  });
   const dedupedTracks: TrackedPersonEntry[] = [];
   for (const track of nextConfirmed) {
-    const dup = dedupedTracks.some((kept) =>
-      isSamePersonDuplicate(kept.box.box_2d, track.box.box_2d)
+    const dup = dedupedTracks.some(
+      (kept) =>
+        isSamePersonDuplicate(kept.box.box_2d, track.box.box_2d) ||
+        isAttachedLimbOrHandFragment(kept.box, track.box)
     );
     if (!dup) {
       dedupedTracks.push(track);
@@ -1548,17 +2029,36 @@ export function stepPersonTracker(
   };
 }
 
+export const DISASTER_DISTRESS_KEYWORDS = [
+  'help',
+  'trapped',
+  'fire',
+  'earthquake',
+  'flood',
+  'collapse',
+  'medical',
+  'emergency',
+] as const;
+
+const LOCAL_DISASTER_VOICE_PATTERN =
+  /\b(help|trapped|fire|earthquake|flood|collapse|collapsed|medical|emergency|injured|rescue|sos|evacuate|stampede)\b/i;
+
 const LOCAL_BEATING_VOICE_PATTERN =
   /\b(beating|beat me|beat him|beat her|beat up|stop hitting|hitting me|hitting him|hitting her|kicking me|kicking him|slapping|slapped me|punching me|don'?t hit|stomping|whipping|pummeling|brutal assault)\b/i;
 
 const LOCAL_BULLYING_VOICE_PATTERN =
-  /\b(bully|bullying|bullied|leave me alone|stop teasing|give me your (money|lunch|bag|phone)|cornered|picking on|don'?t touch me|stop harassing|harassing|mocking me|tripped me|shoved me|shut up loser)\b/i;
+  /\b(bully|bullying|bullied|leave me alone|stop teasing|stop pushing|back off|give it back|get away from me|give me your (money|lunch|bag|phone)|cornered|picking on|don'?t touch me|stop harassing|harassing|mocking me|tripped me|shoved me|shut up loser|stay away from me)\b/i;
 
 const LOCAL_CRITICAL_VOICE_PATTERN =
   /\b(help|fight|fighting|hands up|robbery|gun|knife|weapon|shoot|police|emergency|attack|punch|assault|intruder|fire)\b/i;
 
 const LOCAL_WARNING_VOICE_PATTERN =
   /\b(stop|get off|shut up|hey|scream|screaming|loud|argument|push|shove)\b/i;
+
+export function matchDisasterDistressKeyword(transcript: string): string | null {
+  const match = LOCAL_DISASTER_VOICE_PATTERN.exec((transcript || '').trim());
+  return match ? match[1].toLowerCase() : null;
+}
 
 function computeBoxHorizontalGap(
   a: [number, number, number, number],
@@ -1580,133 +2080,344 @@ function computeVerticalOverlapRatio(
   return interH / minH;
 }
 
-function analyzeVisualPairGeometry(
-  people: DetectedPersonBox[],
-  sensitivity: ThreatSensitivity = 'standard'
-): {
+interface MatchedPersonMotion {
+  currIdx: number;
+  curr: DetectedPersonBox;
+  prev: DetectedPersonBox | null;
+  cx: number;
+  cy: number;
+  dx: number;
+  dy: number;
+  speed: number;
+  verticalDrop: number;
+  heightShrink: number;
+  width: number;
+  height: number;
+  nearEdge: boolean;
+}
+
+interface PairwiseInteractionMetrics {
   closeContactPairs: number;
-  crowdingTargetDetected: boolean;
-  corneredPairDetected: boolean;
-  hasHorizontalCollapsedPerson: boolean;
   maxPairIoU: number;
-} {
-  const count = people.length;
+  maxPairRelativeSpeed: number;
+  maxPairClosingRate: number;
+  opposingClashDetected: boolean;
+  violentClashDetected: boolean;
+  corneredPairDetected: boolean;
+  crowdingTargetDetected: boolean;
+  crowdingWithAgitation: boolean;
+  hasHorizontalCollapsedPerson: boolean;
+  maxBoxVelocity: number;
+  maxVerticalDrop: number;
+  bullyingReason: string;
+}
+
+function analyzePairwiseInteractions(
+  prevPeople: DetectedPersonBox[],
+  currPeople: DetectedPersonBox[],
+  sensitivity: ThreatSensitivity = 'standard'
+): PairwiseInteractionMetrics {
+  const count = currPeople.length;
   if (count === 0) {
     return {
       closeContactPairs: 0,
-      crowdingTargetDetected: false,
-      corneredPairDetected: false,
-      hasHorizontalCollapsedPerson: false,
       maxPairIoU: 0,
+      maxPairRelativeSpeed: 0,
+      maxPairClosingRate: 0,
+      opposingClashDetected: false,
+      violentClashDetected: false,
+      corneredPairDetected: false,
+      crowdingTargetDetected: false,
+      crowdingWithAgitation: false,
+      hasHorizontalCollapsedPerson: false,
+      maxBoxVelocity: 0,
+      maxVerticalDrop: 0,
+      bullyingReason: '',
     };
   }
 
-  // Require real bounding-box collision (NOT mere sitting side-by-side) and exclude nested duplicates
-  const collisionIouThreshold = sensitivity === 'high' ? 0.12 : 0.16;
-  const crowdGapThreshold = sensitivity === 'high' ? 38 : 26;
-  const crowdDegree = new Array<number>(count).fill(0);
-  let closeContactPairs = 0;
-  let maxPairIoU = 0;
+  // Match each current person uniquely to their closest previous-frame box
+  const usedPrev = new Set<number>();
+  const motions: MatchedPersonMotion[] = currPeople.map((curr, currIdx) => {
+    const [cymin, cxmin, cymax, cxmax] = curr.box_2d;
+    const cx = (cxmin + cxmax) / 2;
+    const cy = (cymin + cymax) / 2;
+    const width = Math.max(1, cxmax - cxmin);
+    const height = Math.max(1, cymax - cymin);
+
+    let bestPrevIdx = -1;
+    let bestScore = Infinity;
+    for (let p = 0; p < prevPeople.length; p += 1) {
+      if (usedPrev.has(p)) continue;
+      const [pymin, pxmin, pymax, pxmax] = prevPeople[p].box_2d;
+      const pcx = (pxmin + pxmax) / 2;
+      const pcy = (pymin + pymax) / 2;
+      const dist = Math.hypot(cx - pcx, cy - pcy);
+      if (dist <= 300 && dist < bestScore) {
+        bestScore = dist;
+        bestPrevIdx = p;
+      }
+    }
+
+    let prev: DetectedPersonBox | null = null;
+    let dx = 0;
+    let dy = 0;
+    let speed = 0;
+    let verticalDrop = 0;
+    let heightShrink = 0;
+
+    if (bestPrevIdx !== -1) {
+      usedPrev.add(bestPrevIdx);
+      prev = prevPeople[bestPrevIdx];
+      const [pymin, pxmin, pymax, pxmax] = prev.box_2d;
+      const pcx = (pxmin + pxmax) / 2;
+      const pcy = (pymin + pymax) / 2;
+      dx = cx - pcx;
+      dy = cy - pcy;
+      speed = Math.hypot(dx, dy);
+      verticalDrop = cymin - pymin;
+      const prevH = Math.max(1, pymax - pymin);
+      heightShrink = prevH - height;
+    }
+
+    return {
+      currIdx,
+      curr,
+      prev,
+      cx,
+      cy,
+      dx,
+      dy,
+      speed,
+      verticalDrop,
+      heightShrink,
+      width,
+      height,
+      nearEdge: cxmin <= 105 || cxmax >= 895,
+    };
+  });
+
+  let maxBoxVelocity = 0;
+  let maxVerticalDrop = 0;
   let hasHorizontalCollapsedPerson = false;
 
-  for (let i = 0; i < count; i += 1) {
-    const [ymin, xmin, ymax, xmax] = people[i].box_2d;
-    const w = Math.max(1, xmax - xmin);
-    const h = Math.max(1, ymax - ymin);
-    // Person knocked down or lying horizontally on floor
-    if (w / h >= 1.35 && ymin >= 340) {
+  for (const m of motions) {
+    if (m.speed > maxBoxVelocity) maxBoxVelocity = m.speed;
+    if (m.verticalDrop > maxVerticalDrop) maxVerticalDrop = m.verticalDrop;
+    // Require genuinely knocked-down/horizontal floor posture (NOT slight leaning forward over a desk)
+    if (m.width / m.height >= 1.42 && m.curr.box_2d[0] >= 370) {
       hasHorizontalCollapsedPerson = true;
     }
   }
 
+  const collisionIouThreshold = sensitivity === 'high' ? 0.14 : 0.18;
+  const fightRelSpeedThreshold = sensitivity === 'high' ? 38 : 54;
+  const violentRelSpeedThreshold = sensitivity === 'high' ? 68 : 88;
+  const crowdGapThreshold = sensitivity === 'high' ? 52 : 40;
+
+  let closeContactPairs = 0;
+  let maxPairIoU = 0;
+  let maxPairRelativeSpeed = 0;
+  let maxPairClosingRate = 0;
+  let opposingClashDetected = false;
+  let violentClashDetected = false;
+  let corneredPairDetected = false;
+  let bullyingReason = '';
+
+  // Track directional flanking per person for 3+ person group bullying
+  const flankedLeft = new Array<boolean>(count).fill(false);
+  const flankedRight = new Array<boolean>(count).fill(false);
+  const crowdDegree = new Array<number>(count).fill(0);
+  const crowdAgitationByPerson = new Array<boolean>(count).fill(false);
+
   if (count >= 2) {
     for (let i = 0; i < count; i += 1) {
       for (let j = i + 1; j < count; j += 1) {
-        const a = people[i].box_2d;
-        const b = people[j].box_2d;
+        const mA = motions[i];
+        const mB = motions[j];
+        const a = mA.curr.box_2d;
+        const b = mB.curr.box_2d;
+
         const containment = computeBoxContainment(a, b);
-        // Never treat a nested/duplicate fragment as two distinct fighting humans
-        if (containment >= 0.65) continue;
+        const areaA = mA.width * mA.height;
+        const areaB = mB.width * mB.height;
+        const pairAreaRatio = Math.min(areaA, areaB) / Math.max(1, Math.max(areaA, areaB));
+        // Never treat a small nested head/torso fragment as two distinct humans,
+        // while allowing two equal-sized grappling people to register as close physical contact!
+        if (containment >= 0.78 && pairAreaRatio < 0.55) continue;
 
         const iou = computeBoxIoU(a, b);
         if (iou > maxPairIoU) maxPairIoU = iou;
         const hGap = computeBoxHorizontalGap(a, b);
         const vOverlap = computeVerticalOverlapRatio(a, b);
+        if (vOverlap < 0.32) continue;
 
-        // Actual physical collision / clashing overlap
+        // Relative kinematics between Person A and Person B (immune to unrelated background movement!)
+        const relDx = mA.dx - mB.dx;
+        const relDy = mA.dy - mB.dy;
+        const relSpeed = Math.hypot(relDx, relDy);
+        const pairMaxSpeed = Math.max(mA.speed, mB.speed);
+
+        let closingRate = 0;
+        let advanceA = 0; // How much A moved toward B
+        let advanceB = 0; // How much B moved toward A
+        let retreatA = 0; // How much A backed away from B
+        let retreatB = 0; // How much B backed away from A
+
+        const dirX = mB.cx - mA.cx;
+        const dirY = mB.cy - mA.cy;
+        const currDist = Math.max(1, Math.hypot(dirX, dirY));
+        const ux = dirX / currDist; // unit vector A -> B
+        const uy = dirY / currDist;
+
+        if (mA.prev && mB.prev) {
+          const prevAx = (mA.prev.box_2d[1] + mA.prev.box_2d[3]) / 2;
+          const prevAy = (mA.prev.box_2d[0] + mA.prev.box_2d[2]) / 2;
+          const prevBx = (mB.prev.box_2d[1] + mB.prev.box_2d[3]) / 2;
+          const prevBy = (mB.prev.box_2d[0] + mB.prev.box_2d[2]) / 2;
+          const prevDist = Math.hypot(prevBx - prevAx, prevBy - prevAy);
+          closingRate = prevDist - currDist;
+
+          const projA = mA.dx * ux + mA.dy * uy; // + means A moves toward B
+          const projB = -(mB.dx * ux + mB.dy * uy); // + means B moves toward A
+          advanceA = Math.max(0, projA);
+          advanceB = Math.max(0, projB);
+          retreatA = Math.max(0, -projA);
+          retreatB = Math.max(0, -projB);
+        }
+
+        if (relSpeed > maxPairRelativeSpeed) maxPairRelativeSpeed = relSpeed;
+        if (closingRate > maxPairClosingRate) maxPairClosingRate = closingRate;
+
+        // Smooth walking together (same velocity direction, steady spacing, upright posture) is NEVER an altercation!
+        const sameDirectionWalking =
+          mA.speed >= 8 &&
+          mB.speed >= 8 &&
+          mA.dx * mB.dx + mA.dy * mB.dy > 0 &&
+          relSpeed < 24 &&
+          closingRate < 5 &&
+          mA.heightShrink < 14 &&
+          mB.heightShrink < 14 &&
+          mA.verticalDrop < 16 &&
+          mB.verticalDrop < 16 &&
+          !mA.nearEdge &&
+          !mB.nearEdge;
+
+        // 1. Overlapping physical contact / altercation
         if (iou >= collisionIouThreshold && vOverlap >= 0.35) {
           closeContactPairs += 1;
           crowdDegree[i] += 1;
           crowdDegree[j] += 1;
-        } else if (count >= 3 && hGap <= crowdGapThreshold && vOverlap >= 0.5) {
-          // Track tight encirclement strictly for 3+ person group crowding/bullying
+
+          // Distinguish real fight clash from two people calmly overlapping in depth or walking side-by-side:
+          // Require sharp relative motion (collision, shoving, grappling) OR strong mutual inward/erratic motion
+          const mutualOpposition =
+            (advanceA >= 14 && advanceB >= 14) ||
+            (relSpeed >= fightRelSpeedThreshold && !sameDirectionWalking) ||
+            (closingRate >= 28 && pairMaxSpeed >= 38);
+
+          if (mutualOpposition) {
+            opposingClashDetected = true;
+          }
+          if (relSpeed >= violentRelSpeedThreshold && !sameDirectionWalking) {
+            violentClashDetected = true;
+          }
+        }
+
+        // 2. Real 2-Person Bullying / Cornering / Shoving / Intimidation Detection!
+        const inPersonalSpace =
+          (iou >= 0.05 && vOverlap >= 0.45) || (hGap <= 58 && vOverlap >= 0.48);
+
+        if (inPersonalSpace && !sameDirectionWalking) {
+          // People of ANY height/age can stand peacefully side-by-side or near edges.
+          // NEVER infer bullying from static height differences or stationary poses!
+          const activePairMotion = pairMaxSpeed >= 12 || relSpeed >= 14;
+
+          // Case A: Asymmetric lunge & retreat / shoving (Aggressor actively advances while Victim recoils, crouches, or is pinned)
+          const aBulliesB =
+            activePairMotion &&
+            advanceA >= (sensitivity === 'high' ? 12 : 16) &&
+            (retreatB >= 8 || mB.heightShrink >= 18 || mB.verticalDrop >= 22 || mB.nearEdge);
+          const bBulliesA =
+            activePairMotion &&
+            advanceB >= (sensitivity === 'high' ? 12 : 16) &&
+            (retreatA >= 8 || mA.heightShrink >= 18 || mA.verticalDrop >= 22 || mA.nearEdge);
+
+          // Case B: Active cornering / lunging intimidation (strictly requires active closing or agitation velocity — zero static triggers!)
+          const tightLooming =
+            activePairMotion &&
+            (iou >= 0.08 || hGap <= 30) &&
+            vOverlap >= 0.5 &&
+            ((closingRate >= 16 &&
+              (mA.nearEdge || mB.nearEdge || mA.heightShrink >= 16 || mB.heightShrink >= 16)) ||
+              (relSpeed >= (sensitivity === 'high' ? 20 : 28) &&
+                (mA.nearEdge || mB.nearEdge || mA.heightShrink >= 16 || mB.heightShrink >= 16)));
+
+          if (aBulliesB || bBulliesA) {
+            corneredPairDetected = true;
+            bullyingReason =
+              'Asymmetric shoving / advancing intimidation against retreating target';
+          } else if (tightLooming) {
+            corneredPairDetected = true;
+            bullyingReason = 'Active cornering / lunging intimidation motion detected';
+          }
+        }
+
+        // 3. Directional flanking / encirclement for 3+ person group bullying
+        if (count >= 3 && (iou >= 0.05 || hGap <= crowdGapThreshold) && vOverlap >= 0.45) {
           crowdDegree[i] += 1;
           crowdDegree[j] += 1;
+          if (mA.cx < mB.cx - 18) {
+            flankedLeft[j] = true;
+            flankedRight[i] = true;
+          } else if (mB.cx < mA.cx - 18) {
+            flankedLeft[i] = true;
+            flankedRight[j] = true;
+          }
+          // Agitation around the surrounded target (inward pressure, jostling, or target shrinking/recoiling)
+          if (
+            closingRate >= 12 ||
+            relSpeed >= 22 ||
+            mA.heightShrink >= 16 ||
+            mB.heightShrink >= 16 ||
+            mA.verticalDrop >= 18 ||
+            mB.verticalDrop >= 18
+          ) {
+            crowdAgitationByPerson[i] = true;
+            crowdAgitationByPerson[j] = true;
+          }
         }
       }
     }
   }
 
-  // Crowding / ganging up: strictly 3+ distinct people surrounding 1 center individual
-  const crowdingTargetDetected =
-    count >= 3 && crowdDegree.some((deg) => deg >= 2);
+  // True 3+ person encirclement: a victim flanked on BOTH left and right sides
+  let crowdingTargetDetected = false;
+  let crowdingWithAgitation = false;
+  for (let i = 0; i < count; i += 1) {
+    if (count >= 3 && flankedLeft[i] && flankedRight[i] && crowdDegree[i] >= 2) {
+      crowdingTargetDetected = true;
+      if (crowdAgitationByPerson[i]) {
+        crowdingWithAgitation = true;
+        bullyingReason = `Target encircled on both sides with inward agitation (${count} people in cluster)`;
+      }
+    }
+  }
 
   return {
     closeContactPairs,
-    crowdingTargetDetected,
-    corneredPairDetected: false,
-    hasHorizontalCollapsedPerson,
     maxPairIoU,
-  };
-}
-
-function measureBoxKinematics(
-  prevPeople: DetectedPersonBox[],
-  currPeople: DetectedPersonBox[]
-): {
-  maxBoxVelocity: number;
-  maxVerticalDrop: number;
-} {
-  if (prevPeople.length === 0 || currPeople.length === 0) {
-    return { maxBoxVelocity: 0, maxVerticalDrop: 0 };
-  }
-
-  let maxBoxVelocity = 0;
-  let maxVerticalDrop = 0;
-
-  for (const curr of currPeople) {
-    const [cymin, cxmin, cymax, cxmax] = curr.box_2d;
-    const ccx = (cxmin + cxmax) / 2;
-    const ccy = (cymin + cymax) / 2;
-
-    let bestPrev: DetectedPersonBox | null = null;
-    let bestDist = Infinity;
-    for (const prev of prevPeople) {
-      const [pymin, pxmin, pymax, pxmax] = prev.box_2d;
-      const pcx = (pxmin + pxmax) / 2;
-      const pcy = (pymin + pymax) / 2;
-      const dist = Math.hypot(ccx - pcx, ccy - pcy);
-      if (dist < bestDist && dist <= 320) {
-        bestDist = dist;
-        bestPrev = prev;
-      }
-    }
-
-    if (bestPrev) {
-      if (bestDist > maxBoxVelocity) {
-        maxBoxVelocity = bestDist;
-      }
-      // Sudden downward drop of a person's head/top edge (knocked down / tackled)
-      const verticalDrop = cymin - bestPrev.box_2d[0];
-      if (verticalDrop > maxVerticalDrop) {
-        maxVerticalDrop = verticalDrop;
-      }
-    }
-  }
-
-  return {
+    maxPairRelativeSpeed: Math.round(maxPairRelativeSpeed),
+    maxPairClosingRate: Math.round(maxPairClosingRate),
+    opposingClashDetected,
+    violentClashDetected,
+    corneredPairDetected,
+    crowdingTargetDetected,
+    crowdingWithAgitation,
+    hasHorizontalCollapsedPerson,
     maxBoxVelocity: Math.round(maxBoxVelocity),
     maxVerticalDrop: Math.round(maxVerticalDrop),
+    bullyingReason,
   };
 }
 
@@ -1723,6 +2434,8 @@ export function evaluateLocalSafetyAnalysis(params: {
   voiceTranscript: string;
   audioLevel: number;
   facilityMode: FacilityMode;
+  operationMode?: OperationMode;
+  isStillImage?: boolean;
   audioSpikeDetected?: boolean;
   frameDeltaPercent?: number;
   sensitivity?: ThreatSensitivity;
@@ -1736,35 +2449,51 @@ export function evaluateLocalSafetyAnalysis(params: {
     ? Math.max(0, params.frameDeltaPercent!)
     : 0;
   const sensitivity = params.sensitivity ?? 'standard';
+  const isDisaster = params.operationMode === 'disaster';
+  const isStillImage = Boolean(params.isStillImage);
 
-  const geometry = analyzeVisualPairGeometry(people, sensitivity);
+  const geometry = analyzePairwiseInteractions([], people, sensitivity);
   const hasCloseContact = geometry.closeContactPairs > 0;
   const hasWeaponObject = dangerousObjects.length > 0;
 
+  const disasterCueWord = isDisaster ? matchDisasterDistressKeyword(transcript) : null;
+  const disasterVoiceHit = Boolean(disasterCueWord);
   const beatingVoiceHit = Boolean(transcript && LOCAL_BEATING_VOICE_PATTERN.test(transcript));
-  const bullyingVoiceHit = Boolean(transcript && LOCAL_BULLYING_VOICE_PATTERN.test(transcript));
-  const criticalVoiceHit = Boolean(transcript && LOCAL_CRITICAL_VOICE_PATTERN.test(transcript));
+  const bullyingVoiceHit = Boolean(
+    !isDisaster && transcript && LOCAL_BULLYING_VOICE_PATTERN.test(transcript)
+  );
+  const criticalVoiceHit = Boolean(
+    transcript && (LOCAL_CRITICAL_VOICE_PATTERN.test(transcript) || disasterVoiceHit)
+  );
   const warningVoiceHit = Boolean(transcript && LOCAL_WARNING_VOICE_PATTERN.test(transcript));
   const loudSpike = Boolean(params.audioSpikeDetected) || audioLevel > SOUND_ALERT_THRESHOLD_DB;
 
-  const fightMotionThreshold = sensitivity === 'high' ? 12.0 : 16.0;
-  const violentBeatingMotionThreshold = sensitivity === 'high' ? 18.0 : 24.0;
+  // High bar for single-frame local fallback so minor movement or exhibition chatter NEVER false-triggers
+  const fightMotionThreshold = sensitivity === 'high' ? 18.0 : 24.0;
+  const violentBeatingMotionThreshold = sensitivity === 'high' ? 24.0 : 32.0;
 
+  // Still uploaded photos NEVER trigger motion-based kinetic alerts (bullying / fighting / beating)
   const visualBeating =
+    !isStillImage &&
     count >= 2 &&
     hasCloseContact &&
     ((geometry.hasHorizontalCollapsedPerson &&
-      (frameDeltaPercent >= fightMotionThreshold || audioLevel >= 78)) ||
+      (frameDeltaPercent >= fightMotionThreshold || audioLevel >= 82)) ||
       frameDeltaPercent >= violentBeatingMotionThreshold ||
-      (audioLevel >= 86 && frameDeltaPercent >= 12));
+      (audioLevel >= 88 && frameDeltaPercent >= 18));
 
   const visualFight =
+    !isStillImage &&
     count >= 2 &&
     hasCloseContact &&
-    (frameDeltaPercent >= fightMotionThreshold || (audioLevel >= 82 && frameDeltaPercent >= 10));
+    (frameDeltaPercent >= fightMotionThreshold || (audioLevel >= 85 && frameDeltaPercent >= 16));
 
+  // School-style visual bullying is disabled on still images and in Disaster & Rescue public venues
   const visualBullying =
-    geometry.crowdingTargetDetected && (frameDeltaPercent >= 6.0 || audioLevel >= 70);
+    !isStillImage &&
+    !isDisaster &&
+    geometry.crowdingTargetDetected &&
+    (frameDeltaPercent >= 12.0 || audioLevel >= 78);
 
   let threatCategory: ClassroomAnalysis['threatCategory'] = 'none';
   if (
@@ -1773,6 +2502,8 @@ export function evaluateLocalSafetyAnalysis(params: {
       /\b(robbery|gun|knife|weapon|hands up|shoot)\b/i.test(transcript))
   ) {
     threatCategory = 'robbery_or_weapon';
+  } else if (disasterVoiceHit) {
+    threatCategory = 'disturbance';
   } else if (beatingVoiceHit || visualBeating) {
     threatCategory = 'beating';
   } else if (bullyingVoiceHit || visualBullying) {
@@ -1784,6 +2515,7 @@ export function evaluateLocalSafetyAnalysis(params: {
   }
 
   const isFighting =
+    disasterVoiceHit ||
     threatCategory === 'beating' ||
     threatCategory === 'bullying' ||
     threatCategory === 'fight' ||
@@ -1801,9 +2533,14 @@ export function evaluateLocalSafetyAnalysis(params: {
       `Weapon object detected: ${dangerousObjects.map((o) => `${o.label} (${o.confidence}%)`).join(', ')}`
     );
   }
+  if (disasterVoiceHit) {
+    detectedBehaviors.push(
+      `Disaster distress keyword ("${disasterCueWord}"): "${transcript.slice(0, 60)}"`
+    );
+  }
   if (beatingVoiceHit) detectedBehaviors.push(`Beating / striking cue: "${transcript.slice(0, 60)}"`);
   if (bullyingVoiceHit) detectedBehaviors.push(`Bullying / harassment cue: "${transcript.slice(0, 60)}"`);
-  if (criticalVoiceHit && !beatingVoiceHit && !bullyingVoiceHit) {
+  if (criticalVoiceHit && !beatingVoiceHit && !bullyingVoiceHit && !disasterVoiceHit) {
     detectedBehaviors.push(`Distress speech cue: "${transcript.slice(0, 60)}"`);
   }
   if (visualBeating) {
@@ -1823,47 +2560,65 @@ export function evaluateLocalSafetyAnalysis(params: {
       `Overlapping physical altercation (motion ${frameDeltaPercent.toFixed(0)}%)`
     );
   }
-  if (loudSpike) detectedBehaviors.push(`Loud sound level (${audioLevel.toFixed(1)} dB)`);
+  if (loudSpike) {
+    detectedBehaviors.push(
+      isDisaster
+        ? `ACOUSTIC DISTRESS / STRUCTURAL COLLAPSE ALERT (${audioLevel.toFixed(1)} dB)`
+        : `Loud sound level (${audioLevel.toFixed(1)} dB)`
+    );
+  }
   if (warningVoiceHit && !isFighting) detectedBehaviors.push('Elevated verbal commotion');
 
   const threatScore =
     threatCategory === 'robbery_or_weapon'
       ? 96
-      : threatCategory === 'beating'
+      : disasterVoiceHit
         ? 95
-        : threatCategory === 'fight'
-          ? 88
-          : threatCategory === 'bullying'
-            ? 86
-            : severity === 'warning'
-              ? 58
-              : 0;
+        : threatCategory === 'beating'
+          ? 95
+          : threatCategory === 'fight'
+            ? 88
+            : threatCategory === 'bullying'
+              ? 86
+              : severity === 'warning'
+                ? 58
+                : 0;
 
   const summary =
     threatCategory === 'robbery_or_weapon'
       ? `On-device WEAPON / ROBBERY alert: ${detectedBehaviors.join(' · ')}`
-      : threatCategory === 'beating'
-        ? `On-device BEATING alert: ${detectedBehaviors.join(' · ')} (${count} ${count === 1 ? 'person' : 'people'} in frame).`
-        : threatCategory === 'bullying'
-          ? `On-device BULLYING alert: ${detectedBehaviors.join(' · ')} (${count} ${count === 1 ? 'person' : 'people'} in frame).`
-          : isFighting
-            ? `On-device FIGHT alert: ${detectedBehaviors.join(' · ')} (${count} ${count === 1 ? 'person' : 'people'} in frame).`
-            : count === 0
-              ? 'No people detected in live frame (Empty zone · Edge AI).'
-              : `${count} ${count === 1 ? 'person' : 'people'} tracked live · Nominal (Edge AI).`;
+      : disasterVoiceHit
+        ? `DISASTER DISTRESS VOICE ALERT (${disasterCueWord?.toUpperCase()}): ${detectedBehaviors.join(' · ')} (${count} ${count === 1 ? 'person' : 'people'} in frame).`
+        : threatCategory === 'beating'
+          ? `On-device BEATING alert: ${detectedBehaviors.join(' · ')} (${count} ${count === 1 ? 'person' : 'people'} in frame).`
+          : threatCategory === 'bullying'
+            ? `On-device BULLYING alert: ${detectedBehaviors.join(' · ')} (${count} ${count === 1 ? 'person' : 'people'} in frame).`
+            : isFighting
+              ? `On-device FIGHT alert: ${detectedBehaviors.join(' · ')} (${count} ${count === 1 ? 'person' : 'people'} in frame).`
+              : count === 0
+                ? isStillImage
+                  ? 'No people detected in uploaded still photo (Edge AI).'
+                  : 'No people detected in live frame (Empty zone · Edge AI).'
+                : isStillImage
+                  ? `${count} ${count === 1 ? 'person' : 'people'} counted in still image · Count & Density Mode (kinetic bullying/fight disabled for still photos).`
+                  : `${count} ${count === 1 ? 'person' : 'people'} tracked live · Nominal (Edge AI).`;
 
   const recommendedAction =
     threatCategory === 'robbery_or_weapon'
       ? 'Initiate immediate security lockdown, alert campus/site security, and contact emergency responders.'
-      : threatCategory === 'beating'
-        ? 'Emergency intervention required immediately — stop the beating, protect the victim, and dispatch security/medical help.'
-        : threatCategory === 'bullying'
-          ? 'Intervene immediately, separate aggressor(s) from the targeted individual, and notify the supervising teacher.'
-          : isFighting
-            ? 'Inspect live feed immediately and dispatch supervising staff to separate individuals.'
-            : severity === 'warning'
-              ? 'Check room commotion on the live camera feed.'
-              : 'No action needed; zone is calm.';
+      : disasterVoiceHit
+        ? 'Broadcast PA evacuation directive immediately, confirm survivor location on live feed, and deploy Rescue teams.'
+        : threatCategory === 'beating'
+          ? 'Emergency intervention required immediately — stop the beating, protect the victim, and dispatch security/medical help.'
+          : threatCategory === 'bullying'
+            ? 'Intervene immediately, separate aggressor(s) from the targeted individual, and notify the supervising teacher.'
+            : isFighting
+              ? 'Inspect live feed immediately and dispatch supervising staff to separate individuals.'
+              : severity === 'warning'
+                ? isDisaster
+                  ? 'Verify structural integrity and broadcast precautionary PA announcement if needed.'
+                  : 'Check room commotion on the live camera feed.'
+                : 'No action needed; zone is calm.';
 
   return {
     studentCount: count,
@@ -1931,11 +2686,11 @@ const THREAT_PRIORITY: Record<ThreatCategory, number> = {
 };
 
 /**
- * Stateful 300ms real-time visual + object + kinematic threat engine.
- * Runs 100% on-device with ZERO cloud quota and works on BOTH live webcams (with or without audio)
- * AND silent uploaded/IP CCTV video feeds.
- * Confirms visual threats across 2-3 consecutive frames to prevent single-frame false positives,
- * then pops alerts immediately and auto-recovers smoothly once calm.
+ * Stateful 300ms real-time visual + object + pairwise kinematic threat engine.
+ * - Immune to small movements, lighting shifts, waving, parallel walking, and calm booth crowds.
+ * - Accurately detects BOTH 2-person bullying (asymmetric lunge/shove/cornering/looming)
+ *   AND 3+ person group encirclement bullying with active agitation.
+ * - Confirms threats across multiple consecutive frames to eliminate single-frame noise.
  */
 export function evaluateRealtimeEdgeThreat(
   prevState: EdgeThreatTrackerState,
@@ -1946,6 +2701,8 @@ export function evaluateRealtimeEdgeThreat(
     voiceTranscript: string;
     audioLevel: number;
     facilityMode: FacilityMode;
+    operationMode?: OperationMode;
+    isStillImage?: boolean;
     sensitivity?: ThreatSensitivity;
     nowMs: number;
     alertCooldownMs?: number;
@@ -1958,57 +2715,88 @@ export function evaluateRealtimeEdgeThreat(
     : 0;
   const audioLevel = Number.isFinite(input.audioLevel) ? input.audioLevel : 0;
   const transcript = (input.voiceTranscript || '').trim();
+  const isStillImage = Boolean(input.isStillImage);
+  const isDisaster = input.operationMode === 'disaster';
 
-  const geometry = analyzeVisualPairGeometry(input.people, sensitivity);
-  const kinematics = measureBoxKinematics(prevState.prevPeople, input.people);
-  const hasCloseContact = geometry.closeContactPairs > 0;
+  const pairMetrics = analyzePairwiseInteractions(prevState.prevPeople, input.people, sensitivity);
+  const hasCloseContact = pairMetrics.closeContactPairs > 0;
+  // Require real kinetic movement across frames so stationary people or still images NEVER fire motion threats
+  const hasKineticMovement =
+    !isStillImage &&
+    (pairMetrics.maxBoxVelocity >= 10 || pairMetrics.maxPairRelativeSpeed >= 12);
 
-  // Strictly calibrated thresholds: normal 1-person movement or 2 people sitting/walking NEVER fires false alerts
+  // Strictly calibrated pairwise thresholds: small movements, waving, or walking past NEVER trigger alerts!
   const fightMotionMin = sensitivity === 'high' ? 12.0 : 16.0;
-  const fightVelocityMin = sensitivity === 'high' ? 50 : 65;
   const beatingMotionMin = sensitivity === 'high' ? 18.0 : 24.0;
-  const beatingVelocityMin = sensitivity === 'high' ? 68 : 85;
-  const dropMin = sensitivity === 'high' ? 60 : 75;
+  const dropMin = sensitivity === 'high' ? 70 : 85;
 
   const hasWeaponFrame = input.dangerousObjects.length > 0;
   const highConfWeapon = input.dangerousObjects.some((o) => o.confidence >= 84);
-
   const hasMultiplePeople = input.people.length >= 2;
+
+  // Fight requires REAL overlapping contact + opposing/erratic PAIRWISE motion (never mere lighting flicker, calm walking, or still photos!)
   const strongVisualClash =
-    frameDelta >= fightMotionMin &&
-    (kinematics.maxBoxVelocity >= fightVelocityMin || audioLevel >= (sensitivity === 'high' ? 76 : 82));
+    hasKineticMovement &&
+    pairMetrics.opposingClashDetected &&
+    (frameDelta >= fightMotionMin || audioLevel >= (sensitivity === 'high' ? 78 : 84));
+
   const violentVisualAssault =
-    frameDelta >= beatingMotionMin && kinematics.maxBoxVelocity >= beatingVelocityMin;
+    hasKineticMovement && pairMetrics.violentClashDetected && frameDelta >= beatingMotionMin;
 
   const beatingFrameSignal =
+    !isStillImage &&
+    hasKineticMovement &&
     hasMultiplePeople &&
     hasCloseContact &&
-    (((geometry.hasHorizontalCollapsedPerson || kinematics.maxVerticalDrop >= dropMin) &&
-      frameDelta >= (sensitivity === 'high' ? 10 : 14)) ||
+    (((pairMetrics.hasHorizontalCollapsedPerson || pairMetrics.maxVerticalDrop >= dropMin) &&
+      pairMetrics.opposingClashDetected &&
+      frameDelta >= (sensitivity === 'high' ? 12 : 15)) ||
       violentVisualAssault ||
       (prevState.fightStreak >= 3 && violentVisualAssault));
 
   const fightFrameSignal =
+    !isStillImage &&
+    hasKineticMovement &&
     hasMultiplePeople &&
     hasCloseContact &&
     (strongVisualClash ||
-      (audioLevel >= (sensitivity === 'high' ? 78 : 84) && frameDelta >= 10));
+      (pairMetrics.opposingClashDetected &&
+        audioLevel >= (sensitivity === 'high' ? 80 : 86) &&
+        frameDelta >= 10));
 
+  // Real bullying signal (School Safety Mode + live motion only — NEVER on still photos or Disaster Mode public venues!):
+  // 1) 2-person active cornering / shoving / lunging intimidation
+  // 2) 3+ person directional encirclement WITH active agitation or loud intimidation audio (calm visitors ignored!)
+  const bullyingVoiceHit = Boolean(
+    !isStillImage && !isDisaster && transcript && LOCAL_BULLYING_VOICE_PATTERN.test(transcript)
+  );
   const bullyingFrameSignal =
-    geometry.crowdingTargetDetected &&
-    (frameDelta >= 6.0 || kinematics.maxBoxVelocity >= 32 || audioLevel >= 70);
+    !isStillImage &&
+    !isDisaster &&
+    hasMultiplePeople &&
+    !fightFrameSignal &&
+    !beatingFrameSignal &&
+    ((hasKineticMovement && pairMetrics.corneredPairDetected) ||
+      (hasKineticMovement &&
+        pairMetrics.crowdingTargetDetected &&
+        (pairMetrics.crowdingWithAgitation || audioLevel >= (sensitivity === 'high' ? 72 : 78))) ||
+      (bullyingVoiceHit && (hasCloseContact || pairMetrics.crowdingTargetDetected)));
 
   const weaponStreak = hasWeaponFrame ? prevState.weaponStreak + 1 : 0;
-  const beatingStreak = beatingFrameSignal ? prevState.beatingStreak + 1 : Math.max(0, prevState.beatingStreak - 1);
-  const fightStreak = fightFrameSignal ? prevState.fightStreak + 1 : Math.max(0, prevState.fightStreak - 1);
+  const beatingStreak = beatingFrameSignal
+    ? prevState.beatingStreak + 1
+    : Math.max(0, prevState.beatingStreak - 1);
+  const fightStreak = fightFrameSignal
+    ? prevState.fightStreak + 1
+    : Math.max(0, prevState.fightStreak - 1);
   const bullyingStreak = bullyingFrameSignal
     ? prevState.bullyingStreak + 1
     : Math.max(0, prevState.bullyingStreak - 1);
 
   const requiredWeaponFrames = highConfWeapon ? 2 : 3;
   const requiredBeatingFrames = sensitivity === 'high' ? 3 : 4;
-  const requiredFightFrames = sensitivity === 'high' ? 3 : 4;
-  const requiredBullyingFrames = sensitivity === 'high' ? 3 : 5;
+  const requiredFightFrames = sensitivity === 'high' ? 3 : 5;
+  const requiredBullyingFrames = sensitivity === 'high' ? 3 : 4;
 
   let confirmedCategory: ThreatCategory = 'none';
   const cues: string[] = [];
@@ -2020,11 +2808,11 @@ export function evaluateRealtimeEdgeThreat(
     );
   } else if (beatingStreak >= requiredBeatingFrames) {
     confirmedCategory = 'beating';
-    if (geometry.hasHorizontalCollapsedPerson || kinematics.maxVerticalDrop >= dropMin) {
+    if (pairMetrics.hasHorizontalCollapsedPerson || pairMetrics.maxVerticalDrop >= dropMin) {
       cues.push('Victim dropped/collapsed under close physical assault');
     } else {
       cues.push(
-        `Repeated violent contact (motion ${frameDelta.toFixed(0)}%, velocity ${kinematics.maxBoxVelocity})`
+        `Repeated violent contact (motion ${frameDelta.toFixed(0)}%, pair velocity ${pairMetrics.maxPairRelativeSpeed})`
       );
     }
     if (audioLevel >= 74) {
@@ -2033,17 +2821,24 @@ export function evaluateRealtimeEdgeThreat(
   } else if (fightStreak >= requiredFightFrames) {
     confirmedCategory = 'fight';
     cues.push(
-      `Clashing physical contact (${geometry.closeContactPairs} overlapping pair${geometry.closeContactPairs === 1 ? '' : 's'}, motion ${frameDelta.toFixed(0)}%)`
+      `Clashing physical contact (${pairMetrics.closeContactPairs} overlapping pair${pairMetrics.closeContactPairs === 1 ? '' : 's'}, motion ${frameDelta.toFixed(0)}%)`
     );
-    if (kinematics.maxBoxVelocity >= fightVelocityMin) {
-      cues.push(`Rapid body agitation (Δpos ${kinematics.maxBoxVelocity})`);
+    if (pairMetrics.maxPairRelativeSpeed > 0) {
+      cues.push(`Opposing body agitation (Δrel ${pairMetrics.maxPairRelativeSpeed})`);
     }
   } else if (bullyingStreak >= requiredBullyingFrames) {
     confirmedCategory = 'bullying';
-    if (geometry.crowdingTargetDetected) {
-      cues.push(`Group crowding / surrounding 1 individual (${input.people.length} people in tight cluster)`);
+    if (pairMetrics.bullyingReason) {
+      cues.push(pairMetrics.bullyingReason);
+    } else if (pairMetrics.crowdingTargetDetected) {
+      cues.push(
+        `Group encirclement / surrounding 1 individual (${input.people.length} people in cluster)`
+      );
     } else {
-      cues.push('Sustained cornering / intimidation posture detected');
+      cues.push('Sustained cornering / shoving intimidation detected');
+    }
+    if (bullyingVoiceHit) {
+      cues.push(`Bullying speech cue: "${transcript.slice(0, 50)}"`);
     }
   }
 
@@ -2075,8 +2870,8 @@ export function evaluateRealtimeEdgeThreat(
       analysis: null,
       shouldEmitAlert: false,
       shouldClearThreat,
-      contactPairs: geometry.closeContactPairs,
-      maxBoxVelocity: kinematics.maxBoxVelocity,
+      contactPairs: pairMetrics.closeContactPairs,
+      maxBoxVelocity: pairMetrics.maxBoxVelocity,
     };
   }
 
@@ -2152,8 +2947,8 @@ export function evaluateRealtimeEdgeThreat(
     analysis,
     shouldEmitAlert,
     shouldClearThreat: false,
-    contactPairs: geometry.closeContactPairs,
-    maxBoxVelocity: kinematics.maxBoxVelocity,
+    contactPairs: pairMetrics.closeContactPairs,
+    maxBoxVelocity: pairMetrics.maxBoxVelocity,
   };
 }
 
@@ -2166,15 +2961,18 @@ export function evaluateVoiceCueThreatAlert(
     lastAlertAtMs?: number;
     nowMs?: number;
     cooldownMs?: number;
+    operationMode?: OperationMode;
   }
 ): IncidentAlert | null {
   const cleaned = (transcript || '').trim();
   if (!cleaned) return null;
 
+  const isDisaster = options?.operationMode === 'disaster';
+  const disasterCue = isDisaster ? matchDisasterDistressKeyword(cleaned) : null;
   const isBeating = LOCAL_BEATING_VOICE_PATTERN.test(cleaned);
   const isBullying = LOCAL_BULLYING_VOICE_PATTERN.test(cleaned);
   const isFightOrCritical = LOCAL_CRITICAL_VOICE_PATTERN.test(cleaned);
-  if (!isBeating && !isBullying && !isFightOrCritical) {
+  if (!disasterCue && !isBeating && !isBullying && !isFightOrCritical) {
     return null;
   }
 
@@ -2190,10 +2988,20 @@ export function evaluateVoiceCueThreatAlert(
     voiceTranscript: cleaned,
     audioLevel,
     facilityMode,
+    operationMode: options?.operationMode,
   });
   localAnalysis.studentCount = Math.max(camera.studentCount || 0, localAnalysis.studentCount);
 
-  return evaluateFightNotification(camera, localAnalysis, facilityMode);
+  const alert = evaluateFightNotification(camera, localAnalysis, facilityMode);
+  if (alert && disasterCue) {
+    return {
+      ...alert,
+      disasterPhase: 2,
+      headline: `DISASTER DISTRESS VOICE ALERT ("${disasterCue.toUpperCase()}"): ${camera.classroomName}`,
+      teacherMessageSubject: `[DISASTER RESCUE ALERT] Distress cue "${disasterCue}" detected in ${camera.classroomName}`,
+    };
+  }
+  return alert && isDisaster ? { ...alert, disasterPhase: 2 } : alert;
 }
 
 export type SafeJsonParseResult<T> =

@@ -1,12 +1,18 @@
 import { useState } from 'react';
-import { AlertTriangle, Check, CheckCircle2, Download, Eye, Mail, ShieldAlert, Trash2 } from 'lucide-react';
-import type { ClassroomCamera, FacilityMode, IncidentAlert } from '../types';
-import { filterIncidentAlerts, formatAlertCategoryBadge, formatFacilityLabels } from '../utils/monitoringLogic';
+import { AlertTriangle, Check, CheckCircle2, Download, Eye, Mail, ShieldAlert, Trash2, Volume2 } from 'lucide-react';
+import type { ClassroomCamera, FacilityMode, IncidentAlert, OperationMode } from '../types';
+import {
+  classifyDisasterPhase,
+  filterIncidentAlerts,
+  formatAlertCategoryBadge,
+  formatFacilityLabels,
+} from '../utils/monitoringLogic';
 
 interface AlertsPanelProps {
   alerts: IncidentAlert[];
   cameras: ClassroomCamera[];
   facilityMode: FacilityMode;
+  operationMode?: OperationMode;
   onAcknowledgeAlert: (alertId: string) => void;
   onAcknowledgeAll: () => void;
   onClearAcknowledged: () => void;
@@ -18,6 +24,7 @@ export function AlertsPanel({
   alerts,
   cameras,
   facilityMode,
+  operationMode = 'school',
   onAcknowledgeAlert,
   onAcknowledgeAll,
   onClearAcknowledged,
@@ -26,6 +33,7 @@ export function AlertsPanel({
 }: AlertsPanelProps) {
   const [filterMode, setFilterMode] = useState<'all' | 'unread' | 'critical' | 'bullying' | 'beating'>('all');
   const [cameraFilter, setCameraFilter] = useState<string>('all');
+  const isDisaster = operationMode === 'disaster';
 
   const labels = formatFacilityLabels(facilityMode);
   const visibleAlerts = filterIncidentAlerts(alerts, filterMode, cameraFilter);
@@ -56,10 +64,14 @@ export function AlertsPanel({
       <div className="px-5 py-4 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
         <div>
           <h2 className="text-sm font-semibold text-slate-900">
-            Incident &amp; Threat Audit Log
+            {isDisaster
+              ? '3-Phase Disaster Management & Rescue Incident Log'
+              : 'Incident & Threat Audit Log'}
           </h2>
           <p className="text-xs text-slate-500 mt-0.5">
-            Real-time fighting, beating, bullying, weapon, and acoustic alerts across connected {labels.zonePlural.toLowerCase()}.
+            {isDisaster
+              ? 'Zero-delay Edge AI alerts grouped across Phase 1 (Stampede & Hazard Zones), Phase 2 (Fallen Victims & Acoustic Collapse), and Phase 3 (Missing Person Re-ID).'
+              : `Real-time fighting, beating, bullying, weapon, and acoustic alerts across connected ${labels.zonePlural.toLowerCase()}.`}
           </p>
         </div>
 
@@ -80,7 +92,7 @@ export function AlertsPanel({
                   ? 'bg-red-600 text-white'
                   : tab.id === 'bullying'
                     ? 'bg-orange-600 text-white'
-                    : 'bg-slate-100 text-white';
+                    : 'bg-slate-900 text-white';
               return (
                 <button
                   key={tab.id}
@@ -193,6 +205,23 @@ export function AlertsPanel({
 
                   <div className="min-w-0 space-y-1">
                     <div className="flex flex-wrap items-center gap-2 text-sm font-medium text-slate-900">
+                      {isDisaster ? (() => {
+                        const phaseMeta = classifyDisasterPhase(alert);
+                        const phaseCls =
+                          phaseMeta.phase === 1
+                            ? 'bg-amber-100 text-amber-900 border border-amber-300'
+                            : phaseMeta.phase === 2
+                              ? 'bg-red-100 text-red-900 border border-red-300'
+                              : 'bg-blue-100 text-blue-900 border border-blue-300';
+                        return (
+                          <span
+                            data-testid={`alert-disaster-phase-${phaseMeta.phase}`}
+                            className={`text-[10px] font-mono font-bold tracking-wider uppercase px-1.5 py-0.5 rounded ${phaseCls}`}
+                          >
+                            {phaseMeta.shortTag}
+                          </span>
+                        );
+                      })() : null}
                       <span
                         className={`text-[10px] font-mono font-bold tracking-wider uppercase px-1.5 py-0.5 rounded ${
                           isBullying
@@ -252,10 +281,26 @@ export function AlertsPanel({
                   <button
                     type="button"
                     onClick={() => onNotifyTeacher(alert)}
-                    className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md border border-slate-200 bg-slate-100 text-slate-800 hover:bg-slate-100 cursor-pointer whitespace-nowrap"
+                    className={`inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md border cursor-pointer whitespace-nowrap ${
+                      isDisaster
+                        ? 'border-red-300 bg-red-50 text-red-700 hover:bg-red-100'
+                        : 'border-slate-200 bg-slate-100 text-slate-800 hover:bg-slate-200'
+                    }`}
                   >
-                    <Mail className="w-3.5 h-3.5" aria-hidden="true" />
-                    <span>{alert.teacherNotified ? 'Notified' : 'Notify'}</span>
+                    {isDisaster ? (
+                      <Volume2 className="w-3.5 h-3.5" aria-hidden="true" />
+                    ) : (
+                      <Mail className="w-3.5 h-3.5" aria-hidden="true" />
+                    )}
+                    <span>
+                      {alert.teacherNotified
+                        ? isDisaster
+                          ? 'PA Sent'
+                          : 'Notified'
+                        : isDisaster
+                          ? 'PA Broadcast'
+                          : 'Notify'}
+                    </span>
                   </button>
                   <button
                     type="button"

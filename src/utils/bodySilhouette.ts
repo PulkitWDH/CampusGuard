@@ -20,10 +20,12 @@ export function computeNoseAnchor(
   const h = Math.max(1, ymax - ymin);
   const aspect = h / w;
 
-  // Full-body standing person (~7.5 heads tall): nose is ~13.5% from top of box.
-  // Waist-up person (~4.5 heads): nose is ~20% from top.
-  // Close-up head/shoulders (~2.5 heads): nose is ~28% from top.
-  const noseRatio = aspect >= 1.65 ? 0.135 : aspect >= 1.15 ? 0.2 : 0.28;
+  // Continuous smoothstep curve from close-up head/shoulders (aspect <= 0.95 -> 28%)
+  // to full-body standing person (aspect >= 1.85 -> 13.5%), eliminating sudden vertical jumps
+  // when bounding-box aspect ratio wobbles near a threshold.
+  const t = Math.max(0, Math.min(1, (aspect - 0.95) / (1.85 - 0.95)));
+  const smoothT = t * t * (3 - 2 * t);
+  const noseRatio = 0.28 + (0.135 - 0.28) * smoothT;
   return {
     x: Math.max(0, Math.min(1000, (xmin + xmax) / 2)),
     y: Math.max(0, Math.min(1000, ymin + h * noseRatio)),

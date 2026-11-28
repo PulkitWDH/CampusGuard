@@ -3,6 +3,7 @@ import { BookOpen, CheckCircle2, Mail, Mic, RefreshCw, Users, Volume2 } from 'lu
 import type {
   ClassroomCamera,
   IncidentAlert,
+  OperationMode,
   WorkspaceCourse,
   WorkspaceGmailMessage,
   WorkspaceTeacher,
@@ -13,6 +14,7 @@ import {
   SOUND_ALERT_THRESHOLD_DB,
   computeCalibratedOffsetFromDbfs,
   computeSplDecibels,
+  formatOperationModeBranding,
 } from '../utils/monitoringLogic';
 import { GoogleSignInButton } from './GoogleSignInButton';
 
@@ -22,6 +24,7 @@ interface WorkspaceTeacherHubProps {
   hasAccessToken: boolean;
   isSigningIn: boolean;
   onGoogleSignIn: () => Promise<void>;
+  onConnectGoogleWorkspace?: () => Promise<void>;
   onSignOut: () => Promise<void>;
   defaultTeacherEmail: string;
   onSaveTeacherEmail: (email: string) => void;
@@ -39,6 +42,7 @@ interface WorkspaceTeacherHubProps {
   dbCalibrationOffset: number;
   onChangeDbCalibrationOffset: (offset: number) => void;
   onOpenDispatchModal: (alert: IncidentAlert) => void;
+  operationMode?: OperationMode;
 }
 
 export function WorkspaceTeacherHub({
@@ -47,6 +51,7 @@ export function WorkspaceTeacherHub({
   hasAccessToken,
   isSigningIn,
   onGoogleSignIn,
+  onConnectGoogleWorkspace,
   onSignOut,
   defaultTeacherEmail,
   onSaveTeacherEmail,
@@ -64,7 +69,10 @@ export function WorkspaceTeacherHub({
   dbCalibrationOffset,
   onChangeDbCalibrationOffset,
   onOpenDispatchModal,
+  operationMode = 'school',
 }: WorkspaceTeacherHubProps) {
+  const isDisaster = operationMode === 'disaster';
+  const branding = formatOperationModeBranding(operationMode);
   const [emailDraft, setEmailDraft] = useState(defaultTeacherEmail);
   const [savedNotice, setSavedNotice] = useState(false);
   const [isCalibrating, setIsCalibrating] = useState(false);
@@ -147,32 +155,63 @@ export function WorkspaceTeacherHub({
     <div className="space-y-5">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div>
-          <h1 className="text-xl font-bold tracking-tight text-slate-900">
-            Teacher Alerts · Classroom &amp; Gmail
+          <h1
+            data-testid="workspace-hub-title"
+            className="text-xl font-bold tracking-tight text-slate-900"
+          >
+            {branding.workspaceFullTitle}
           </h1>
           <p className="text-xs text-slate-500 mt-0.5">
-            Automatically alerts the assigned teacher whenever sustained sound exceeds{' '}
-            <span className="font-mono font-semibold text-red-600 tabular-nums">
-              {SOUND_ALERT_THRESHOLD_DB.toFixed(1)} dB
-            </span>{' '}
-            for &gt;3s or real-time AI detects a critical threat.
+            {isDisaster ? (
+              <>
+                Dispatches rescue and evacuation directives whenever crowd density exceeds threshold,
+                distress speech cues fire, or sustained sound exceeds{' '}
+                <span className="font-mono font-semibold text-red-600 tabular-nums">
+                  {SOUND_ALERT_THRESHOLD_DB.toFixed(1)} dB
+                </span>{' '}
+                (ACOUSTIC DISTRESS / STRUCTURAL COLLAPSE ALERT).
+              </>
+            ) : (
+              <>
+                Automatically alerts the assigned teacher whenever sustained sound exceeds{' '}
+                <span className="font-mono font-semibold text-red-600 tabular-nums">
+                  {SOUND_ALERT_THRESHOLD_DB.toFixed(1)} dB
+                </span>{' '}
+                for &gt;3s or real-time AI detects a critical threat.
+              </>
+            )}
           </p>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
-          {hasAccessToken && userEmail ? (
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          {userEmail ? (
             <>
-              <button
-                type="button"
-                onClick={() => {
-                  void onRefreshWorkspace();
-                }}
-                disabled={loadingWorkspace}
-                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-slate-300 bg-slate-100 text-slate-800 hover:bg-slate-200 disabled:opacity-50 cursor-pointer"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${loadingWorkspace ? 'animate-spin' : ''}`} aria-hidden="true" />
-                <span>Sync Classroom &amp; Gmail</span>
-              </button>
+              {hasAccessToken ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    void onRefreshWorkspace();
+                  }}
+                  disabled={loadingWorkspace}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-slate-300 bg-slate-100 text-slate-800 hover:bg-slate-200 disabled:opacity-50 cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${loadingWorkspace ? 'animate-spin' : ''}`} aria-hidden="true" />
+                  <span>Sync Classroom &amp; Gmail</span>
+                </button>
+              ) : onConnectGoogleWorkspace ? (
+                <button
+                  type="button"
+                  data-testid="connect-google-workspace-btn"
+                  onClick={() => {
+                    void onConnectGoogleWorkspace();
+                  }}
+                  disabled={isSigningIn}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 cursor-pointer"
+                >
+                  <Mail className="w-3.5 h-3.5" aria-hidden="true" />
+                  <span>Link Classroom &amp; Gmail</span>
+                </button>
+              ) : null}
               <button
                 type="button"
                 onClick={() => {
@@ -208,7 +247,9 @@ export function WorkspaceTeacherHub({
             <div className="flex items-center gap-2">
               <Volume2 className="w-4 h-4 text-red-600 shrink-0" aria-hidden="true" />
               <h2 className="text-sm font-semibold text-slate-900">
-                90.1 dB (&gt;3s) Teacher Sound Alert Rule
+                {isDisaster
+                  ? '90.1 dB (>3s) Acoustic Distress / Structural Collapse Rule'
+                  : '90.1 dB (>3s) Teacher Sound Alert Rule'}
               </h2>
             </div>
             <span className="font-mono text-[11px] font-semibold text-red-700 bg-red-50 border border-red-200 rounded px-2 py-0.5 tabular-nums">
@@ -218,7 +259,10 @@ export function WorkspaceTeacherHub({
 
           <p className="text-xs text-slate-500 leading-relaxed">
             Every live zone microphone is continuously measured in decibels. If any monitored feed stays above{' '}
-            <strong className="text-slate-800">90.1 dB for more than 3 seconds</strong>, an urgent alert pops up on screen and prepares a teacher message with one-click Gmail or Google Classroom dispatch.
+            <strong className="text-slate-800">90.1 dB for more than 3 seconds</strong>,{' '}
+            {isDisaster
+              ? 'an urgent ACOUSTIC DISTRESS / STRUCTURAL COLLAPSE ALERT fires and prepares a rescue dispatch message.'
+              : 'an urgent alert pops up on screen and prepares a teacher message with one-click Gmail or Google Classroom dispatch.'}
           </p>
 
           <form
@@ -231,7 +275,7 @@ export function WorkspaceTeacherHub({
             className="space-y-2"
           >
             <label htmlFor="default-teacher-email" className="block text-xs font-medium text-slate-700">
-              Teacher Alert Recipient Email
+              {branding.recipientLabel}
             </label>
             <div className="flex items-center gap-2">
               <input
@@ -239,7 +283,7 @@ export function WorkspaceTeacherHub({
                 type="email"
                 value={emailDraft}
                 onChange={(e) => setEmailDraft(e.target.value)}
-                placeholder="teacher@school.edu"
+                placeholder={isDisaster ? 'rescue-command@emergency.gov' : 'teacher@school.edu'}
                 className="flex-1 min-w-0 text-sm px-3 py-2 border border-slate-300 bg-slate-50 rounded-lg text-slate-900 placeholder:text-slate-500 focus-visible:outline-2 focus-visible:outline-blue-500"
               />
               <button
@@ -252,7 +296,7 @@ export function WorkspaceTeacherHub({
             {savedNotice ? (
               <p className="text-xs text-emerald-600 inline-flex items-center gap-1">
                 <CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>Teacher email updated.</span>
+                <span>{isDisaster ? 'Rescue command email updated.' : 'Teacher email updated.'}</span>
               </p>
             ) : null}
           </form>
@@ -365,16 +409,32 @@ export function WorkspaceTeacherHub({
           {!hasAccessToken ? (
             <div className="border border-dashed border-slate-300 bg-slate-50 rounded-lg p-6 text-center space-y-3">
               <p className="text-xs text-slate-500">
-                Sign in with Google to load your Google Classroom classes, teachers, and student rosters.
+                {userEmail
+                  ? `Signed in as ${userEmail}. Link optional Google Classroom & Gmail permissions to load classes, teachers, and student rosters.`
+                  : 'Sign in with Google to sync your account and optionally link Google Classroom classes, teachers, and rosters.'}
               </p>
               <div className="flex justify-center">
-                <GoogleSignInButton
-                  compact
-                  loading={isSigningIn}
-                  onClick={() => {
-                    void onGoogleSignIn();
-                  }}
-                />
+                {userEmail && onConnectGoogleWorkspace ? (
+                  <button
+                    type="button"
+                    disabled={isSigningIn}
+                    onClick={() => {
+                      void onConnectGoogleWorkspace();
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 cursor-pointer"
+                  >
+                    <BookOpen className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>{isSigningIn ? 'Linking...' : 'Link Google Classroom & Gmail'}</span>
+                  </button>
+                ) : (
+                  <GoogleSignInButton
+                    compact
+                    loading={isSigningIn}
+                    onClick={() => {
+                      void onGoogleSignIn();
+                    }}
+                  />
+                )}
               </div>
             </div>
           ) : courses.length === 0 ? (
@@ -440,15 +500,19 @@ export function WorkspaceTeacherHub({
         </section>
       </div>
 
-      {/* Sound Threshold Alerts Ready for Teacher */}
+      {/* Sound Threshold Alerts Ready for Dispatch */}
       <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
         <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between gap-3">
           <div>
             <h2 className="text-sm font-semibold text-slate-900">
-              Recent &gt; 90.1 dB (3s) Teacher Alert Messages
+              {isDisaster
+                ? 'Recent > 90.1 dB Acoustic Distress / Structural Collapse Alerts'
+                : 'Recent > 90.1 dB (3s) Teacher Alert Messages'}
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Review triggered sustained decibel alerts and dispatch them to the teacher via Gmail or Classroom.
+              {isDisaster
+                ? 'Review triggered >90.1 dB acoustic distress & structural collapse spikes and dispatch rescue teams.'
+                : 'Review triggered sustained decibel alerts and dispatch them to the teacher via Gmail or Classroom.'}
             </p>
           </div>
         </div>
@@ -471,7 +535,13 @@ export function WorkspaceTeacherHub({
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-red-600 text-white hover:bg-red-500 cursor-pointer shrink-0"
                 >
                   <Mail className="w-3.5 h-3.5" aria-hidden="true" />
-                  <span>{alert.teacherNotified ? 'Resend to Teacher' : 'Send to Teacher'}</span>
+                  <span>
+                    {alert.teacherNotified
+                      ? isDisaster
+                        ? 'Resend Rescue Dispatch'
+                        : 'Resend to Teacher'
+                      : branding.dispatchButtonLabel}
+                  </span>
                 </button>
               </li>
             ))}

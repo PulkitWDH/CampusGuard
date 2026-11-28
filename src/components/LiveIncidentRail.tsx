@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { Check, CheckCircle2, Eye, Mail, ShieldAlert } from 'lucide-react';
-import type { FacilityMode, IncidentAlert } from '../types';
+import { Check, CheckCircle2, Eye, Mail, ShieldAlert, Volume2 } from 'lucide-react';
+import type { FacilityMode, IncidentAlert, OperationMode } from '../types';
 import {
   filterIncidentAlerts,
   formatAlertCategoryBadge,
@@ -10,6 +10,7 @@ import {
 interface LiveIncidentRailProps {
   alerts: IncidentAlert[];
   facilityMode: FacilityMode;
+  operationMode?: OperationMode;
   onAcknowledgeAlert: (alertId: string) => void;
   onAcknowledgeAll: () => void;
   onFocusCamera: (cameraId: string) => void;
@@ -20,6 +21,7 @@ interface LiveIncidentRailProps {
 export function LiveIncidentRail({
   alerts,
   facilityMode,
+  operationMode = 'school',
   onAcknowledgeAlert,
   onAcknowledgeAll,
   onFocusCamera,
@@ -27,6 +29,7 @@ export function LiveIncidentRail({
   onViewAllIncidents,
 }: LiveIncidentRailProps) {
   const [filterMode, setFilterMode] = useState<'all' | 'unread' | 'critical'>('all');
+  const isDisaster = operationMode === 'disaster';
   const labels = formatFacilityLabels(facilityMode);
   const visible = filterIncidentAlerts(alerts, filterMode, 'all');
   const unreadCount = alerts.filter((a) => !a.acknowledged).length;
@@ -98,7 +101,9 @@ export function LiveIncidentRail({
             <CheckCircle2 className="w-5 h-5 text-emerald-600 mx-auto" aria-hidden="true" />
             <p className="text-xs font-medium text-slate-800">All clear</p>
             <p className="text-xs text-slate-500 leading-relaxed">
-              Verified fights, weapons, breaches, and distress alerts appear here immediately.
+              {isDisaster
+                ? 'Stampede warnings, hazard breaches, evacuee Re-ID matches, and distress alerts appear here immediately.'
+                : 'Verified fights, weapons, breaches, and distress alerts appear here immediately.'}
             </p>
           </div>
         ) : (
@@ -192,10 +197,26 @@ export function LiveIncidentRail({
                     <button
                       type="button"
                       onClick={() => onNotifyTeacher(alert)}
-                      className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 cursor-pointer"
+                      className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-md border cursor-pointer ${
+                        isDisaster
+                          ? 'border-red-300 bg-red-50 text-red-700 hover:bg-red-100'
+                          : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-50'
+                      }`}
                     >
-                      <Mail className="w-3 h-3" aria-hidden="true" />
-                      <span>{alert.teacherNotified ? 'Sent' : 'Notify'}</span>
+                      {isDisaster ? (
+                        <Volume2 className="w-3 h-3" aria-hidden="true" />
+                      ) : (
+                        <Mail className="w-3 h-3" aria-hidden="true" />
+                      )}
+                      <span>
+                        {alert.teacherNotified
+                          ? isDisaster
+                            ? 'PA Sent'
+                            : 'Sent'
+                          : isDisaster
+                            ? 'PA Speak'
+                            : 'Notify'}
+                      </span>
                     </button>
                     {!alert.acknowledged ? (
                       <button

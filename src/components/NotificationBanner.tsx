@@ -1,9 +1,10 @@
-import { Mail, ShieldAlert, X } from 'lucide-react';
-import type { IncidentAlert } from '../types';
+import { Mail, ShieldAlert, Volume2, X } from 'lucide-react';
+import type { IncidentAlert, OperationMode } from '../types';
 import { formatAlertCategoryBadge } from '../utils/monitoringLogic';
 
 interface NotificationBannerProps {
   alert: IncidentAlert | null;
+  operationMode?: OperationMode;
   onInspectCamera: (cameraId: string) => void;
   onNotifyTeacher: (alert: IncidentAlert) => void;
   onAcknowledge: (alertId: string) => void;
@@ -11,11 +12,13 @@ interface NotificationBannerProps {
 
 export function NotificationBanner({
   alert,
+  operationMode = 'school',
   onInspectCamera,
   onNotifyTeacher,
   onAcknowledge,
 }: NotificationBannerProps) {
   if (!alert) return null;
+  const isDisaster = operationMode === 'disaster';
 
   const isCritical = alert.severity === 'critical';
   const badge = formatAlertCategoryBadge(alert);
@@ -117,8 +120,20 @@ export function NotificationBanner({
           onClick={() => onNotifyTeacher(alert)}
           className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-white border border-slate-300 text-slate-800 hover:bg-slate-50 transition-colors whitespace-nowrap cursor-pointer"
         >
-          <Mail className="w-3.5 h-3.5" aria-hidden="true" />
-          <span>{alert.teacherNotified ? 'Teacher Notified' : 'Notify Teacher'}</span>
+          {isDisaster ? (
+            <Volume2 className="w-3.5 h-3.5 text-red-600" aria-hidden="true" />
+          ) : (
+            <Mail className="w-3.5 h-3.5" aria-hidden="true" />
+          )}
+          <span>
+            {alert.teacherNotified
+              ? isDisaster
+                ? 'PA Broadcast Sent'
+                : 'Teacher Notified'
+              : isDisaster
+                ? 'PA Broadcast'
+                : 'Notify Teacher'}
+          </span>
         </button>
         <button
           type="button"

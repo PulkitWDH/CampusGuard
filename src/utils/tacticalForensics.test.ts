@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import {
   HEATMAP_COLS,
   HEATMAP_ROWS,
+  PERIMETER_ZONE_PRESETS,
   createActivityHeatmap,
   detectPerimeterBreaches,
+  getDefaultPerimeterPreset,
   normalizeDragToPerimeterZone,
   pushRollingDvrFrame,
   sealForensicEvidenceCase,
@@ -164,4 +166,16 @@ test('sealForensicEvidenceCase produces real SHA-256 digest and verifyForensicEv
   const tamperedCheck = await verifyForensicEvidenceIntegrity(tampered);
   assert.equal(tamperedCheck.valid, false);
   assert.notEqual(tamperedCheck.recomputedHash, tamperedCheck.expectedHash);
+});
+
+test('PERIMETER_ZONE_PRESETS exposes all 5 disaster hazard and school restricted zone labels', () => {
+  assert.deepEqual([...PERIMETER_ZONE_PRESETS], [
+    'Collapsed Structure Zone',
+    'Flood / Live Wire Hazard',
+    'Fire / Smoke Exclusion Zone',
+    'Evacuation Bottleneck',
+    'Restricted Area',
+  ]);
+  assert.equal(getDefaultPerimeterPreset('school'), 'Restricted Area');
+  assert.equal(getDefaultPerimeterPreset('disaster'), 'Collapsed Structure Zone');
 });

@@ -14,12 +14,13 @@ import {
   Trash2,
   Video,
 } from 'lucide-react';
-import type { ForensicEvidenceCase } from '../types';
+import type { ForensicEvidenceCase, OperationMode } from '../types';
 import { verifyForensicEvidenceIntegrity } from '../utils/tacticalForensics';
 
 interface EvidenceVaultViewProps {
   cases: ForensicEvidenceCase[];
   selectedCaseId: string | null;
+  operationMode?: OperationMode;
   onSelectCase: (caseId: string) => void;
   onDeleteCase: (caseId: string) => void;
   onReturnToWall: () => void;
@@ -28,10 +29,12 @@ interface EvidenceVaultViewProps {
 export function EvidenceVaultView({
   cases,
   selectedCaseId,
+  operationMode = 'disaster',
   onSelectCase,
   onDeleteCase,
   onReturnToWall,
 }: EvidenceVaultViewProps) {
+  const isDisaster = operationMode === 'disaster';
   const [searchQuery, setSearchQuery] = useState('');
   const [severityFilter, setSeverityFilter] = useState<'all' | 'critical' | 'manual'>('all');
   const [viewMode, setViewMode] = useState<'video' | 'frames'>('frames');
@@ -179,18 +182,37 @@ export function EvidenceVaultView({
     activeCase && integrityResult?.caseId === activeCase.id ? integrityResult : null;
 
   return (
-    <section aria-label="Forensic Evidence Vault" className="space-y-5">
+    <section aria-label={isDisaster ? 'Tamper-Proof Disaster & Rescue Incident Logs' : 'Forensic Evidence Vault'} className="space-y-5">
       <div className="flex flex-wrap items-end justify-between gap-4 border-b border-slate-200 pb-4">
         <div>
-          <h1 className="font-display text-xl font-semibold text-slate-950 tracking-tight">
-            Forensic Evidence Vault
+          {isDisaster ? (
+            <div className="flex flex-wrap items-center gap-2 mb-1">
+              <span className="inline-flex items-center px-2 py-0.5 rounded bg-blue-600 text-white font-mono text-[10px] font-bold uppercase tracking-wider">
+                Phase 3 · Post-Disaster Relief
+              </span>
+              <span className="font-mono text-[11px] text-slate-500">
+                SHA-256 Chain-of-Custody Sealed DVR Clips
+              </span>
+            </div>
+          ) : null}
+          <h1
+            data-testid="evidence-vault-title"
+            className="font-display text-xl font-semibold text-slate-950 tracking-tight"
+          >
+            {isDisaster
+              ? 'Tamper-Proof Disaster & Rescue Incident Logs'
+              : 'Forensic Evidence Vault'}
           </h1>
           <p className="text-xs text-slate-500 mt-1">
-            Recorded black-box DVR video clips and pre-event forensic timelines sealed automatically on threat, perimeter breach, watchlist match, or manual capture with SHA-256 Chain-of-Custody verification.
+            {isDisaster
+              ? 'Phase 3 Post-Disaster Relief: SHA-256 sealed black-box DVR video clips and pre-event timelines locked automatically on stampede warnings, fallen-victim detections, hazard zone breaches, acoustic collapse spikes, or Missing Person / Evacuee Re-Identification hits.'
+              : 'Recorded black-box DVR video clips and pre-event forensic timelines sealed automatically on threat, perimeter breach, watchlist match, or manual capture with SHA-256 Chain-of-Custody verification.'}
           </p>
         </div>
         <div className="flex items-center gap-4 text-xs text-slate-500 font-mono tabular-nums">
-          <span>{cases.length} sealed {cases.length === 1 ? 'case' : 'cases'}</span>
+          <span>
+            {cases.length} sealed {isDisaster ? (cases.length === 1 ? 'rescue log' : 'rescue logs') : (cases.length === 1 ? 'case' : 'cases')}
+          </span>
           <span aria-hidden="true">·</span>
           <span>
             {cases.reduce((acc, c) => acc + c.frames.length, 0)} DVR frames
@@ -201,9 +223,15 @@ export function EvidenceVaultView({
       {cases.length === 0 ? (
         <div className="border border-slate-200 bg-white rounded-lg p-10 text-center max-w-2xl mx-auto space-y-3">
           <Film className="w-8 h-8 text-slate-500 mx-auto" aria-hidden="true" />
-          <h2 className="text-base font-semibold text-slate-900">No sealed forensic evidence yet</h2>
+          <h2 className="text-base font-semibold text-slate-900">
+            {isDisaster
+              ? 'No tamper-proof disaster & rescue logs sealed yet'
+              : 'No sealed forensic evidence yet'}
+          </h2>
           <p className="text-xs text-slate-500 leading-relaxed max-w-md mx-auto">
-            Every live feed continuously records a rolling black-box DVR video clip and frame buffer. Threats, perimeter breaches, Watchlist Re-ID hits, or clicking <strong className="text-slate-800">Save Clip</strong> on any feed seal a tamper-evident case here automatically.
+            {isDisaster
+              ? 'Every live feed continuously records a rolling black-box DVR clip. Stampede alerts, fallen-victim detections, hazard breaches, Missing Person Re-ID hits, or clicking Save Clip seal a SHA-256 Tamper-Proof Disaster & Rescue Incident Log here automatically.'
+              : 'Every live feed continuously records a rolling black-box DVR video clip and frame buffer. Threats, perimeter breaches, Watchlist Re-ID hits, or clicking Save Clip on any feed seal a tamper-evident case here automatically.'}
           </p>
           <div className="pt-2">
             <button
@@ -569,7 +597,9 @@ export function EvidenceVaultView({
                   <div className="space-y-1.5">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className="text-[11px] text-slate-500 font-medium">
-                        Chain-of-Custody SHA-256 Digest
+                        {isDisaster
+                          ? 'Tamper-Proof Disaster & Rescue Incident Log · SHA-256 Digest'
+                          : 'Chain-of-Custody SHA-256 Digest'}
                       </span>
                       {activeIntegrity ? (
                         <span

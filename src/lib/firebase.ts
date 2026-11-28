@@ -1,19 +1,27 @@
-import { initializeApp } from 'firebase/app';
+import { getApp, getApps, initializeApp, type FirebaseApp } from 'firebase/app';
 import {
   GoogleAuthProvider,
+  browserLocalPersistence,
+  browserPopupRedirectResolver,
+  browserSessionPersistence,
   getAuth,
+  inMemoryPersistence,
+  indexedDBLocalPersistence,
+  initializeAuth,
   onAuthStateChanged,
+  setPersistence,
   signInWithPopup,
+  type Auth,
   type User,
 } from 'firebase/auth';
 import {
   collection,
   deleteDoc,
   doc,
+  getDoc,
   getDocFromServer,
   getFirestore,
   onSnapshot,
-  orderBy,
   query,
   serverTimestamp,
   setDoc,
@@ -23,66 +31,115 @@ import {
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 import type { ClassroomCamera, FacilityMode, IncidentAlert } from '../types';
+import {
+  buildMonitoredZoneCreateFields,
+  buildMonitoredZoneUpdateFields,
+  buildSafetyIncidentCreateFields,
+  buildSafetyIncidentUpdateFields,
+  buildUserProfileCreateFields,
+  buildUserProfileUpdateFields,
+  formatFriendlyAuthError,
+  sanitizeDocumentId,
+  sortIncidentsDescending,
+  validateOwnerUid,
+} from './firebaseHelpers';
 
-export const SCOPES: string[] = [
-  'openid',
-  'email',
-  'profile',
-  'https://www.googleapis.com/auth/classroom.addons.student',
-  'https://www.googleapis.com/auth/classroom.addons.teacher',
-  'https://www.googleapis.com/auth/classroom.announcements',
-  'https://www.googleapis.com/auth/classroom.announcements.readonly',
-  'https://www.googleapis.com/auth/classroom.courses',
+// Minimal scopes ONLY requested when a School Mode operator explicitly links Google Classroom & Gmail
+export const WORKSPACE_SCOPES: string[] = [
   'https://www.googleapis.com/auth/classroom.courses.readonly',
-  'https://www.googleapis.com/auth/classroom.coursework.me',
-  'https://www.googleapis.com/auth/classroom.coursework.me.readonly',
-  'https://www.googleapis.com/auth/classroom.coursework.students',
-  'https://www.googleapis.com/auth/classroom.coursework.students.readonly',
-  'https://www.googleapis.com/auth/classroom.courseworkmaterials',
-  'https://www.googleapis.com/auth/classroom.courseworkmaterials.readonly',
-  'https://www.googleapis.com/auth/classroom.guardianlinks.me.readonly',
-  'https://www.googleapis.com/auth/classroom.guardianlinks.students',
-  'https://www.googleapis.com/auth/classroom.guardianlinks.students.readonly',
-  'https://www.googleapis.com/auth/classroom.profile.emails',
-  'https://www.googleapis.com/auth/classroom.profile.photos',
-  'https://www.googleapis.com/auth/classroom.push-notifications',
-  'https://www.googleapis.com/auth/classroom.rosters',
   'https://www.googleapis.com/auth/classroom.rosters.readonly',
-  'https://www.googleapis.com/auth/classroom.student-submissions.me.readonly',
-  'https://www.googleapis.com/auth/classroom.student-submissions.students.readonly',
-  'https://www.googleapis.com/auth/classroom.topics',
-  'https://www.googleapis.com/auth/classroom.topics.readonly',
-  'https://mail.google.com/',
-  'https://www.googleapis.com/auth/gmail.addons.current.action.compose',
-  'https://www.googleapis.com/auth/gmail.addons.current.message.action',
-  'https://www.googleapis.com/auth/gmail.addons.current.message.metadata',
-  'https://www.googleapis.com/auth/gmail.addons.current.message.readonly',
-  'https://www.googleapis.com/auth/gmail.compose',
-  'https://www.googleapis.com/auth/gmail.insert',
-  'https://www.googleapis.com/auth/gmail.labels',
-  'https://www.googleapis.com/auth/gmail.metadata',
-  'https://www.googleapis.com/auth/gmail.modify',
-  'https://www.googleapis.com/auth/gmail.readonly',
+  'https://www.googleapis.com/auth/classroom.announcements',
   'https://www.googleapis.com/auth/gmail.send',
-  'https://www.googleapis.com/auth/gmail.settings.basic',
-  'https://www.googleapis.com/auth/gmail.settings.sharing',
+  'https://www.googleapis.com/auth/gmail.readonly',
 ];
 
-const app = initializeApp(firebaseConfig);
-export const auth = getAuth(app);
+function createFirebaseApp(): FirebaseApp {
+  return getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+}
+
+function createFirebaseAuth(firebaseApp: FirebaseApp): Auth {
+  try {
+    return initializeAuth(firebaseApp, {
+      persistence: [
+        indexedDBLocalPersistence,
+        browserLocalPersistence,
+        browserSessionPersistence,
+        inMemoryPersistence,
+      ],
+      popupRedirectResolver: browserPopupRedirectResolver,
+    });
+  } catch {
+    // Already initialized (e.g. during module reload)
+    return getAuth(firebaseApp);
+  }
+}
+
+const app = createFirebaseApp();
+export const auth = createFirebaseAuth(app);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
-const googleProvider = new GoogleAuthProvider();
-for (const scope of SCOPES) {
-  googleProvider.addScope(scope);
+// Standard Firebase Google Sign-In provider (ZERO restricted Gmail/Classroom scopes -> works on every Google account!)
+const basicGoogleProvider = new GoogleAuthProvider();
+basicGoogleProvider.setCustomParameters({ prompt: 'select_account' });
+
+// Optional Workspace provider for School Safety Classroom/Gmail dispatch linking
+const workspaceGoogleProvider = new GoogleAuthProvider();
+for (const scope of WORKSPACE_SCOPES) {
+  workspaceGoogleProvider.addScope(scope);
 }
-googleProvider.setCustomParameters({ prompt: 'consent select_account' });
+workspaceGoogleProvider.setCustomParameters({ prompt: 'consent select_account' });
 
 // In-memory OAuth access token only (never persisted to localStorage or sessionStorage).
 let cachedAccessToken: string | null = null;
-let isSigningIn = false;
+let persistenceConfigured = false;
+let activeSignInPromise: Promise<{
+  user: User;
+  accessToken: string | null;
+  idToken: string;
+} | null> | null = null;
 
-// Firestore persistence activates only after explicit Google Sign-In (owner-scoped rules).
+// Tracks verified `/users/{uid}` document readiness so subcollection writes never race ahead of profile creation
+const ensuredUserProfiles = new Set<string>();
+const inFlightProfileSyncs = new Map<string, Promise<void>>();
+
+/**
+ * Ensures Firebase Auth uses persistent storage (`browserLocalPersistence` -> `browserSessionPersistence`
+ * -> `inMemoryPersistence`) so sessions survive reloads and never throw in restricted iframes.
+ */
+async function ensureAuthPersistence(): Promise<void> {
+  if (persistenceConfigured) return;
+  const fallbacks = [browserLocalPersistence, browserSessionPersistence, inMemoryPersistence];
+  for (const persistence of fallbacks) {
+    try {
+      await setPersistence(auth, persistence);
+      persistenceConfigured = true;
+      return;
+    } catch {
+      // Try next storage tier (e.g., third-party iframe blocking localStorage/IndexedDB)
+    }
+  }
+}
+
+/**
+ * Waits for Firebase Auth to finish restoring any persisted session from storage on startup.
+ */
+export async function waitForAuthReady(): Promise<User | null> {
+  await auth.authStateReady();
+  return auth.currentUser;
+}
+
+// Validate connection to Firestore on boot (silently logs config warning only if offline/misconfigured)
+async function testConnection() {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+  try {
+    await getDocFromServer(doc(db, 'test', 'connection'));
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('the client is offline')) {
+      console.warn('Firestore offline or unavailable — continuing in local Edge AI mode.');
+    }
+  }
+}
+void testConnection();
 
 export enum OperationType {
   CREATE = 'create',
@@ -137,69 +194,104 @@ export function handleFirestoreError(
 }
 
 export function initAuth(
-  onUserChanged: (user: User | null, accessToken: string | null) => void
+  onUserChanged: (user: User | null, accessToken: string | null) => void,
+  onAuthReady?: () => void
 ): Unsubscribe {
+  let notifiedReady = false;
   return onAuthStateChanged(auth, (user) => {
     if (!user) {
       cachedAccessToken = null;
+      ensuredUserProfiles.clear();
+      inFlightProfileSyncs.clear();
       onUserChanged(null, null);
-      return;
-    }
-    if (!isSigningIn) {
+    } else {
       onUserChanged(user, cachedAccessToken);
+    }
+    if (!notifiedReady) {
+      notifiedReady = true;
+      onAuthReady?.();
     }
   });
 }
 
+async function performPopupSignIn(
+  provider: GoogleAuthProvider,
+  captureWorkspaceAccessToken: boolean
+): Promise<{
+  user: User;
+  accessToken: string | null;
+  idToken: string;
+} | null> {
+  if (activeSignInPromise) {
+    return activeSignInPromise;
+  }
+
+  const run = (async () => {
+    try {
+      await ensureAuthPersistence();
+      const result = await signInWithPopup(auth, provider, browserPopupRedirectResolver);
+      const credential = GoogleAuthProvider.credentialFromResult(result);
+      if (captureWorkspaceAccessToken) {
+        cachedAccessToken = credential?.accessToken ?? null;
+      }
+      const idToken = await result.user.getIdToken();
+      return {
+        user: result.user,
+        accessToken: cachedAccessToken,
+        idToken,
+      };
+    } catch (err) {
+      const friendly = formatFriendlyAuthError(err);
+      if (friendly.cancelled) {
+        return null;
+      }
+      throw new Error(friendly.message);
+    } finally {
+      activeSignInPromise = null;
+    }
+  })();
+
+  activeSignInPromise = run;
+  return run;
+}
+
+/**
+ * Standard Firebase Google Sign-In (no restricted Workspace scopes so ANY Google account works reliably).
+ */
 export async function googleSignIn(): Promise<{
   user: User;
   accessToken: string | null;
   idToken: string;
-}> {
-  isSigningIn = true;
-  try {
-    const result = await signInWithPopup(auth, googleProvider);
-    const credential = GoogleAuthProvider.credentialFromResult(result);
-    cachedAccessToken = credential?.accessToken ?? null;
-    const idToken = await result.user.getIdToken();
-    return {
-      user: result.user,
-      accessToken: cachedAccessToken,
-      idToken,
-    };
-  } catch (err) {
-    const code = (err as { code?: string } | null)?.code;
-    if (code === 'auth/unauthorized-domain') {
-      const host =
-        typeof window !== 'undefined' && window.location.hostname
-          ? window.location.hostname
-          : 'this domain';
-      throw new Error(
-        `Domain "${host}" is not authorized for Google Sign-In. Add "${host}" in Firebase Console → Project "${firebaseConfig.projectId}" → Authentication → Settings → Authorized domains.`
-      );
-    }
-    throw err;
-  } finally {
-    isSigningIn = false;
-  }
+} | null> {
+  return performPopupSignIn(basicGoogleProvider, false);
+}
+
+/**
+ * Explicit opt-in Google Workspace (Classroom & Gmail) OAuth linking for School Safety Mode.
+ */
+export async function connectGoogleWorkspace(): Promise<{
+  user: User;
+  accessToken: string | null;
+  idToken: string;
+} | null> {
+  return performPopupSignIn(workspaceGoogleProvider, true);
 }
 
 export async function getAccessToken(): Promise<string | null> {
   return cachedAccessToken;
 }
 
-export async function getFirebaseIdToken(): Promise<string | null> {
+export async function getFirebaseIdToken(forceRefresh = false): Promise<string | null> {
+  await auth.authStateReady();
   if (!auth.currentUser) return null;
-  return auth.currentUser.getIdToken();
+  return auth.currentUser.getIdToken(forceRefresh);
 }
 
 export async function logout(): Promise<void> {
   cachedAccessToken = null;
+  ensuredUserProfiles.clear();
+  inFlightProfileSyncs.clear();
   await auth.signOut();
-}
-
-function sanitizeId(raw: string): string {
-  return raw.replace(/[^a-zA-Z0-9_\-]/g, '-').slice(0, 128);
 }
 
 export async function syncUserProfileToFirestore(
@@ -211,41 +303,101 @@ export async function syncUserProfileToFirestore(
     facilityMode: FacilityMode;
   }
 ): Promise<void> {
-  const uid = sanitizeId(user.uid);
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+  await auth.authStateReady();
+  const uid = validateOwnerUid(user.uid, auth.currentUser?.uid);
+  if (!uid) return;
+
   const path = `users/${uid}`;
   const docRef = doc(db, 'users', uid);
 
+  const syncTask = (async () => {
+    try {
+      const existingSnap = await getDoc(docRef);
+      if (existingSnap.exists()) {
+        await updateDoc(docRef, {
+          ...buildUserProfileUpdateFields({
+            uid,
+            email: user.email,
+            displayName: user.displayName,
+            defaultTeacherEmail: prefs.defaultTeacherEmail,
+            linkedCourseId: prefs.linkedCourseId,
+            linkedCourseName: prefs.linkedCourseName,
+            facilityMode: prefs.facilityMode,
+          }),
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        await setDoc(docRef, {
+          ...buildUserProfileCreateFields({
+            uid,
+            email: user.email,
+            displayName: user.displayName,
+            defaultTeacherEmail: prefs.defaultTeacherEmail,
+            linkedCourseId: prefs.linkedCourseId,
+            linkedCourseName: prefs.linkedCourseName,
+            facilityMode: prefs.facilityMode,
+          }),
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+      ensuredUserProfiles.add(uid);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, path);
+    } finally {
+      inFlightProfileSyncs.delete(uid);
+    }
+  })();
+
+  inFlightProfileSyncs.set(uid, syncTask);
+  return syncTask;
+}
+
+/**
+ * Guarantees `/users/{uid}` exists before any `zones` or `incidents` subcollection write/delete,
+ * satisfying `exists(/databases/$(database)/documents/users/$(userId))` in firestore.rules.
+ */
+async function ensureUserProfileReady(uid: string): Promise<boolean> {
+  if (ensuredUserProfiles.has(uid)) return true;
+  const pending = inFlightProfileSyncs.get(uid);
+  if (pending) {
+    await pending.catch(() => {});
+    if (ensuredUserProfiles.has(uid)) return true;
+  }
+  const currentUser = auth.currentUser;
+  if (!currentUser || currentUser.uid !== uid) return false;
+
+  await syncUserProfileToFirestore(currentUser, { facilityMode: 'all' });
+  return ensuredUserProfiles.has(uid);
+}
+
+export async function saveZoneToFirestore(
+  userUid: string,
+  camera: ClassroomCamera
+): Promise<void> {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+  await auth.authStateReady();
+  const uid = validateOwnerUid(userUid, auth.currentUser?.uid);
+  if (!uid) return;
+
+  const profileReady = await ensureUserProfileReady(uid);
+  if (!profileReady) return;
+
+  const zoneId = sanitizeDocumentId(camera.id, 'zone');
+  const path = `users/${uid}/zones/${zoneId}`;
+  const ref = doc(db, 'users', uid, 'zones', zoneId);
+
   try {
-    const existingSnap = await getDocFromServer(docRef).catch(() => null);
-    if (existingSnap && existingSnap.exists()) {
-      await updateDoc(docRef, {
-        email: (user.email || `${uid}@users.local`).slice(0, 254),
-        ...(user.displayName ? { displayName: user.displayName.slice(0, 120) } : {}),
-        ...(prefs.defaultTeacherEmail !== undefined
-          ? { defaultTeacherEmail: prefs.defaultTeacherEmail.slice(0, 254) }
-          : {}),
-        ...(prefs.linkedCourseId !== undefined
-          ? { linkedCourseId: prefs.linkedCourseId.slice(0, 128) }
-          : {}),
-        ...(prefs.linkedCourseName !== undefined
-          ? { linkedCourseName: prefs.linkedCourseName.slice(0, 160) }
-          : {}),
-        facilityMode: prefs.facilityMode,
+    const existingSnap = await getDoc(ref);
+    if (existingSnap.exists()) {
+      await updateDoc(ref, {
+        ...buildMonitoredZoneUpdateFields(camera),
         updatedAt: serverTimestamp(),
       });
     } else {
-      await setDoc(docRef, {
-        uid,
-        email: (user.email || `${uid}@users.local`).slice(0, 254),
-        ...(user.displayName ? { displayName: user.displayName.slice(0, 120) } : {}),
-        ...(prefs.defaultTeacherEmail
-          ? { defaultTeacherEmail: prefs.defaultTeacherEmail.slice(0, 254) }
-          : {}),
-        ...(prefs.linkedCourseId ? { linkedCourseId: prefs.linkedCourseId.slice(0, 128) } : {}),
-        ...(prefs.linkedCourseName
-          ? { linkedCourseName: prefs.linkedCourseName.slice(0, 160) }
-          : {}),
-        facilityMode: prefs.facilityMode,
+      await setDoc(ref, {
+        ...buildMonitoredZoneCreateFields(uid, zoneId, camera),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
@@ -255,39 +407,16 @@ export async function syncUserProfileToFirestore(
   }
 }
 
-export async function saveZoneToFirestore(
-  userUid: string,
-  camera: ClassroomCamera
-): Promise<void> {
-  const uid = sanitizeId(userUid);
-  const zoneId = sanitizeId(camera.id);
-  const path = `users/${uid}/zones/${zoneId}`;
-  const ref = doc(db, 'users', uid, 'zones', zoneId);
-
-  try {
-    await setDoc(ref, {
-      id: zoneId,
-      ownerUid: uid,
-      cameraCode: camera.cameraCode.slice(0, 32),
-      classroomName: camera.classroomName.slice(0, 140),
-      bluetoothDeviceName: camera.bluetoothDeviceName.slice(0, 140),
-      bluetoothAddress: camera.bluetoothAddress.slice(0, 128),
-      sourceKind: camera.sourceKind,
-      hasVideo: Boolean(camera.hasVideo),
-      hasVoice: Boolean(camera.hasVoice),
-      voiceListeningEnabled: Boolean(camera.voiceListeningEnabled),
-      ...(camera.streamUrl ? { streamUrl: camera.streamUrl.slice(0, 1000) } : {}),
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.CREATE, path);
-  }
-}
-
 export async function deleteZoneFromFirestore(userUid: string, cameraId: string): Promise<void> {
-  const uid = sanitizeId(userUid);
-  const zoneId = sanitizeId(cameraId);
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+  await auth.authStateReady();
+  const uid = validateOwnerUid(userUid, auth.currentUser?.uid);
+  if (!uid) return;
+
+  const profileReady = await ensureUserProfileReady(uid);
+  if (!profileReady) return;
+
+  const zoneId = sanitizeDocumentId(cameraId, 'zone');
   const path = `users/${uid}/zones/${zoneId}`;
   try {
     await deleteDoc(doc(db, 'users', uid, 'zones', zoneId));
@@ -300,39 +429,34 @@ export async function saveIncidentToFirestore(
   userUid: string,
   alert: IncidentAlert
 ): Promise<void> {
-  const uid = sanitizeId(userUid);
-  const incidentId = sanitizeId(alert.id);
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+  await auth.authStateReady();
+  const uid = validateOwnerUid(userUid, auth.currentUser?.uid);
+  if (!uid) return;
+
+  const profileReady = await ensureUserProfileReady(uid);
+  if (!profileReady) return;
+
+  const incidentId = sanitizeDocumentId(alert.id, 'incident');
   const path = `users/${uid}/incidents/${incidentId}`;
+  const ref = doc(db, 'users', uid, 'incidents', incidentId);
   try {
-    await setDoc(doc(db, 'users', uid, 'incidents', incidentId), {
-      id: incidentId,
-      ownerUid: uid,
-      cameraId: sanitizeId(alert.cameraId),
-      cameraCode: alert.cameraCode.slice(0, 32),
-      classroomName: alert.classroomName.slice(0, 140),
-      alertType:
-        alert.alertType === 'sound-threshold' || alert.alertType === 'attendance'
-          ? alert.alertType
-          : 'ai-vision',
-      severity: alert.severity,
-      ...(alert.threatCategory ? { threatCategory: alert.threatCategory } : {}),
-      ...(alert.modelUsed ? { modelUsed: alert.modelUsed.slice(0, 64) } : {}),
-      studentCount: Math.max(0, Math.min(10000, Math.round(alert.studentCount || 0))),
-      ...(typeof alert.measuredDb === 'number'
-        ? { measuredDb: Math.max(0, Math.min(200, alert.measuredDb)) }
-        : {}),
-      headline: alert.headline.slice(0, 240),
-      voiceCue: (alert.voiceCue || '').slice(0, 500),
-      details: (alert.details || '').slice(0, 1000),
-      ...(alert.teacherMessageBody
-        ? { teacherMessage: alert.teacherMessageBody.slice(0, 2000) }
-        : {}),
-      teacherNotified: Boolean(alert.teacherNotified),
-      acknowledged: Boolean(alert.acknowledged),
-      timestamp: alert.timestamp.slice(0, 64),
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
+    const existingSnap = await getDoc(ref);
+    if (existingSnap.exists()) {
+      await updateDoc(ref, {
+        ...buildSafetyIncidentUpdateFields({
+          acknowledged: alert.acknowledged,
+          teacherNotified: alert.teacherNotified,
+        }),
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await setDoc(ref, {
+        ...buildSafetyIncidentCreateFields(uid, incidentId, alert),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, path);
   }
@@ -343,15 +467,22 @@ export async function updateIncidentInFirestore(
   incidentIdRaw: string,
   updates: { acknowledged?: boolean; teacherNotified?: boolean }
 ): Promise<void> {
-  const uid = sanitizeId(userUid);
-  const incidentId = sanitizeId(incidentIdRaw);
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+  await auth.authStateReady();
+  const uid = validateOwnerUid(userUid, auth.currentUser?.uid);
+  if (!uid) return;
+
+  const profileReady = await ensureUserProfileReady(uid);
+  if (!profileReady) return;
+
+  const incidentId = sanitizeDocumentId(incidentIdRaw, 'incident');
   const path = `users/${uid}/incidents/${incidentId}`;
+  const fields = buildSafetyIncidentUpdateFields(updates);
+  if (Object.keys(fields).length === 0) return;
+
   try {
     await updateDoc(doc(db, 'users', uid, 'incidents', incidentId), {
-      ...(updates.acknowledged !== undefined ? { acknowledged: updates.acknowledged } : {}),
-      ...(updates.teacherNotified !== undefined
-        ? { teacherNotified: updates.teacherNotified }
-        : {}),
+      ...fields,
       updatedAt: serverTimestamp(),
     });
   } catch (error) {
@@ -359,27 +490,79 @@ export async function updateIncidentInFirestore(
   }
 }
 
+export function subscribeToUserZones(
+  userUid: string,
+  onZones: (zones: ClassroomCamera[]) => void
+): Unsubscribe {
+  const uid = validateOwnerUid(userUid, auth.currentUser?.uid);
+  if (!uid) {
+    return () => {};
+  }
+  const path = `users/${uid}/zones`;
+  // Uses equality filter on ownerUid only (matches firestore.rules `allow list` without needing composite index)
+  const q = query(collection(db, 'users', uid, 'zones'), where('ownerUid', '==', uid));
+  return onSnapshot(
+    q,
+    (snap) => {
+      const list: ClassroomCamera[] = snap.docs.map((d) => {
+        const data = d.data();
+        return {
+          id: String(data.id || d.id),
+          cameraCode: String(data.cameraCode || 'CAM-01'),
+          classroomName: String(data.classroomName || 'Monitored Zone'),
+          bluetoothDeviceName: String(data.bluetoothDeviceName || 'Local Camera'),
+          bluetoothAddress: String(data.bluetoothAddress || 'local'),
+          sourceKind: (data.sourceKind || 'device-camera') as ClassroomCamera['sourceKind'],
+          hasVideo: Boolean(data.hasVideo),
+          hasVoice: Boolean(data.hasVoice),
+          voiceListeningEnabled: Boolean(data.voiceListeningEnabled),
+          streamUrl: data.streamUrl ? String(data.streamUrl) : undefined,
+          liveTranscript: '',
+          audioLevel: 0,
+          status: 'normal',
+          studentCount: 0,
+          lastAnalysis: null,
+          isAnalyzing: false,
+        };
+      });
+      onZones(list);
+    },
+    (error) => {
+      const code = (error as { code?: string } | null)?.code;
+      if (code === 'unavailable' || (typeof navigator !== 'undefined' && !navigator.onLine)) {
+        return;
+      }
+      try {
+        handleFirestoreError(error, OperationType.LIST, path);
+      } catch {
+        // Logged structured FirestoreErrorInfo above; avoid unhandled crash inside async listener
+      }
+    }
+  );
+}
+
 export function subscribeToUserIncidents(
   userUid: string,
   onIncidents: (incidents: IncidentAlert[]) => void
 ): Unsubscribe {
-  const uid = sanitizeId(userUid);
+  const uid = validateOwnerUid(userUid, auth.currentUser?.uid);
+  if (!uid) {
+    return () => {};
+  }
   const path = `users/${uid}/incidents`;
-  const q = query(
-    collection(db, 'users', uid, 'incidents'),
-    where('ownerUid', '==', uid),
-    orderBy('timestamp', 'desc')
-  );
+  // Filter strictly by ownerUid (matches firestore.rules `allow list`) and sort in-memory
+  // so no Firestore composite index on (ownerUid, timestamp) is required.
+  const q = query(collection(db, 'users', uid, 'incidents'), where('ownerUid', '==', uid));
   return onSnapshot(
     q,
     (snap) => {
       const list: IncidentAlert[] = snap.docs.map((d) => {
         const data = d.data();
         return {
-          id: String(data.id),
-          cameraId: String(data.cameraId),
-          cameraCode: String(data.cameraCode),
-          classroomName: String(data.classroomName),
+          id: String(data.id || d.id),
+          cameraId: String(data.cameraId || ''),
+          cameraCode: String(data.cameraCode || ''),
+          classroomName: String(data.classroomName || ''),
           alertType:
             data.alertType === 'sound-threshold' || data.alertType === 'attendance'
               ? data.alertType
@@ -398,10 +581,18 @@ export function subscribeToUserIncidents(
           acknowledged: Boolean(data.acknowledged),
         };
       });
-      onIncidents(list);
+      onIncidents(sortIncidentsDescending(list));
     },
     (error) => {
-      handleFirestoreError(error, OperationType.LIST, path);
+      const code = (error as { code?: string } | null)?.code;
+      if (code === 'unavailable' || (typeof navigator !== 'undefined' && !navigator.onLine)) {
+        return;
+      }
+      try {
+        handleFirestoreError(error, OperationType.LIST, path);
+      } catch {
+        // Logged structured FirestoreErrorInfo above; avoid unhandled crash inside async listener
+      }
     }
   );
 }

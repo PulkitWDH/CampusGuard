@@ -29,9 +29,12 @@ import type {
   DetectedPersonBox,
   DvrEvidenceFrame,
   FacilityMode,
+  OperationMode,
   PerimeterZone,
+  PerimeterZonePreset,
   ThreatSensitivity,
   TrackedSubject,
+  WatchlistLabelMode,
   WatchlistSubject,
 } from '../types';
 import { captureCanvasJpegBase64 } from '../utils/mediaCapture';
@@ -66,8 +69,10 @@ import {
 import {
   HEATMAP_COLS,
   HEATMAP_ROWS,
+  PERIMETER_ZONE_PRESETS,
   createActivityHeatmap,
   detectPerimeterBreaches,
+  getDefaultPerimeterPreset,
   mapIronbowColor,
   normalizeDragToPerimeterZone,
   pushRollingDvrFrame,
@@ -75,9 +80,11 @@ import {
 } from '../utils/tacticalForensics';
 import {
   type PtzViewportRect,
+  computePeakTrailVelocity,
   computeSmoothPtzViewport,
   easePtzViewportToFull,
   extractAppearanceSignature,
+  getWatchlistModeMeta,
   mapBoxThroughPtzViewport,
   mapPointThroughPtzViewport,
   matchSubjectsToWatchlist,
@@ -92,6 +99,11 @@ import {
   getAdaptiveRenderProfile,
   globalEdgeInferenceScheduler,
 } from '../utils/cameraScaleEngine';
+import {
+  type Point2D,
+  advanceSmoothedDisplayPoint,
+  buildSmoothTrailSpline,
+} from '../utils/trailSmoothing';
 
 export interface CameraFramePayload {
   frameBase64: string;
@@ -117,6 +129,8 @@ export interface DvrBundleSnapshot {
 interface CameraFeedCardProps {
   camera: ClassroomCamera;
   facilityMode: FacilityMode;
+  operationMode?: OperationMode;
+  watchlistLabelMode?: WatchlistLabelMode;
   threatSensitivity: ThreatSensitivity;
   defaultAiModel: AiEngineModel;
   dbCalibrationOffset?: number;
@@ -158,6 +172,13 @@ interface CameraFeedCardProps {
       subjectId: string;
       similarity: number;
       bundle: DvrBundleSnapshot;
+    }
+  ) => void;
+  onSubjectTelemetry?: (
+    cameraId: string,
+    telemetry: {
+      peakTrailVelocity: number;
+      fallenSubjects: TrackedSubject[];
     }
   ) => void;
   onReconnectStream: (cameraId: string) => void;
@@ -205,6 +226,8 @@ interface SpeechRecognitionInstance {
 function CameraFeedCardInner({
   camera,
   facilityMode,
+  operationMode = 'school',
+  watchlistLabelMode = operationMode === 'disaster' ? 'missing-person' : 'security',
   threatSensitivity,
   defaultAiModel,
   dbCalibrationOffset = DEFAULT_DB_CALIBRATION_OFFSET,
@@ -221,6 +244,7 @@ function CameraFeedCardInner({
   onManualLockEvidence,
   onEnrollLiveSubject,
   onWatchlistMatch,
+  onSubjectTelemetry,
   onReconnectStream,
   onAnalyzeCamera,
   onToggleVoiceListening,
@@ -229,6 +253,24 @@ function CameraFeedCardInner({
   onToggleFocus,
   onRemoveCamera,
 }: CameraFeedCardProps) {
+  const isDisasterMode = operationMode === 'disaster';
+  const watchlistMeta = getWatchlistModeMeta(watchlistLabelMode);
+  const operationModeRef = useRef<OperationMode>(operationMode);
+  operationModeRef.current = operationMode;
+  const watchlistLabelModeRef = useRef<WatchlistLabelMode>(watchlistLabelMode);
+  watchlistLabelModeRef.current = watchlistLabelMode;
+  const [zonePreset, setZonePreset] = useState<PerimeterZonePreset>(() =>
+    PERIMETER_ZONE_PRESETS.includes(camera.perimeterZone?.label as PerimeterZonePreset)
+      ? (camera.perimeterZone!.label as PerimeterZonePreset)
+      : getDefaultPerimeterPreset(operationMode)
+  );
+  useEffect(() => {
+    if (camera.perimeterZone?.label && PERIMETER_ZONE_PRESETS.includes(camera.perimeterZone.label as PerimeterZonePreset)) {
+      setZonePreset(camera.perimeterZone.label as PerimeterZonePreset);
+    } else if (!camera.perimeterZone) {
+      setZonePreset(getDefaultPerimeterPreset(operationMode));
+    }
+  }, [camera.perimeterZone, operationMode]);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const loadedImageRef = useRef<HTMLImageElement | null>(null);
@@ -304,6 +346,8 @@ function CameraFeedCardInner({
   onPerimeterBreachRef.current = onPerimeterBreach;
   const onWatchlistMatchRef = useRef(onWatchlistMatch);
   onWatchlistMatchRef.current = onWatchlistMatch;
+  const onSubjectTelemetryRef = useRef(onSubjectTelemetry);
+  onSubjectTelemetryRef.current = onSubjectTelemetry;
   const watchlistRef = useRef<WatchlistSubject[]>(watchlist);
   watchlistRef.current = watchlist;
 
@@ -365,6 +409,8 @@ function CameraFeedCardInner({
   lockedPtzSubjectIdRef.current = lockedPtzSubjectId;
   const [liveTrackedSubjects, setLiveTrackedSubjects] = useState<TrackedSubject[]>([]);
   const lastTrackedUiSigRef = useRef<string>('');
+  const smoothedDisplayNoseRef = useRef<Map<string, Point2D>>(new Map());
+  const lastTrailRenderMsRef = useRef<number>(0);
 
   // Real MediaRecorder rolling WebM video clip state
   const currentVideoChunksRef = useRef<Blob[]>([]);
@@ -656,7 +702,7 @@ function CameraFeedCardInner({
         );
       } else if (pickModeRef.current === 'flag') {
         handleFlagLiveSubject(hit);
-        showPickFeedback(`Flagged ${hit.id} to Watchlist`);
+        showPickFeedback(`Registered ${hit.id} to ${watchlistMeta.title}`);
         lastPickerPointerPxRef.current = null;
         hoveredSubjectIdRef.current = null;
         setHoveredSubjectId(null);
@@ -713,7 +759,7 @@ function CameraFeedCardInner({
       dragStartPxRef.current,
       endPt,
       lastDrawRectRef.current,
-      'Restricted Perimeter'
+      zonePreset
     );
     dragStartPxRef.current = null;
     dragCurrentPxRef.current = null;
@@ -1047,10 +1093,10 @@ function CameraFeedCardInner({
           personTrackerStateRef.current,
           rawPeople,
           {
-            instantConfidence: crowdScanUsed ? 22 : 50,
-            minConfidence: crowdScanUsed ? 22 : 28,
-            maxMissedFrames: 3,
-            maxOccludedFrames: 35,
+            instantConfidence: crowdScanUsed ? 22 : 76,
+            minConfidence: crowdScanUsed ? 22 : 26,
+            maxMissedFrames: 2,
+            maxOccludedFrames: 10,
             weakDetections: weakPeople,
             occluderObjects,
             sampleTorsoSignature,
@@ -1158,6 +1204,12 @@ function CameraFeedCardInner({
         }
 
         trackedSubjectsRef.current = nextTracked;
+        const peakTrailVelocity = computePeakTrailVelocity(nextTracked);
+        const fallenSubjects = nextTracked.filter((s) => Boolean(s.isFallenVictim));
+        onSubjectTelemetryRef.current?.(camera.id, {
+          peakTrailVelocity,
+          fallenSubjects,
+        });
         if (pickModeRef.current !== null && lastPickerPointerPxRef.current) {
           const liveHit = findHoveredBodySubject(
             lastPickerPointerPxRef.current,
@@ -1171,7 +1223,10 @@ function CameraFeedCardInner({
           }
         }
         const trackedUiSig = nextTracked
-          .map((s) => `${s.id}:${s.dwellSeconds}:${s.matchedWatchlistId ?? ''}:${s.matchedSimilarity ?? 0}`)
+          .map(
+            (s) =>
+              `${s.id}:${s.dwellSeconds}:${s.matchedWatchlistId ?? ''}:${s.matchedSimilarity ?? 0}:${s.isFallenVictim ? 'F' : ''}`
+          )
           .join('|');
         if (trackedUiSig !== lastTrackedUiSigRef.current) {
           lastTrackedUiSigRef.current = trackedUiSig;
@@ -1199,18 +1254,22 @@ function CameraFeedCardInner({
         }
 
         // Run real-time stateful visual + weapon + contact threat detector on EVERY frame
+        // (Still uploaded photos automatically skip kinetic bullying/fight/beating alerts and stay in Count & Density mode)
+        const isStillPhoto = camera.customMediaType === 'image';
         const threatEval = evaluateRealtimeEdgeThreat(edgeThreatStateRef.current, {
           people,
           dangerousObjects,
-          frameDeltaPercent: instantDelta,
-          voiceTranscript: voiceListeningRef.current ? liveTranscriptRef.current : '',
-          audioLevel: voiceListeningRef.current ? audioLevelRef.current : 0,
+          frameDeltaPercent: isStillPhoto ? 0 : instantDelta,
+          voiceTranscript: !isStillPhoto && voiceListeningRef.current ? liveTranscriptRef.current : '',
+          audioLevel: !isStillPhoto && voiceListeningRef.current ? audioLevelRef.current : 0,
           facilityMode: facilityModeRef.current,
+          operationMode: operationModeRef.current,
+          isStillImage: isStillPhoto,
           sensitivity: threatSensitivityRef.current,
           nowMs: Date.now(),
         });
         edgeThreatStateRef.current = threatEval.nextState;
-        setContactPairsCount(threatEval.contactPairs);
+        setContactPairsCount(isStillPhoto ? 0 : threatEval.contactPairs);
 
         if (threatEval.analysis || threatEval.shouldClearThreat) {
           onRealtimeEdgeThreatRef.current(camera.id, {
@@ -1223,12 +1282,16 @@ function CameraFeedCardInner({
 
         if (!isAnalyzingRef.current) {
           const backendTag = backend === 'cpu' ? 'CPU' : 'WebGL';
-          const engineTag = crowdScanUsed ? `Crowd AI (${backendTag})` : `Edge AI (${backendTag})`;
-          setScanModeLabel(
-            cloudQuotaExhaustedRef.current
-              ? `${engineTag} · ${inferenceMs}ms`
-              : `${engineTag} + Cloud · ${inferenceMs}ms`
-          );
+          if (isStillPhoto) {
+            setScanModeLabel(`Still Photo · Count & Density (${backendTag}) · ${inferenceMs}ms`);
+          } else {
+            const engineTag = crowdScanUsed ? `Crowd AI (${backendTag})` : `Edge AI (${backendTag})`;
+            setScanModeLabel(
+              cloudQuotaExhaustedRef.current
+                ? `${engineTag} · ${inferenceMs}ms`
+                : `${engineTag} + Cloud · ${inferenceMs}ms`
+            );
+          }
         }
       } catch (err) {
         consecutiveEdgeErrorsRef.current += 1;
@@ -1680,7 +1743,15 @@ function CameraFeedCardInner({
         ctx.restore();
         ctx.fillStyle = '#f87171';
         ctx.font = '600 10px "JetBrains Mono", monospace';
-        ctx.fillText('90.1 dB ALERT', chartRight - 84, thresholdY - 5);
+        const thresholdLabel =
+          operationModeRef.current === 'disaster'
+            ? '90.1 dB COLLAPSE / DISTRESS'
+            : '90.1 dB ALERT';
+        ctx.fillText(
+          thresholdLabel,
+          operationModeRef.current === 'disaster' ? chartRight - 168 : chartRight - 84,
+          thresholdY - 5
+        );
 
         // Live 48-bar acoustic spectrum
         const bins = waveformBinsRef.current;
@@ -1712,7 +1783,9 @@ function CameraFeedCardInner({
         ctx.fillStyle = '#a1a1aa';
         ctx.font = '500 10.5px "JetBrains Mono", monospace';
         const modeText = audioConnected
-          ? 'MICROPHONE ONLY · LIVE ACOUSTIC & VOICE AI'
+          ? operationModeRef.current === 'disaster'
+            ? 'MICROPHONE ONLY · DISASTER DISTRESS & COLLAPSE AI'
+            : 'MICROPHONE ONLY · LIVE ACOUSTIC & VOICE AI'
           : 'MICROPHONE ONLY · STANDBY (CLICK CONNECT LIVE MIC)';
         ctx.fillText(modeText, chartLeft, 94, Math.max(180, chartW - 16));
 
@@ -1723,8 +1796,12 @@ function CameraFeedCardInner({
         const cueLine = transcript
           ? `Speech: "${transcript.slice(0, 74)}"`
           : audioConnected
-            ? 'Listening for fight, beating, bullying, and distress speech...'
-            : 'Ready to monitor acoustic spikes (>90.1 dB) & distress speech.';
+            ? operationModeRef.current === 'disaster'
+              ? 'Listening for help, trapped, fire, earthquake, flood, collapse, medical, emergency...'
+              : 'Listening for fight, beating, bullying, and distress speech...'
+            : operationModeRef.current === 'disaster'
+              ? 'Ready for >90.1 dB ACOUSTIC DISTRESS / STRUCTURAL COLLAPSE ALERT (rubble/smoke zones).'
+              : 'Ready to monitor acoustic spikes (>90.1 dB) & distress speech.';
         ctx.fillText(cueLine, chartLeft, height - 38);
       } else {
         const video = videoRef.current;
@@ -1903,7 +1980,7 @@ function CameraFeedCardInner({
           }
         }
 
-        // Nose-Anchored Movement Trajectory Trails (for selected specific person(s) or everyone)
+        // Silky 60 FPS Nose-Anchored Movement Trajectory Trails (Centripetal Catmull-Rom Splines)
         if (hasLiveFrameRef.current && trailsEnabledRef.current && trackedSubjects.length > 0) {
           const selectedIds = selectedTrailSubjectIdsRef.current;
           const trailSubjects =
@@ -1911,56 +1988,118 @@ function CameraFeedCardInner({
               ? trackedSubjects.filter((s) => selectedIds.includes(s.id))
               : trackedSubjects;
 
+          const trailDtMs =
+            lastTrailRenderMsRef.current > 0
+              ? Math.max(4, Math.min(100, timestamp - lastTrailRenderMsRef.current))
+              : 16.67;
+          lastTrailRenderMsRef.current = timestamp;
+
+          const activeSubjectIds = new Set(trackedSubjects.map((s) => s.id));
+          smoothedDisplayNoseRef.current.forEach((_val, key) => {
+            if (!activeSubjectIds.has(key)) {
+              smoothedDisplayNoseRef.current.delete(key);
+            }
+          });
+
           trailSubjects.forEach((subj) => {
-            const liveNose = computeNoseAnchor(subj.box_2d);
-            const rawPts = subj.trail.length > 0 ? [...subj.trail, liveNose] : [liveNose];
+            const targetNose = subj.smoothedNose ?? computeNoseAnchor(subj.box_2d);
+            const prevDisplayNose = smoothedDisplayNoseRef.current.get(subj.id) ?? null;
+            const liveNose = advanceSmoothedDisplayPoint(prevDisplayNose, targetNose, trailDtMs);
+            smoothedDisplayNoseRef.current.set(subj.id, liveNose);
+
             const isWatchlistHit = Boolean(subj.matchedWatchlistId);
             const isPinnedTrail = selectedIds.includes(subj.id);
 
+            // Convert trail history + 60fps damped live head into canvas pixel space
+            const rawNormPts: Point2D[] =
+              subj.trail.length > 0 ? [...subj.trail, liveNose] : [liveNose];
+            const pixelWaypoints: Point2D[] = rawNormPts.map((pt) => {
+              const mapped = mapPointThroughPtzViewport(pt, activePtz);
+              return {
+                x: activeRect.x + (mapped.x / 1000) * activeRect.width,
+                y: activeRect.y + (mapped.y / 1000) * activeRect.height,
+              };
+            });
+
+            const splinePts = buildSmoothTrailSpline(pixelWaypoints, {
+              minControlSpacing: 3,
+              laplacianPasses: 2,
+              subdivisionsPerSegment: 8,
+            });
+
+            const rgb = isWatchlistHit
+              ? '239, 68, 68'
+              : isPinnedTrail
+                ? '16, 185, 129'
+                : '56, 189, 248';
+            const anchorColor = isWatchlistHit ? '#ef4444' : isPinnedTrail ? '#10b981' : '#38bdf8';
+
             ctx.save();
-            ctx.lineCap = 'round';
             ctx.lineJoin = 'round';
 
-            if (rawPts.length >= 2) {
-              for (let i = 1; i < rawPts.length; i += 1) {
-                const prevPt = mapPointThroughPtzViewport(rawPts[i - 1], activePtz);
-                const currPt = mapPointThroughPtzViewport(rawPts[i], activePtz);
-                const alpha = 0.22 + (i / rawPts.length) * 0.78;
-                const px1 = activeRect.x + (prevPt.x / 1000) * activeRect.width;
-                const py1 = activeRect.y + (prevPt.y / 1000) * activeRect.height;
-                const px2 = activeRect.x + (currPt.x / 1000) * activeRect.width;
-                const py2 = activeRect.y + (currPt.y / 1000) * activeRect.height;
-                ctx.strokeStyle = isWatchlistHit
-                  ? `rgba(239, 68, 68, ${alpha.toFixed(2)})`
-                  : isPinnedTrail
-                    ? `rgba(16, 185, 129, ${alpha.toFixed(2)})`
-                    : `rgba(56, 189, 248, ${alpha.toFixed(2)})`;
-                ctx.lineWidth = isPinnedTrail ? 3 : 2.5;
+            if (splinePts.length >= 2) {
+              // 1. Subtle continuous soft halo ribbon along the entire smooth spline
+              ctx.beginPath();
+              ctx.moveTo(splinePts[0].x, splinePts[0].y);
+              for (let i = 1; i < splinePts.length; i += 1) {
+                ctx.lineTo(splinePts[i].x, splinePts[i].y);
+              }
+              ctx.lineCap = 'round';
+              ctx.lineWidth = isPinnedTrail ? 7 : 6;
+              ctx.strokeStyle = `rgba(${rgb}, 0.14)`;
+              ctx.stroke();
+
+              // 2. Tapered smooth comet core divided into contiguous bands with butt inner joins
+              //    (zero overlapping round-cap knots, smooth alpha + width ramp from tail to nose)
+              const bandCount = Math.min(16, Math.max(1, Math.floor((splinePts.length - 1) / 2)));
+              const baseMaxWidth = isPinnedTrail ? 3.4 : 2.8;
+              for (let b = 0; b < bandCount; b += 1) {
+                const startIdx = Math.floor((b * (splinePts.length - 1)) / bandCount);
+                const endIdx = Math.floor(((b + 1) * (splinePts.length - 1)) / bandCount);
+                if (endIdx <= startIdx) continue;
+
+                const midProgress = splinePts[Math.floor((startIdx + endIdx) / 2)].progress;
+                // Smooth cubic ease-in for comet fade
+                const alpha = 0.08 + Math.pow(midProgress, 1.35) * 0.86;
+                const widthScale = 0.35 + midProgress * 0.65;
+
                 ctx.beginPath();
-                ctx.moveTo(px1, py1);
-                ctx.lineTo(px2, py2);
+                ctx.moveTo(splinePts[startIdx].x, splinePts[startIdx].y);
+                for (let i = startIdx + 1; i <= endIdx; i += 1) {
+                  ctx.lineTo(splinePts[i].x, splinePts[i].y);
+                }
+                ctx.lineCap = b === 0 || b === bandCount - 1 ? 'round' : 'butt';
+                ctx.lineWidth = baseMaxWidth * widthScale;
+                ctx.strokeStyle = `rgba(${rgb}, ${alpha.toFixed(3)})`;
                 ctx.stroke();
               }
             }
 
-            // Crisp nose anchor dot & halo locked directly on the subject's nose
+            // Crisp 60 FPS gliding nose anchor dot & soft halo welded to the spline tip
             const headPt = mapPointThroughPtzViewport(liveNose, activePtz);
             const hx = activeRect.x + (headPt.x / 1000) * activeRect.width;
             const hy = activeRect.y + (headPt.y / 1000) * activeRect.height;
-            const anchorColor = isWatchlistHit ? '#ef4444' : isPinnedTrail ? '#10b981' : '#38bdf8';
+
+            ctx.fillStyle = `rgba(${rgb}, 0.24)`;
+            ctx.beginPath();
+            ctx.arc(hx, hy, 9, 0, Math.PI * 2);
+            ctx.fill();
 
             ctx.fillStyle = anchorColor;
             ctx.beginPath();
-            ctx.arc(hx, hy, 4, 0, Math.PI * 2);
+            ctx.arc(hx, hy, 4.2, 0, Math.PI * 2);
             ctx.fill();
 
             ctx.strokeStyle = '#ffffff';
-            ctx.lineWidth = 1.5;
+            ctx.lineWidth = 1.6;
             ctx.beginPath();
-            ctx.arc(hx, hy, 6.5, 0, Math.PI * 2);
+            ctx.arc(hx, hy, 6.4, 0, Math.PI * 2);
             ctx.stroke();
             ctx.restore();
           });
+        } else if (trackedSubjects.length === 0 && smoothedDisplayNoseRef.current.size > 0) {
+          smoothedDisplayNoseRef.current.clear();
+          lastTrailRenderMsRef.current = 0;
         }
 
         // Draw active Restricted Perimeter Zone or in-progress drag preview
@@ -2055,6 +2194,7 @@ function CameraFeedCardInner({
             boxes.forEach((person, idx) => {
               const matchedSubj = trackedSubjects[idx];
               const isWatchlistHit = Boolean(matchedSubj?.matchedWatchlistId);
+              const isFallenVictim = Boolean(matchedSubj?.isFallenVictim);
               const mapped = mapNormalizedBoxToRect(
                 mapBoxThroughPtzViewport(person.box_2d, activePtz),
                 activeRect
@@ -2065,48 +2205,51 @@ function CameraFeedCardInner({
               const bh = Math.max(14, Math.min(height - y - 2, mapped.height));
 
               const isOccluded = Boolean(person.faceOccluded);
-              const strokeColor = isWatchlistHit
-                ? '#ef4444'
-                : isBullying
-                  ? '#f97316'
-                  : isCritical
-                    ? '#ef4444'
-                    : isOccluded
-                      ? '#38bdf8'
-                      : '#10b981';
-              const fillTint = isWatchlistHit
-                ? 'rgba(239, 68, 68, 0.18)'
-                : isCrowdView
-                  ? 'rgba(16, 185, 129, 0.06)'
+              const strokeColor =
+                isFallenVictim || isWatchlistHit
+                  ? '#ef4444'
                   : isBullying
-                    ? 'rgba(249, 115, 22, 0.14)'
+                    ? '#f97316'
                     : isCritical
-                      ? 'rgba(239, 68, 68, 0.14)'
+                      ? '#ef4444'
                       : isOccluded
-                        ? 'rgba(56, 189, 248, 0.12)'
-                        : 'rgba(16, 185, 129, 0.10)';
-              const tagBg = isWatchlistHit
-                ? 'rgba(220, 38, 38, 0.95)'
-                : isBullying
-                  ? 'rgba(194, 65, 12, 0.92)'
-                  : isCritical
-                    ? 'rgba(185, 28, 28, 0.92)'
-                    : isOccluded
-                      ? 'rgba(3, 105, 161, 0.92)'
-                      : 'rgba(6, 95, 70, 0.88)';
+                        ? '#38bdf8'
+                        : '#10b981';
+              const fillTint =
+                isFallenVictim || isWatchlistHit
+                  ? 'rgba(239, 68, 68, 0.22)'
+                  : isCrowdView
+                    ? 'rgba(16, 185, 129, 0.06)'
+                    : isBullying
+                      ? 'rgba(249, 115, 22, 0.14)'
+                      : isCritical
+                        ? 'rgba(239, 68, 68, 0.14)'
+                        : isOccluded
+                          ? 'rgba(56, 189, 248, 0.12)'
+                          : 'rgba(16, 185, 129, 0.10)';
+              const tagBg =
+                isFallenVictim || isWatchlistHit
+                  ? 'rgba(220, 38, 38, 0.96)'
+                  : isBullying
+                    ? 'rgba(194, 65, 12, 0.92)'
+                    : isCritical
+                      ? 'rgba(185, 28, 28, 0.92)'
+                      : isOccluded
+                        ? 'rgba(3, 105, 161, 0.92)'
+                        : 'rgba(6, 95, 70, 0.88)';
 
               ctx.fillStyle = fillTint;
               ctx.fillRect(x, y, bw, bh);
 
               ctx.strokeStyle = strokeColor;
-              ctx.lineWidth = isWatchlistHit ? 2.5 : isCrowdView ? 1.35 : 2;
-              if (isOccluded && !isCritical && !isWatchlistHit) {
+              ctx.lineWidth = isFallenVictim || isWatchlistHit ? 2.8 : isCrowdView ? 1.35 : 2;
+              if (isOccluded && !isCritical && !isWatchlistHit && !isFallenVictim) {
                 ctx.setLineDash([6, 4]);
               }
               ctx.strokeRect(x, y, bw, bh);
               ctx.setLineDash([]);
 
-              if (!isCrowdView || isWatchlistHit) {
+              if (!isCrowdView || isWatchlistHit || isFallenVictim) {
                 const corner = Math.min(12, Math.floor(Math.min(bw, bh) / 3));
                 ctx.lineWidth = 3.5;
                 ctx.beginPath();
@@ -2128,15 +2271,21 @@ function CameraFeedCardInner({
               const subjectPrefix = matchedSubj ? matchedSubj.id : `#${idx + 1}`;
               const dwellSuffix =
                 matchedSubj && matchedSubj.dwellSeconds > 0 ? ` · ${matchedSubj.dwellSeconds}s` : '';
-              const tagText = isWatchlistHit
-                ? `WATCHLIST: ${matchedSubj?.matchedWatchlistLabel} ${matchedSubj?.matchedSimilarity}%`
-                : isCrowdView
-                  ? `${idx + 1}`
-                  : isOccluded
-                    ? `${subjectPrefix}${dwellSuffix} · OCCLUDED`
-                    : `${subjectPrefix}${dwellSuffix} · ${person.confidence}%`;
+              const activeMatchPrefix = getWatchlistModeMeta(watchlistLabelModeRef.current).matchTagPrefix;
+              const fallenSec = matchedSubj?.fallenDurationMs
+                ? `${(matchedSubj.fallenDurationMs / 1000).toFixed(1)}s`
+                : '1.5s+';
+              const tagText = isFallenVictim
+                ? `FALLEN VICTIM · ${subjectPrefix} (${fallenSec})`
+                : isWatchlistHit
+                  ? `${activeMatchPrefix}: ${matchedSubj?.matchedWatchlistLabel} ${matchedSubj?.matchedSimilarity}%`
+                  : isCrowdView
+                    ? `${idx + 1}`
+                    : isOccluded
+                      ? `${subjectPrefix}${dwellSuffix} · OCCLUDED`
+                      : `${subjectPrefix}${dwellSuffix} · ${person.confidence}%`;
 
-              ctx.font = isCrowdView && !isWatchlistHit
+              ctx.font = isCrowdView && !isWatchlistHit && !isFallenVictim
                 ? '700 8.5px "JetBrains Mono", monospace'
                 : '600 11px "JetBrains Mono", monospace';
               const tagH = isCrowdView && !isWatchlistHit ? 12 : 18;
@@ -2584,7 +2733,7 @@ function CameraFeedCardInner({
               {pickMode === 'trail'
                 ? 'Nose Trail Picker:'
                 : pickMode === 'flag'
-                  ? 'Flag Person Picker:'
+                  ? `${watchlistMeta.flagActionLabel} Picker:`
                   : 'Auto-PTZ Target:'}
             </span>
             <span className="text-zinc-200">
@@ -3073,7 +3222,7 @@ function CameraFeedCardInner({
                       type="button"
                       onClick={() => togglePickMode('flag')}
                       aria-pressed={pickMode === 'flag'}
-                      aria-label={`Pick specific person to flag on ${camera.classroomName}`}
+                      aria-label={`Pick specific person for ${watchlistMeta.title} on ${camera.classroomName}`}
                       className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-md border transition-colors cursor-pointer whitespace-nowrap ${
                         pickMode === 'flag'
                           ? 'bg-red-600 border-red-600 text-white'
@@ -3081,7 +3230,9 @@ function CameraFeedCardInner({
                       }`}
                     >
                       <UserPlus className="w-3 h-3" aria-hidden="true" />
-                      <span>Pick Flag Person</span>
+                      <span>
+                        {watchlistLabelMode === 'missing-person' ? 'Pick Evacuee' : 'Pick Flag Person'}
+                      </span>
                     </button>
                   ) : null}
 
@@ -3102,6 +3253,28 @@ function CameraFeedCardInner({
                     <span>Heatmap</span>
                   </button>
 
+                  <select
+                    aria-label={`Perimeter zone hazard label for ${camera.classroomName}`}
+                    data-testid={`perimeter-preset-select-${camera.id}`}
+                    value={zonePreset}
+                    onChange={(e) => {
+                      const nextPreset = e.target.value as PerimeterZonePreset;
+                      setZonePreset(nextPreset);
+                      if (perimeterZone) {
+                        onUpdateCameraSettings(camera.id, {
+                          perimeterZone: { ...perimeterZone, label: nextPreset },
+                        });
+                      }
+                    }}
+                    className="px-2 py-1 text-[11px] font-medium rounded-md border border-slate-300 bg-white text-slate-700 cursor-pointer"
+                  >
+                    {PERIMETER_ZONE_PRESETS.map((preset) => (
+                      <option key={preset} value={preset}>
+                        {preset}
+                      </option>
+                    ))}
+                  </select>
+
                   <button
                     type="button"
                     onClick={() => {
@@ -3113,8 +3286,8 @@ function CameraFeedCardInner({
                     }}
                     aria-label={
                       perimeterZone && !isDrawingZone
-                        ? `Clear restricted perimeter on ${camera.classroomName}`
-                        : `Draw restricted perimeter on ${camera.classroomName}`
+                        ? `Clear ${perimeterZone.label} zone on ${camera.classroomName}`
+                        : `Draw ${zonePreset} zone on ${camera.classroomName}`
                     }
                     className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-md border transition-colors cursor-pointer whitespace-nowrap ${
                       perimeterBreached
@@ -3129,8 +3302,10 @@ function CameraFeedCardInner({
                       {isDrawingZone
                         ? 'Cancel Draw'
                         : perimeterZone
-                          ? 'Clear Zone'
-                          : 'Draw Zone'}
+                          ? `Clear (${perimeterZone.label})`
+                          : isDisasterMode
+                            ? 'Draw Hazard Zone'
+                            : 'Draw Zone'}
                     </span>
                   </button>
                 </>
@@ -3177,11 +3352,11 @@ function CameraFeedCardInner({
                       <button
                         type="button"
                         onClick={() => handleFlagLiveSubject(subj)}
-                        title={`Flag ${subj.id} to Cross-Camera Re-ID Watchlist`}
+                        title={`Add ${subj.id} to ${watchlistMeta.title}`}
                         className="inline-flex items-center gap-0.5 pl-1.5 border-l border-slate-300 text-amber-700 hover:text-amber-900 cursor-pointer font-sans font-medium"
                       >
                         <UserPlus className="w-3 h-3" aria-hidden="true" />
-                        <span>Flag</span>
+                        <span>{watchlistMeta.flagActionLabel}</span>
                       </button>
                     ) : null}
                   </div>

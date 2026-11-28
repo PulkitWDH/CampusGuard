@@ -11,9 +11,11 @@ import {
 } from './monitoringLogic';
 import {
   buildOverlappingTileGrid,
+  filterEmptyRoomMovementPhantoms,
   mapTilePredictionToFullFrame,
   mergeCrowdTileDetections,
   shouldEngageDeepCrowdGrid,
+  type TileCandidateBox,
 } from './crowdTiling';
 
 export type LocalDetectorStatus = 'idle' | 'loading' | 'ready' | 'error';
@@ -82,6 +84,56 @@ export function getLocalDetectorStatus(): {
     backend: detectorBackend,
     modelSource: detectorModelSource,
     error: detectorErrorMessage,
+  };
+}
+
+export interface OfflineResilienceStatus {
+  isOnline: boolean;
+  mode: 'online' | 'offline';
+  badgeLabel: string;
+  compactBadgeLabel: string;
+  bannerTitle: string;
+  bannerDetail: string;
+  activeBackendLabel: string;
+}
+
+/**
+ * Computes clear network & local Edge AI resilience indicators for both
+ * online hybrid (Edge + Cloud) operation and offline disaster survival mode.
+ */
+export function getOfflineResilienceStatus(
+  isOnline: boolean,
+  backend: LocalDetectorBackend = detectorBackend
+): OfflineResilienceStatus {
+  const activeBackendLabel =
+    backend === 'webgl'
+      ? 'TF.js WebGL GPU'
+      : backend === 'cpu'
+        ? 'TF.js Local CPU'
+        : 'TF.js Edge Ready';
+
+  if (isOnline) {
+    return {
+      isOnline: true,
+      mode: 'online',
+      badgeLabel: 'ONLINE: Edge + Cloud AI Synced',
+      compactBadgeLabel: 'ONLINE · Edge + Cloud',
+      bannerTitle: 'ONLINE: Edge + Cloud AI Synced',
+      bannerDetail:
+        'On-device TensorFlow.js Edge AI and background Gemini Vision situation analysis are both synced.',
+      activeBackendLabel,
+    };
+  }
+
+  return {
+    isOnline: false,
+    mode: 'offline',
+    badgeLabel: 'OFFLINE RESILIENCE MODE: 100% Local Edge AI Active',
+    compactBadgeLabel: 'OFFLINE · 100% Local Edge AI',
+    bannerTitle: 'OFFLINE RESILIENCE MODE: 100% Local Edge AI Active',
+    bannerDetail:
+      'Internet disconnected — local TensorFlow.js person tracking, stampede prevention, fallen-victim detection, perimeter zones, and acoustic distress monitoring remain 100% operational with zero cloud dependency.',
+    activeBackendLabel,
   };
 }
 
@@ -354,7 +406,9 @@ function mapPredictionsToDangerousObjects(
   width: number,
   height: number,
   tileOffsetX = 0,
-  tileScaleX = 1
+  tileScaleX = 1,
+  tileOffsetY = 0,
+  tileScaleY = 1
 ): DetectedObjectBox[] {
   const items: DetectedObjectBox[] = [];
   for (const pred of rawPredictions) {
@@ -366,12 +420,14 @@ function mapPredictionsToDangerousObjects(
     if (confidence < requiredConfidence) continue;
 
     const [bx, by, bw, bh] = pred.bbox;
-    const ymin = Math.round((Math.max(0, by) / height) * 1000);
+    const rawYmin = (Math.max(0, by) / height) * 1000;
+    const rawYmax = (Math.min(height, by + bh) / height) * 1000;
     const rawXmin = (Math.max(0, bx) / width) * 1000;
     const rawXmax = (Math.min(width, bx + bw) / width) * 1000;
     const xmin = Math.round(tileOffsetX + rawXmin * tileScaleX);
     const xmax = Math.round(tileOffsetX + rawXmax * tileScaleX);
-    const ymax = Math.round((Math.min(height, by + bh) / height) * 1000);
+    const ymin = Math.round(tileOffsetY + rawYmin * tileScaleY);
+    const ymax = Math.round(tileOffsetY + rawYmax * tileScaleY);
 
     const boxW = xmax - xmin;
     const boxH = ymax - ymin;
@@ -400,7 +456,9 @@ function mapPredictionsToOccluders(
   width: number,
   height: number,
   tileOffsetX = 0,
-  tileScaleX = 1
+  tileScaleX = 1,
+  tileOffsetY = 0,
+  tileScaleY = 1
 ): DetectedObjectBox[] {
   const items: DetectedObjectBox[] = [];
   for (const pred of rawPredictions) {
@@ -412,12 +470,14 @@ function mapPredictionsToOccluders(
     if (confidence < 24) continue;
 
     const [bx, by, bw, bh] = pred.bbox;
-    const ymin = Math.round((Math.max(0, by) / height) * 1000);
+    const rawYmin = (Math.max(0, by) / height) * 1000;
+    const rawYmax = (Math.min(height, by + bh) / height) * 1000;
     const rawXmin = (Math.max(0, bx) / width) * 1000;
     const rawXmax = (Math.min(width, bx + bw) / width) * 1000;
     const xmin = Math.round(tileOffsetX + rawXmin * tileScaleX);
     const xmax = Math.round(tileOffsetX + rawXmax * tileScaleX);
-    const ymax = Math.round((Math.min(height, by + bh) / height) * 1000);
+    const ymin = Math.round(tileOffsetY + rawYmin * tileScaleY);
+    const ymax = Math.round(tileOffsetY + rawYmax * tileScaleY);
 
     const boxW = xmax - xmin;
     const boxH = ymax - ymin;
@@ -515,10 +575,9 @@ export async function detectPeopleLocallyOnCanvas(
   const startedAt = performance.now();
   const rawMinScore = 0.15;
 
-  // COCO-SSD (lite_mobilenet_v2) internally resizes inputs to 300x300.
-  // Downscaling Pass 1 to <= 320px avoids uploading massive 1080px tensors while keeping
-  // the full 1080px source canvas razor sharp for zoomed crowd crop tiles in Pass 2 & Pass 3!
-  const pass1Scale = Math.min(1, 320 / Math.max(width, height));
+  // Preserve crisp mid-range & background people detail in Pass 1 (480px) while keeping
+  // the full 1080px source canvas razor sharp for zoomed crowd crop tiles in Pass 2 & Pass 3.
+  const pass1Scale = Math.min(1, 480 / Math.max(width, height));
   const pass1W = Math.max(64, Math.round(width * pass1Scale));
   const pass1H = Math.max(64, Math.round(height * pass1Scale));
   pass1Canvas = ensureTileCanvas(pass1Canvas, pass1W, pass1H);
@@ -532,7 +591,7 @@ export async function detectPeopleLocallyOnCanvas(
   const pass1InputW = p1Ctx ? pass1W : width;
   const pass1InputH = p1Ctx ? pass1H : height;
 
-  // Pass 1: Full-frame detection on aspect-ratio-preserved 320px canvas
+  // Pass 1: Full-frame detection on aspect-ratio-preserved 480px canvas
   const fullStart = performance.now();
   let fullRaw = await safeModelDetect(model, pass1Input, 80, rawMinScore);
   const fullPassMs = performance.now() - fullStart;
@@ -622,10 +681,11 @@ export async function detectPeopleLocallyOnCanvas(
     rows: number,
     overlap: number,
     tileMinConf: number,
-    maxPerTile: number
-  ): Promise<DetectedPersonBox[]> => {
+    maxPerTile: number,
+    sourcePass: 'quad' | 'deep'
+  ): Promise<TileCandidateBox[]> => {
     const tiles = buildOverlappingTileGrid(cols, rows, overlap);
-    const collected: DetectedPersonBox[] = [];
+    const collected: TileCandidateBox[] = [];
 
     for (const tile of tiles) {
       const sx = Math.floor((tile.xmin / 1000) * width);
@@ -652,55 +712,100 @@ export async function detectPeopleLocallyOnCanvas(
       for (const pred of tileRaw) {
         if (pred.class !== 'person' || !Number.isFinite(pred.score)) continue;
         const conf = Math.round(pred.score * 100);
-        const projected = mapTilePredictionToFullFrame(pred.bbox, conf, tw, th, tile, tileMinConf);
+        const projected = mapTilePredictionToFullFrame(
+          pred.bbox,
+          conf,
+          tw,
+          th,
+          tile,
+          tileMinConf,
+          sourcePass
+        );
         if (projected) {
           collected.push(projected);
         }
       }
 
       const tileScaleX = (tile.xmax - tile.xmin) / 1000;
-      rawWeapons.push(...mapPredictionsToDangerousObjects(tileRaw, tw, th, tile.xmin, tileScaleX));
-      rawOccluders.push(...mapPredictionsToOccluders(tileRaw, tw, th, tile.xmin, tileScaleX));
+      const tileScaleY = (tile.ymax - tile.ymin) / 1000;
+      rawWeapons.push(
+        ...mapPredictionsToDangerousObjects(
+          tileRaw,
+          tw,
+          th,
+          tile.xmin,
+          tileScaleX,
+          tile.ymin,
+          tileScaleY
+        )
+      );
+      rawOccluders.push(
+        ...mapPredictionsToOccluders(
+          tileRaw,
+          tw,
+          th,
+          tile.xmin,
+          tileScaleX,
+          tile.ymin,
+          tileScaleY
+        )
+      );
     }
 
     return collected;
   };
 
-  // Pass 2: Overlapping 2x2 Quadrant Zoom Tiles (catches groups, back-row students, and crowds)
-  const hasCloseUpDominantPerson = fullBoxes.some(
-    (b) => b.box_2d[3] - b.box_2d[1] >= 420 || b.box_2d[2] - b.box_2d[0] >= 580
-  );
-  const canRunTiles =
-    !hasCloseUpDominantPerson &&
+  // Pass 2: Overlapping 2x2 Quadrant Zoom Tiles
+  // ALWAYS run when the frame is clear & reasonably sized — EVEN if one presenter/judge stands
+  // close to the camera! Otherwise people standing behind/beside them at an exhibition booth get missed.
+  const hasCloseUpDominantPerson = fullBoxes.some((b) => {
+    const bw = b.box_2d[3] - b.box_2d[1];
+    const bh = b.box_2d[2] - b.box_2d[0];
+    return bw >= 380 || bh >= 600 || bw * bh >= 180_000;
+  });
+  const canRunQuadTiles =
     !exposure?.isBlankFrame &&
     width >= 260 &&
     height >= 180 &&
     (fullPassMs < 1500 || fullBoxes.length >= 1);
 
-  let quadBoxes: DetectedPersonBox[] = [];
-  if (canRunTiles) {
-    quadBoxes = await runTileGrid(2, 2, 0.2, Math.max(24, minConfidencePercent - 2), 45);
+  let quadBoxes: TileCandidateBox[] = [];
+  if (canRunQuadTiles) {
+    const quadMinConf = hasCloseUpDominantPerson
+      ? Math.max(38, minConfidencePercent + 8)
+      : Math.max(24, minConfidencePercent - 2);
+    quadBoxes = await runTileGrid(2, 2, 0.22, quadMinConf, 45, 'quad');
   }
 
   // Pass 3: Adaptive Deep Crowd Zoom Pyramid (4x3 on fast GPU, 3x3 on mid-tier, 3x2 on slow CPU)
   // Automatically engages whenever a dense crowd or distant small people are detected!
-  let deepCrowdBoxes: DetectedPersonBox[] = [];
+  let deepCrowdBoxes: TileCandidateBox[] = [];
   let crowdScanUsed = false;
   if (
-    canRunTiles &&
+    canRunQuadTiles &&
     options?.allowDeepCrowdScan !== false &&
     shouldEngageDeepCrowdGrid(fullBoxes, quadBoxes, hasCloseUpDominantPerson)
   ) {
     crowdScanUsed = true;
     const gridCols = fullPassMs < 400 ? 4 : 3;
     const gridRows = fullPassMs < 700 ? 3 : 2;
-    deepCrowdBoxes = await runTileGrid(gridCols, gridRows, 0.22, 22, 50);
+    deepCrowdBoxes = await runTileGrid(gridCols, gridRows, 0.22, 22, 50, 'deep');
   }
 
+  const taggedFullBoxes: TileCandidateBox[] = fullBoxes.map((b) => ({
+    ...b,
+    tileMeta: { sourcePass: 'full' },
+  }));
+  const verifiedQuadBoxes = filterEmptyRoomMovementPhantoms(
+    taggedFullBoxes,
+    quadBoxes,
+    crowdScanUsed
+  );
+
   let people: DetectedPersonBox[] =
-    crowdScanUsed || quadBoxes.length > 0
+    crowdScanUsed || verifiedQuadBoxes.length > 0
       ? mergeCrowdTileDetections(
-          [...fullBoxes, ...quadBoxes, ...deepCrowdBoxes],
+          [...taggedFullBoxes, ...verifiedQuadBoxes, ...deepCrowdBoxes],
           crowdScanUsed ? 22 : minConfidencePercent
         )
       : fullBoxes;

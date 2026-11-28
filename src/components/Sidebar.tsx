@@ -15,21 +15,41 @@ import type {
   AiEngineModel,
   ClassroomCamera,
   FacilityMode,
+  OperationMode,
   ThreatSensitivity,
+  WatchlistLabelMode,
   WatchlistSubject,
 } from '../types';
+import {
+  DEFAULT_DEMO_CROWD_THRESHOLD,
+  DEFAULT_LIVE_CROWD_THRESHOLD,
+  MAX_CROWD_DENSITY_THRESHOLD,
+  MAX_ROOM_AREA_SQM,
+  MIN_CROWD_DENSITY_THRESHOLD,
+  MIN_ROOM_AREA_SQM,
+  ROOM_SIZE_PRESETS,
+  evaluateCrowdCrushRisk,
+} from '../utils/crowdTiling';
 import {
   type CampusSummary,
   DEFAULT_DB_CALIBRATION_OFFSET,
   SOUND_ALERT_THRESHOLD_DB,
   formatFacilityLabels,
 } from '../utils/monitoringLogic';
+import { getWatchlistModeMeta } from '../utils/subjectIntelligence';
 import { AppDownloadControls } from './AppDownloadControls';
 import { GoogleSignInButton } from './GoogleSignInButton';
 
 interface SidebarProps {
   cameras: ClassroomCamera[];
   summary: CampusSummary;
+  operationMode: OperationMode;
+  crowdDensityThreshold: number;
+  onChangeCrowdDensityThreshold: (value: number) => void;
+  roomAreaSqm: number;
+  onChangeRoomAreaSqm: (areaSqm: number) => void;
+  watchlistLabelMode: WatchlistLabelMode;
+  onChangeWatchlistLabelMode: (mode: WatchlistLabelMode) => void;
   facilityMode: FacilityMode;
   onChangeFacilityMode: (mode: FacilityMode) => void;
   threatSensitivity: ThreatSensitivity;
@@ -65,6 +85,13 @@ interface SidebarProps {
 export function Sidebar({
   cameras,
   summary,
+  operationMode,
+  crowdDensityThreshold,
+  onChangeCrowdDensityThreshold,
+  roomAreaSqm,
+  onChangeRoomAreaSqm,
+  watchlistLabelMode,
+  onChangeWatchlistLabelMode,
   facilityMode,
   onChangeFacilityMode,
   threatSensitivity,
@@ -101,6 +128,26 @@ export function Sidebar({
   const [visibleLimit, setVisibleLimit] = useState(40);
   const watchlistFileRef = useRef<HTMLInputElement | null>(null);
   const labels = formatFacilityLabels(facilityMode);
+  const watchlistMeta = getWatchlistModeMeta(watchlistLabelMode);
+  const isDisaster = operationMode === 'disaster';
+  const peakCamera = useMemo(() => {
+    let best: ClassroomCamera | null = null;
+    for (const cam of cameras) {
+      if (!best || (cam.studentCount || 0) > (best.studentCount || 0)) {
+        best = cam;
+      }
+    }
+    return best;
+  }, [cameras]);
+  const peakCameraCount = peakCamera?.studentCount || 0;
+  const crowdRisk = useMemo(
+    () =>
+      evaluateCrowdCrushRisk(Math.max(peakCameraCount, summary.totalKidsCount), crowdDensityThreshold, {
+        roomAreaSqm,
+        detectedPeople: peakCamera?.lastAnalysis?.detectedPeople,
+      }),
+    [crowdDensityThreshold, peakCamera, peakCameraCount, roomAreaSqm, summary.totalKidsCount]
+  );
 
   const filteredSidebarCameras = useMemo(() => {
     const q = zoneSearch.trim().toLowerCase();
@@ -257,6 +304,132 @@ export function Sidebar({
           )}
         </section>
 
+        {/* Disaster Stampede & Crowd Crush Threshold Controls (Always visible in Disaster Mode) */}
+        {isDisaster ? (
+          <section
+            className="p-4 space-y-2.5 bg-red-50/40"
+            aria-label="Stampede and crowd crush threshold"
+            data-testid="sidebar-crowd-threshold-section"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] font-semibold text-red-900">
+                Crowd Density Threshold
+              </span>
+              <span
+                data-testid="sidebar-crowd-density-badge"
+                className={`px-1.5 py-0.5 rounded font-mono text-[10px] font-semibold ${
+                  crowdRisk.status === 'CRITICAL CRUSH RISK'
+                    ? 'bg-red-600 text-white'
+                    : crowdRisk.status === 'ELEVATED'
+                      ? 'bg-amber-500 text-white'
+                      : 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                }`}
+              >
+                {crowdRisk.status}
+              </span>
+            </div>
+
+            <div className="space-y-2.5">
+              {/* Room Floor Area (m²) so big halls stay SAFE when people are spread out */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between gap-1 text-[11px]">
+                  <label htmlFor="sidebar-room-area" className="text-slate-600 whitespace-nowrap">
+                    Room Area
+                  </label>
+                  <span
+                    data-testid="sidebar-room-area-value"
+                    className="font-mono font-semibold text-slate-900 tabular-nums whitespace-nowrap"
+                  >
+                    {roomAreaSqm} m² · {(crowdRisk.densityPerSqm ?? 0).toFixed(2)} p/m²
+                  </span>
+                </div>
+                <input
+                  id="sidebar-room-area"
+                  data-testid="sidebar-room-area-slider"
+                  type="range"
+                  min={MIN_ROOM_AREA_SQM}
+                  max={MAX_ROOM_AREA_SQM}
+                  step={5}
+                  value={roomAreaSqm}
+                  onChange={(e) => onChangeRoomAreaSqm(Number(e.target.value))}
+                  className="w-full accent-red-600 cursor-pointer"
+                />
+                <div className="grid grid-cols-2 gap-1">
+                  {ROOM_SIZE_PRESETS.map((preset) => (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      onClick={() => onChangeRoomAreaSqm(preset.areaSqm)}
+                      className={`py-1 px-1.5 text-[10px] font-mono font-semibold rounded border cursor-pointer transition-colors ${
+                        roomAreaSqm === preset.areaSqm
+                          ? 'bg-slate-900 text-white border-slate-900'
+                          : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'
+                      }`}
+                    >
+                      {preset.shortLabel}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-1.5 pt-1 border-t border-red-200/60">
+                <div className="flex items-center justify-between text-[11px]">
+                  <label htmlFor="sidebar-crowd-threshold" className="text-slate-600">
+                    Effective Safe Cap
+                  </label>
+                  <span
+                    data-testid="sidebar-crowd-threshold-value"
+                    className="font-mono font-semibold text-slate-900 tabular-nums"
+                  >
+                    {crowdRisk.threshold} people
+                  </span>
+                </div>
+                <input
+                  id="sidebar-crowd-threshold"
+                  data-testid="sidebar-crowd-threshold-slider"
+                  type="range"
+                  min={MIN_CROWD_DENSITY_THRESHOLD}
+                  max={MAX_CROWD_DENSITY_THRESHOLD}
+                  step={1}
+                  value={crowdDensityThreshold}
+                  onChange={(e) => onChangeCrowdDensityThreshold(Number(e.target.value))}
+                  className="w-full accent-red-600 cursor-pointer"
+                />
+                <div className="flex items-center justify-between gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onChangeCrowdDensityThreshold(DEFAULT_DEMO_CROWD_THRESHOLD);
+                      onChangeRoomAreaSqm(15);
+                    }}
+                    className={`flex-1 py-1 text-[10px] font-mono font-semibold rounded border cursor-pointer transition-colors ${
+                      crowdDensityThreshold === DEFAULT_DEMO_CROWD_THRESHOLD && roomAreaSqm <= 20
+                        ? 'bg-slate-900 text-white border-slate-900'
+                        : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'
+                    }`}
+                  >
+                    15 (Demo Booth)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onChangeCrowdDensityThreshold(DEFAULT_LIVE_CROWD_THRESHOLD);
+                      onChangeRoomAreaSqm(150);
+                    }}
+                    className={`flex-1 py-1 text-[10px] font-mono font-semibold rounded border cursor-pointer transition-colors ${
+                      roomAreaSqm === 150
+                        ? 'bg-slate-900 text-white border-slate-900'
+                        : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'
+                    }`}
+                  >
+                    150 m² Hall
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+        ) : null}
+
         {/* Advanced Settings Drawer (Collapsed by default so UI stays ultra-simple) */}
         <section className="p-4" aria-label="Advanced settings">
           <button
@@ -334,14 +507,56 @@ export function Sidebar({
                 </div>
               </div>
 
-              {/* Watchlist Re-ID */}
-              <div className="pt-3 border-t border-slate-200 space-y-2" aria-label="Subject Re-ID Watchlist">
-                <div className="flex items-center justify-between">
-                  <span className="text-[11px] font-semibold text-slate-600">Watchlist Re-ID</span>
-                  <span className="text-[11px] font-mono text-slate-400 tabular-nums">
+              {/* Watchlist / Missing Person Re-ID */}
+              <div className="pt-3 border-t border-slate-200 space-y-2" aria-label={watchlistMeta.title}>
+                <div className="flex items-center justify-between gap-1">
+                  <span
+                    data-testid="sidebar-watchlist-title"
+                    className="text-[11px] font-semibold text-slate-700 truncate"
+                  >
+                    {watchlistMeta.title}
+                  </span>
+                  <span className="text-[11px] font-mono text-slate-400 tabular-nums shrink-0">
                     {watchlist.length}
                   </span>
                 </div>
+
+                <div
+                  role="group"
+                  aria-label="Watchlist or Missing Person Re-ID label mode"
+                  className="grid grid-cols-2 gap-1 p-0.5 bg-slate-100 border border-slate-200 rounded-md"
+                >
+                  <button
+                    type="button"
+                    data-testid="watchlist-label-security"
+                    aria-pressed={watchlistLabelMode === 'security'}
+                    onClick={() => onChangeWatchlistLabelMode('security')}
+                    className={`py-1 px-1 text-[10px] font-medium rounded transition-colors cursor-pointer truncate ${
+                      watchlistLabelMode === 'security'
+                        ? 'bg-white text-slate-900 shadow-2xs font-semibold'
+                        : 'text-slate-500 hover:text-slate-900'
+                    }`}
+                  >
+                    Security Watchlist
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="watchlist-label-missing"
+                    aria-pressed={watchlistLabelMode === 'missing-person'}
+                    onClick={() => onChangeWatchlistLabelMode('missing-person')}
+                    className={`py-1 px-1 text-[10px] font-medium rounded transition-colors cursor-pointer truncate ${
+                      watchlistLabelMode === 'missing-person'
+                        ? 'bg-white text-red-700 shadow-2xs font-semibold'
+                        : 'text-slate-500 hover:text-slate-900'
+                    }`}
+                  >
+                    Missing / Evacuee
+                  </button>
+                </div>
+
+                <p className="text-[10px] text-slate-500 leading-snug">
+                  {watchlistMeta.description}
+                </p>
 
                 <input
                   ref={watchlistFileRef}
@@ -352,7 +567,13 @@ export function Sidebar({
                     const file = e.target.files?.[0];
                     if (file) {
                       const baseName = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim();
-                      onEnrollWatchlistPhoto(file, baseName || `Target ${watchlist.length + 1}`);
+                      onEnrollWatchlistPhoto(
+                        file,
+                        baseName ||
+                          (watchlistLabelMode === 'missing-person'
+                            ? `Evacuee ${watchlist.length + 1}`
+                            : `Target ${watchlist.length + 1}`)
+                      );
                     }
                     e.target.value = '';
                   }}
@@ -364,7 +585,7 @@ export function Sidebar({
                   className="w-full inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 transition-colors cursor-pointer"
                 >
                   <UserPlus className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                  <span>Enroll Photo</span>
+                  <span>{watchlistMeta.enrollButtonLabel}</span>
                 </button>
 
                 {watchlist.length > 0 ? (

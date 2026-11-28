@@ -2,12 +2,28 @@ import type {
   DetectedPersonBox,
   DvrEvidenceFrame,
   ForensicEvidenceCase,
+  OperationMode,
   PerimeterZone,
+  PerimeterZonePreset,
 } from '../types';
 import type { ContainDrawRect } from './monitoringLogic';
 
 export const HEATMAP_COLS = 32;
 export const HEATMAP_ROWS = 18;
+
+export const PERIMETER_ZONE_PRESETS: readonly PerimeterZonePreset[] = [
+  'Collapsed Structure Zone',
+  'Flood / Live Wire Hazard',
+  'Fire / Smoke Exclusion Zone',
+  'Evacuation Bottleneck',
+  'Restricted Area',
+] as const;
+
+export function getDefaultPerimeterPreset(
+  operationMode: OperationMode = 'school'
+): PerimeterZonePreset {
+  return operationMode === 'disaster' ? 'Collapsed Structure Zone' : 'Restricted Area';
+}
 
 /**
  * Converts pointer drag start/end pixels on the display canvas into a normalized
@@ -18,7 +34,7 @@ export function normalizeDragToPerimeterZone(
   startPx: { x: number; y: number },
   endPx: { x: number; y: number },
   drawRect: ContainDrawRect,
-  label = 'Restricted Perimeter'
+  label: string = 'Restricted Area'
 ): PerimeterZone | null {
   if (drawRect.width <= 0 || drawRect.height <= 0) return null;
 

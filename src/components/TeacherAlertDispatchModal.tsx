@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Mail, MessageSquareWarning, Send, X } from 'lucide-react';
-import type { IncidentAlert, WorkspaceCourse } from '../types';
+import type { IncidentAlert, OperationMode, WorkspaceCourse } from '../types';
+import { formatOperationModeBranding } from '../utils/monitoringLogic';
 import { GoogleSignInButton } from './GoogleSignInButton';
 
 interface TeacherAlertDispatchModalProps {
@@ -9,6 +10,7 @@ interface TeacherAlertDispatchModalProps {
   courses: WorkspaceCourse[];
   linkedCourseId: string;
   hasAccessToken: boolean;
+  operationMode?: OperationMode;
   onGoogleSignIn: () => Promise<void>;
   onConfirmSendGmail: (params: {
     alertId: string;
@@ -30,11 +32,14 @@ export function TeacherAlertDispatchModal({
   courses,
   linkedCourseId,
   hasAccessToken,
+  operationMode = 'school',
   onGoogleSignIn,
   onConfirmSendGmail,
   onConfirmPostClassroom,
   onClose,
 }: TeacherAlertDispatchModalProps) {
+  const isDisaster = operationMode === 'disaster';
+  const branding = formatOperationModeBranding(operationMode);
   const [recipientEmail, setRecipientEmail] = useState(defaultTeacherEmail);
   const [subject, setSubject] = useState('');
   const [body, setBody] = useState('');
@@ -113,7 +118,7 @@ export function TeacherAlertDispatchModal({
           <div className="flex items-center gap-2 min-w-0">
             <MessageSquareWarning className="w-5 h-5 text-red-600 shrink-0" aria-hidden="true" />
             <h2 id="teacher-dispatch-title" className="text-base font-semibold text-slate-900 truncate">
-              Confirm Teacher Alert Dispatch
+              {branding.dispatchModalTitle}
             </h2>
           </div>
           <button
@@ -173,14 +178,14 @@ export function TeacherAlertDispatchModal({
           {channel === 'gmail' ? (
             <div>
               <label htmlFor="teacher-email-input" className="block text-xs font-medium text-slate-700 mb-1">
-                Teacher Recipient Email
+                {branding.recipientLabel}
               </label>
               <input
                 id="teacher-email-input"
                 type="email"
                 value={recipientEmail}
                 onChange={(e) => setRecipientEmail(e.target.value)}
-                placeholder="teacher@school.edu"
+                placeholder={isDisaster ? 'rescue-command@emergency.gov' : 'teacher@school.edu'}
                 className="w-full text-sm px-3 py-2 border border-slate-300 bg-slate-50 rounded-lg text-slate-900 placeholder:text-slate-500 focus-visible:outline-2 focus-visible:outline-blue-500"
               />
             </div>
@@ -223,7 +228,7 @@ export function TeacherAlertDispatchModal({
 
           <div>
             <label htmlFor="alert-body-textarea" className="block text-xs font-medium text-slate-700 mb-1">
-              Alert Message to Teacher
+              {isDisaster ? 'Emergency Command & Rescue Directive' : 'Alert Message to Teacher'}
             </label>
             <textarea
               id="alert-body-textarea"
@@ -262,7 +267,9 @@ export function TeacherAlertDispatchModal({
               {submitting
                 ? 'Sending...'
                 : channel === 'gmail'
-                  ? 'Confirm & Send Gmail Alert'
+                  ? isDisaster
+                    ? 'Confirm & Dispatch Rescue Email'
+                    : 'Confirm & Send Gmail Alert'
                   : 'Confirm & Post Announcement'}
             </span>
           </button>

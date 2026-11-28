@@ -1,19 +1,29 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Activity,
+  AlertTriangle,
   Bluetooth,
   Cable,
   Camera,
   ChevronLeft,
   ChevronRight,
   Columns2,
+  FileLock2,
   Grid3X3,
+  HeartPulse,
   LayoutGrid,
+  Megaphone,
   Mic,
+  RefreshCw,
   RotateCw,
   Search,
+  Siren,
+  Sparkles,
   Square,
   SwitchCamera,
   Upload,
+  Users,
+  Volume2,
   Wifi,
 } from 'lucide-react';
 import type { User } from 'firebase/auth';
@@ -29,15 +39,19 @@ import {
   type RealtimeThreatEvent,
 } from './components/CameraFeedCard';
 import { DedicatedCameraPanel } from './components/DedicatedCameraPanel';
+import { DisasterCommandCenter } from './components/DisasterCommandCenter';
 import { EvidenceVaultView } from './components/EvidenceVaultView';
 import { LiveIncidentRail } from './components/LiveIncidentRail';
 import { MobileBottomNav } from './components/MobileBottomNav';
 import { NotificationBanner } from './components/NotificationBanner';
+import { PaEvacuationDispatchModal } from './components/PaEvacuationDispatchModal';
 import { Sidebar } from './components/Sidebar';
 import { TeacherAlertDispatchModal } from './components/TeacherAlertDispatchModal';
 import { TopBar } from './components/TopBar';
 import { WorkspaceTeacherHub } from './components/WorkspaceTeacherHub';
+import { useOnlineStatus } from './hooks/usePWAInstall';
 import {
+  connectGoogleWorkspace,
   deleteZoneFromFirestore,
   getAccessToken,
   getFirebaseIdToken,
@@ -47,6 +61,7 @@ import {
   saveIncidentToFirestore,
   saveZoneToFirestore,
   subscribeToUserIncidents,
+  subscribeToUserZones,
   syncUserProfileToFirestore,
   updateIncidentInFirestore,
 } from './lib/firebase';
@@ -66,11 +81,15 @@ import type {
   ClassroomCamera,
   DetectedObjectBox,
   DetectedPersonBox,
+  DisasterSituationReport,
   FacilityMode,
   ForensicEvidenceCase,
   IncidentAlert,
+  OperationMode,
   PerimeterZone,
   ThreatSensitivity,
+  TrackedSubject,
+  WatchlistLabelMode,
   WatchlistSubject,
   WorkspaceCourse,
   WorkspaceGmailMessage,
@@ -90,7 +109,22 @@ import {
   requestDeviceLandscapeLock,
 } from './utils/mobileLayout';
 import { ensureLocalPersonDetector } from './utils/localPersonDetector';
-import { extractAppearanceSignature } from './utils/subjectIntelligence';
+import {
+  DEFAULT_DEMO_CROWD_THRESHOLD,
+  DEFAULT_LIVE_CROWD_THRESHOLD,
+  DEFAULT_ROOM_AREA_SQM,
+  MAX_CROWD_DENSITY_THRESHOLD,
+  MAX_ROOM_AREA_SQM,
+  MIN_CROWD_DENSITY_THRESHOLD,
+  MIN_ROOM_AREA_SQM,
+  ROOM_SIZE_PRESETS,
+  evaluateCrowdCrushRisk,
+} from './utils/crowdTiling';
+import {
+  extractAppearanceSignature,
+  getDefaultWatchlistLabelMode,
+  getWatchlistModeMeta,
+} from './utils/subjectIntelligence';
 import { sealForensicEvidenceCase } from './utils/tacticalForensics';
 import { openRawMediaStream, playAlertChime, sendBrowserNotification } from './utils/mediaCapture';
 import {
@@ -101,17 +135,32 @@ import {
   computeClassAttendance,
   deriveSafetyStatus,
   evaluateAttendanceReportAlert,
+  evaluateFallenVictimAlert,
   evaluateFightNotification,
   evaluateLocalSafetyAnalysis,
   evaluateSoundThresholdAlert,
+  evaluateStampedeRiskAlert,
   evaluateSustainedSoundDuration,
   evaluateVoiceCueThreatAlert,
   formatFacilityLabels,
+  formatOperationModeBranding,
   getLocalDateKey,
   parseSafeJsonText,
   shouldRunScheduledAttendance,
   shouldTriggerAudioSpikeScan,
 } from './utils/monitoringLogic';
+import {
+  type PaBroadcastLogEntry,
+  type PaPresetId,
+  type PaSirenProfile,
+  type RescueUnitType,
+  broadcastPaAnnouncement,
+  buildPaAnnouncementText,
+  createPaBroadcastLogEntry,
+  inferPaPresetForAlert,
+  stopAllPaAudio,
+  subscribePaAudioState,
+} from './utils/paSpeakerEngine';
 
 const STORAGE_CAMERAS_KEY = 'campusguard_cameras_v2';
 const STORAGE_ALERTS_KEY = 'campusguard_alerts_v2';
@@ -120,6 +169,54 @@ const STORAGE_TEACHER_EMAIL_KEY = 'campusguard_teacher_email_v1';
 const STORAGE_DB_OFFSET_KEY = 'campusguard_db_offset_v1';
 const STORAGE_SENSITIVITY_KEY = 'campusguard_threat_sensitivity_v1';
 const STORAGE_WATCHLIST_KEY = 'campusguard_watchlist_v1';
+const STORAGE_OPERATION_MODE_KEY = 'campusguard_operation_mode_v1';
+const STORAGE_CROWD_THRESHOLD_KEY = 'campusguard_crowd_threshold_v1';
+const STORAGE_ROOM_AREA_KEY = 'campusguard_room_area_sqm_v1';
+
+function loadSavedOperationMode(): OperationMode {
+  if (typeof window === 'undefined') return 'school';
+  try {
+    return localStorage.getItem(STORAGE_OPERATION_MODE_KEY) === 'disaster'
+      ? 'disaster'
+      : 'school';
+  } catch {
+    return 'school';
+  }
+}
+
+function loadSavedCrowdThreshold(): number {
+  if (typeof window === 'undefined') return DEFAULT_DEMO_CROWD_THRESHOLD;
+  try {
+    const raw = localStorage.getItem(STORAGE_CROWD_THRESHOLD_KEY);
+    if (!raw) return DEFAULT_DEMO_CROWD_THRESHOLD;
+    const parsed = Number(raw);
+    if (
+      Number.isFinite(parsed) &&
+      parsed >= MIN_CROWD_DENSITY_THRESHOLD &&
+      parsed <= MAX_CROWD_DENSITY_THRESHOLD
+    ) {
+      return Math.round(parsed);
+    }
+    return DEFAULT_DEMO_CROWD_THRESHOLD;
+  } catch {
+    return DEFAULT_DEMO_CROWD_THRESHOLD;
+  }
+}
+
+function loadSavedRoomAreaSqm(): number {
+  if (typeof window === 'undefined') return DEFAULT_ROOM_AREA_SQM;
+  try {
+    const raw = localStorage.getItem(STORAGE_ROOM_AREA_KEY);
+    if (!raw) return DEFAULT_ROOM_AREA_SQM;
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed >= MIN_ROOM_AREA_SQM && parsed <= MAX_ROOM_AREA_SQM) {
+      return Math.round(parsed);
+    }
+    return DEFAULT_ROOM_AREA_SQM;
+  } catch {
+    return DEFAULT_ROOM_AREA_SQM;
+  }
+}
 
 function loadSavedWatchlist(): WatchlistSubject[] {
   if (typeof window === 'undefined') return [];
@@ -228,13 +325,37 @@ export default function App() {
   const [alerts, setAlerts] = useState<IncidentAlert[]>(loadSavedAlerts);
   const [popupAlerts, setPopupAlerts] = useState<IncidentAlert[]>([]);
   const [facilityMode, setFacilityMode] = useState<FacilityMode>(loadSavedFacilityMode);
+  const [operationMode, setOperationMode] = useState<OperationMode>(loadSavedOperationMode);
+  const [crowdDensityThreshold, setCrowdDensityThreshold] = useState<number>(
+    loadSavedCrowdThreshold
+  );
+  const [watchlistLabelMode, setWatchlistLabelMode] = useState<WatchlistLabelMode>(() =>
+    getDefaultWatchlistLabelMode(loadSavedOperationMode())
+  );
+  const isOnline = useOnlineStatus();
   const [themeMode, setThemeMode] = useState<'light' | 'dark'>(loadSavedThemeMode);
   const [threatSensitivity, setThreatSensitivity] = useState<ThreatSensitivity>(
     loadSavedThreatSensitivity
   );
   const [discoveredBluetooth, setDiscoveredBluetooth] = useState<BluetoothDeviceCandidate[]>([]);
   const lastVoiceCueAlertAtRef = useRef<Record<string, number>>({});
+  const lastStampedeAlertAtRef = useRef<Record<string, number>>({});
+  const lastFallenAlertAtRef = useRef<Record<string, number>>({});
+  const lastSituationReportAtRef = useRef<number>(0);
+  const subjectTelemetryByCamRef = useRef<
+    Record<string, { peakTrailVelocity: number; fallenCount: number }>
+  >({});
+  const [peakTrailVelocity, setPeakTrailVelocity] = useState<number>(0);
+  const [fallenVictimCount, setFallenVictimCount] = useState<number>(0);
+  const [situationReport, setSituationReport] = useState<DisasterSituationReport | null>(null);
+  const [situationReportLoading, setSituationReportLoading] = useState<boolean>(false);
+  const lastAutoPaAtRef = useRef<Record<string, number>>({});
   const loudHoldStartByCamRef = useRef<Record<string, number | null>>({});
+  const [autoPaEnabled, setAutoPaEnabled] = useState(true);
+  const [paVolume, setPaVolume] = useState(0.85);
+  const [paIsOnAir, setPaIsOnAir] = useState(false);
+  const [paActiveText, setPaActiveText] = useState<string | null>(null);
+  const [paLogs, setPaLogs] = useState<PaBroadcastLogEntry[]>([]);
   const [activeView, setActiveView] = useState<ActiveWorkspaceView>('grid');
   const [focusedCameraId, setFocusedCameraId] = useState<string | null>(null);
   const [isScannerOpen, setIsScannerOpen] = useState(false);
@@ -398,6 +519,18 @@ export default function App() {
     teacherEmailRef.current = defaultTeacherEmail;
   }, [defaultTeacherEmail]);
 
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
+  const facilityModeRef = useRef<FacilityMode>(facilityMode);
+  useEffect(() => {
+    facilityModeRef.current = facilityMode;
+  }, [facilityMode]);
+
+  const linkedCourseIdRef = useRef<string>(linkedCourseId);
+  useEffect(() => {
+    linkedCourseIdRef.current = linkedCourseId;
+  }, [linkedCourseId]);
+
   const courseNameRef = useRef<string>(linkedCourseName);
   useEffect(() => {
     courseNameRef.current = linkedCourseName;
@@ -524,30 +657,35 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const unsubscribe = initAuth((user, token) => {
-      setCurrentUser(user);
-      setHasAccessToken(Boolean(token));
-      if (user) {
-        void syncUserProfileToFirestore(user, {
-          defaultTeacherEmail: teacherEmailRef.current || undefined,
-          linkedCourseId: linkedCourseId || undefined,
-          linkedCourseName: courseNameRef.current || undefined,
-          facilityMode,
-        }).catch(() => {});
-        void syncBackendWorkspaceState(user);
-      } else {
-        setCourses([]);
-        setGmailMessages([]);
-        setCourseTeachers([]);
-        setCourseStudentCount(null);
+    const unsubscribe = initAuth(
+      (user, token) => {
+        setCurrentUser(user);
+        setHasAccessToken(Boolean(token));
+        if (user) {
+          void syncUserProfileToFirestore(user, {
+            defaultTeacherEmail: teacherEmailRef.current || undefined,
+            linkedCourseId: linkedCourseIdRef.current || undefined,
+            linkedCourseName: courseNameRef.current || undefined,
+            facilityMode: facilityModeRef.current,
+          }).catch(() => {});
+          void syncBackendWorkspaceState(user);
+        } else {
+          setCourses([]);
+          setGmailMessages([]);
+          setCourseTeachers([]);
+          setCourseStudentCount(null);
+        }
+      },
+      () => {
+        setIsAuthReady(true);
       }
-    });
+    );
     return () => unsubscribe();
-  }, [facilityMode, linkedCourseId, syncBackendWorkspaceState]);
+  }, [syncBackendWorkspaceState]);
 
   useEffect(() => {
-    if (!currentUser) return;
-    const unsub = subscribeToUserIncidents(currentUser.uid, (firestoreIncidents) => {
+    if (!isAuthReady || !currentUser) return;
+    const unsubIncidents = subscribeToUserIncidents(currentUser.uid, (firestoreIncidents) => {
       if (firestoreIncidents.length > 0) {
         setAlerts((prev) => {
           const merged = new Map<string, IncidentAlert>();
@@ -561,14 +699,136 @@ export default function App() {
         });
       }
     });
-    return () => unsub();
-  }, [currentUser]);
+    const unsubZones = subscribeToUserZones(currentUser.uid, (firestoreZones) => {
+      if (firestoreZones.length > 0 && camerasRef.current.length === 0) {
+        setCameras(firestoreZones);
+      }
+    });
+    return () => {
+      unsubIncidents();
+      unsubZones();
+    };
+  }, [isAuthReady, currentUser]);
+
+  useEffect(() => {
+    const unsub = subscribePaAudioState((isSpeaking, activeText) => {
+      setPaIsOnAir(isSpeaking);
+      setPaActiveText(activeText);
+    });
+    return () => {
+      unsub();
+      stopAllPaAudio();
+    };
+  }, []);
+
+  const handleBroadcastPa = useCallback(
+    (params: {
+      alertId?: string;
+      zoneName: string;
+      presetId: PaPresetId | 'custom';
+      message: string;
+      sirenProfile: PaSirenProfile | 'none';
+      repeatCount: 1 | 2;
+      unitsDispatched: RescueUnitType[];
+      triggeredBy?: 'manual' | 'auto-pa';
+    }) => {
+      const triggeredBy = params.triggeredBy ?? 'manual';
+      void broadcastPaAnnouncement({
+        text: params.message,
+        sirenProfile: params.sirenProfile,
+        volume: paVolume,
+        repeatCount: params.repeatCount,
+      });
+      const entry = createPaBroadcastLogEntry({
+        zoneName: params.zoneName,
+        presetId: params.presetId,
+        message: params.message,
+        sirenProfile: params.sirenProfile,
+        unitsDispatched: params.unitsDispatched,
+        triggeredBy,
+      });
+      setPaLogs((prev) => [entry, ...prev].slice(0, 40));
+
+      if (params.alertId) {
+        const nowIso = new Date().toISOString();
+        setAlerts((prev) =>
+          prev.map((a) =>
+            a.id === params.alertId
+              ? { ...a, teacherNotified: true, notifiedAt: nowIso }
+              : a
+          )
+        );
+        if (currentUserRef.current) {
+          void updateIncidentInFirestore(currentUserRef.current.uid, params.alertId, {
+            teacherNotified: true,
+          }).catch(() => {});
+        }
+      }
+
+      setStatusNotice(
+        `PA Loudspeaker broadcasting to ${params.zoneName}${
+          params.unitsDispatched.length > 0
+            ? ` · Units: ${params.unitsDispatched.join(', ')}`
+            : ''
+        }.`
+      );
+    },
+    [paVolume]
+  );
+
+  const handleStopPaAudio = useCallback(() => {
+    stopAllPaAudio();
+    setStatusNotice('PA Loudspeaker siren and voice broadcast silenced.');
+  }, []);
+
+  const triggerAutoPaForAlert = useCallback(
+    (alert: IncidentAlert) => {
+      if (operationMode !== 'disaster' || !autoPaEnabled) return;
+      const nowMs = Date.now();
+      const key = `${alert.cameraId}:${alert.threatCategory ?? alert.alertType ?? 'alert'}`;
+      const lastMs = lastAutoPaAtRef.current[key] ?? 0;
+      if (lastMs > 0 && nowMs - lastMs < 25_000) return;
+      lastAutoPaAtRef.current[key] = nowMs;
+
+      const presetId = inferPaPresetForAlert(alert);
+      const zoneLabel = `${alert.classroomName} (${alert.cameraCode})`;
+      const message = buildPaAnnouncementText(presetId, zoneLabel);
+      const sirenProfile: PaSirenProfile =
+        presetId === 'fire'
+          ? 'fire-alarm'
+          : presetId === 'stampede' || presetId === 'earthquake'
+            ? 'evacuation-sweep'
+            : presetId === 'all-clear'
+              ? 'all-clear-chime'
+              : 'attention-chime';
+
+      handleBroadcastPa({
+        alertId: alert.id,
+        zoneName: zoneLabel,
+        presetId,
+        message,
+        sirenProfile,
+        repeatCount: 1,
+        unitsDispatched:
+          presetId === 'fire'
+            ? ['Fire & Rescue', 'Venue Security']
+            : ['Crowd Control', 'Medical / EMS'],
+        triggeredBy: 'auto-pa',
+      });
+    },
+    [autoPaEnabled, handleBroadcastPa, operationMode]
+  );
 
   const handleGoogleSignIn = useCallback(async () => {
     setIsSigningIn(true);
     setWorkspaceError(null);
+    setGlobalError(null);
     try {
-      const { user, accessToken } = await googleSignIn();
+      const result = await googleSignIn();
+      if (!result) {
+        return;
+      }
+      const { user, accessToken } = result;
       setCurrentUser(user);
       setHasAccessToken(Boolean(accessToken));
       await syncUserProfileToFirestore(user, {
@@ -578,6 +838,7 @@ export default function App() {
         facilityMode,
       }).catch(() => {});
       void syncBackendWorkspaceState(user);
+      setStatusNotice(`Signed in as ${user.displayName || user.email}. Cloud sync active.`);
       if (accessToken) {
         await syncWorkspaceFromGoogle(accessToken);
       }
@@ -590,12 +851,38 @@ export default function App() {
     }
   }, [facilityMode, linkedCourseId, syncBackendWorkspaceState, syncWorkspaceFromGoogle]);
 
+  const handleConnectGoogleWorkspace = useCallback(async () => {
+    setIsSigningIn(true);
+    setWorkspaceError(null);
+    try {
+      const result = await connectGoogleWorkspace();
+      if (!result) {
+        return;
+      }
+      setCurrentUser(result.user);
+      setHasAccessToken(Boolean(result.accessToken));
+      if (result.accessToken) {
+        await syncWorkspaceFromGoogle(result.accessToken);
+        setStatusNotice('Google Classroom & Gmail linked for School Teacher alerts.');
+      }
+    } catch (err) {
+      const msg =
+        err instanceof Error
+          ? err.message
+          : 'Unable to link Google Classroom & Gmail permissions.';
+      setWorkspaceError(msg);
+    } finally {
+      setIsSigningIn(false);
+    }
+  }, [syncWorkspaceFromGoogle]);
+
   const handleSignOut = useCallback(async () => {
     await logout();
     setCurrentUser(null);
     setHasAccessToken(false);
     setCourses([]);
     setGmailMessages([]);
+    setStatusNotice('Signed out. Local Edge AI monitoring continues offline.');
   }, []);
 
   const persistZoneAsync = useCallback(async (camera: ClassroomCamera) => {
@@ -726,11 +1013,71 @@ export default function App() {
     }
   }, [themeMode]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_OPERATION_MODE_KEY, operationMode);
+    } catch {
+      // ignore storage errors
+    }
+  }, [operationMode]);
+
+  const [roomAreaSqm, setRoomAreaSqm] = useState<number>(loadSavedRoomAreaSqm);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_CROWD_THRESHOLD_KEY, String(crowdDensityThreshold));
+    } catch {
+      // ignore storage errors
+    }
+  }, [crowdDensityThreshold]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_ROOM_AREA_KEY, String(roomAreaSqm));
+    } catch {
+      // ignore storage errors
+    }
+  }, [roomAreaSqm]);
+
+  const handleChangeOperationMode = useCallback((nextMode: OperationMode) => {
+    setOperationMode(nextMode);
+    setWatchlistLabelMode(getDefaultWatchlistLabelMode(nextMode));
+  }, []);
+
   const labels = useMemo(() => formatFacilityLabels(facilityMode), [facilityMode]);
+  const operationBranding = useMemo(
+    () => formatOperationModeBranding(operationMode, facilityMode),
+    [operationMode, facilityMode]
+  );
 
   const summary = useMemo(
     () => computeCampusSummary(cameras, alerts),
     [cameras, alerts]
+  );
+
+  const peakCrowdCamera = useMemo(() => {
+    let best: ClassroomCamera | null = null;
+    for (const cam of cameras) {
+      if (!best || cam.studentCount > best.studentCount) {
+        best = cam;
+      }
+    }
+    return best;
+  }, [cameras]);
+
+  const liveCrowdCount = useMemo(
+    () => Math.max(peakCrowdCamera?.studentCount ?? 0, summary.totalKidsCount),
+    [peakCrowdCamera, summary.totalKidsCount]
+  );
+
+  const crowdRisk = useMemo(
+    () =>
+      evaluateCrowdCrushRisk(liveCrowdCount, crowdDensityThreshold, {
+        roomAreaSqm,
+        detectedPeople: peakCrowdCamera?.lastAnalysis?.detectedPeople,
+        maxTrailVelocityNormPerSec: peakTrailVelocity,
+      }),
+    [crowdDensityThreshold, liveCrowdCount, peakCrowdCamera, peakTrailVelocity, roomAreaSqm]
   );
 
   const latestUnacknowledgedAlert = useMemo(
@@ -866,14 +1213,17 @@ export default function App() {
         const currentPeople = target.lastAnalysis?.detectedPeople ?? [];
         const currentObjects =
           capturePayload?.detectedObjects ?? target.lastAnalysis?.detectedObjects ?? [];
+        const isStillPhoto = target.customMediaType === 'image';
         const localResult = evaluateLocalSafetyAnalysis({
           detectedPeople: currentPeople,
           detectedObjects: currentObjects,
-          frameDeltaPercent: capturePayload?.liveMotionPercent ?? 0,
-          voiceTranscript: transcriptToSend,
-          audioLevel: audioLevelToSend,
+          frameDeltaPercent: isStillPhoto ? 0 : capturePayload?.liveMotionPercent ?? 0,
+          voiceTranscript: isStillPhoto ? '' : transcriptToSend,
+          audioLevel: isStillPhoto ? 0 : audioLevelToSend,
           facilityMode,
-          audioSpikeDetected: options?.audioSpikeDetected,
+          operationMode,
+          isStillImage: isStillPhoto,
+          audioSpikeDetected: isStillPhoto ? false : options?.audioSpikeDetected,
           sensitivity: threatSensitivity,
         });
         const nextStatus = deriveSafetyStatus(localResult);
@@ -1123,21 +1473,15 @@ export default function App() {
         }
 
         const shouldPauseOnAuth = status === 401 || status === 403;
-        const finalMessage = shouldPauseOnAuth
-          ? `${baseMessage} Autonomous scanning paused for this camera.`
-          : baseMessage;
-        setGlobalError(finalMessage);
-        setCameras((prev) =>
-          prev.map((cam) =>
-            cam.id === cameraId
-              ? {
-                  ...cam,
-                  isAnalyzing: false,
-                  autoAiEnabled: shouldPauseOnAuth ? false : cam.autoAiEnabled,
-                  errorMessage: finalMessage,
-                }
-              : cam
-          )
+        if (isAutoTrigger || shouldPauseOnAuth) {
+          setGlobalError(null);
+          applyLocalEdgeSafetyFallback(capturePayload?.previewDataUrl);
+          return;
+        }
+        setGlobalError(null);
+        applyLocalEdgeSafetyFallback(
+          capturePayload?.previewDataUrl,
+          'Cloud AI unavailable — running on-device Edge AI locally.'
         );
       } finally {
         analyzingIdsRef.current.delete(cameraId);
@@ -1148,6 +1492,7 @@ export default function App() {
       aiCapabilities.openaiConfigured,
       desktopNotifications,
       facilityMode,
+      operationMode,
       persistIncidentAsync,
       persistZoneAsync,
       sealEvidenceCaseForCamera,
@@ -1325,8 +1670,16 @@ export default function App() {
       if (!target) return;
       const nowIso = new Date().toISOString();
       const count = breachingPeople.length;
-      const headline = `Restricted Perimeter Breach (${zone.label || 'Restricted Zone'})`;
-      const details = `${count} ${count === 1 ? 'person' : 'people'} crossed into restricted zone "${zone.label || 'Restricted Zone'}" on ${target.classroomName}. Forensic video & DVR buffer automatically sealed.`;
+      const zoneLabel =
+        zone.label ||
+        (operationMode === 'disaster' ? 'Collapsed Structure Zone' : 'Restricted Area');
+      const headline =
+        operationMode === 'disaster'
+          ? `HAZARD ZONE BREACH (${zoneLabel})`
+          : `Restricted Perimeter Breach (${zoneLabel})`;
+      const details = `${count} ${count === 1 ? 'person' : 'people'} crossed into ${
+        operationMode === 'disaster' ? 'hazard perimeter' : 'restricted zone'
+      } "${zoneLabel}" on ${target.classroomName}. Forensic video & DVR buffer automatically sealed.`;
 
       setCameras((prev) =>
         prev.map((cam) =>
@@ -1374,6 +1727,7 @@ export default function App() {
       const breachAlert: IncidentAlert = {
         id: `alert-breach-${Date.now()}-${cameraId}`,
         alertType: 'ai-vision',
+        disasterPhase: operationMode === 'disaster' ? 1 : undefined,
         cameraId: target.id,
         cameraCode: target.cameraCode,
         classroomName: target.classroomName,
@@ -1414,8 +1768,18 @@ export default function App() {
       if (desktopNotifications) {
         sendBrowserNotification(breachAlert);
       }
+      if (operationMode === 'disaster') {
+        triggerAutoPaForAlert(breachAlert);
+      }
     },
-    [desktopNotifications, persistIncidentAsync, sealEvidenceCaseForCamera, soundAlertsEnabled]
+    [
+      desktopNotifications,
+      operationMode,
+      persistIncidentAsync,
+      sealEvidenceCaseForCamera,
+      soundAlertsEnabled,
+      triggerAutoPaForAlert,
+    ]
   );
 
   const handleManualLockEvidence = useCallback(
@@ -1562,8 +1926,9 @@ export default function App() {
         )
       );
 
-      const headline = `WATCHLIST MATCH · ${watchlistItem.label} (${similarity}%)`;
-      const details = `Tracked subject ${subjectId} on ${target.classroomName} (${target.cameraCode}) matched Watchlist target "${watchlistItem.label}" with ${similarity}% spatial appearance Re-ID confidence.`;
+      const watchlistMeta = getWatchlistModeMeta(watchlistLabelMode);
+      const headline = `${watchlistMeta.matchHeadlinePrefix} · ${watchlistItem.label} (${similarity}%)`;
+      const details = `Tracked subject ${subjectId} on ${target.classroomName} (${target.cameraCode}) matched ${watchlistMeta.title} target "${watchlistItem.label}" with ${similarity}% clothing HSV Re-ID confidence.`;
 
       setCameras((prev) =>
         prev.map((cam) =>
@@ -1615,6 +1980,7 @@ export default function App() {
       const matchAlert: IncidentAlert = {
         id: `alert-wl-${Date.now()}-${cameraId}`,
         alertType: 'ai-vision',
+        disasterPhase: operationMode === 'disaster' ? 3 : undefined,
         cameraId: target.id,
         cameraCode: target.cameraCode,
         classroomName: target.classroomName,
@@ -1655,7 +2021,13 @@ export default function App() {
         sendBrowserNotification(matchAlert);
       }
     },
-    [desktopNotifications, persistIncidentAsync, sealEvidenceCaseForCamera, soundAlertsEnabled]
+    [
+      desktopNotifications,
+      persistIncidentAsync,
+      sealEvidenceCaseForCamera,
+      soundAlertsEnabled,
+      watchlistLabelMode,
+    ]
   );
 
   const handleDeleteEvidenceCase = useCallback((caseId: string) => {
@@ -1807,6 +2179,7 @@ export default function App() {
             lastAlertAtMs: lastVoiceMs,
             nowMs,
             cooldownMs: 10000,
+            operationMode,
           }
         );
         if (voiceThreatAlert) {
@@ -1873,6 +2246,9 @@ export default function App() {
           if (desktopNotifications) {
             sendBrowserNotification(enrichedVoiceAlert);
           }
+          if (operationMode === 'disaster') {
+            triggerAutoPaForAlert(enrichedVoiceAlert);
+          }
         }
       }
 
@@ -1901,6 +2277,7 @@ export default function App() {
               lastAlertAtMs: lastDbMs,
               nowMs,
               liveTranscript: transcript,
+              operationMode,
             });
             if (dbAlert) {
               lastDbAlertAtRef.current[cameraId] = nowMs;
@@ -1921,6 +2298,9 @@ export default function App() {
               }
               if (desktopNotifications) {
                 sendBrowserNotification(dbAlert);
+              }
+              if (operationMode === 'disaster') {
+                triggerAutoPaForAlert(dbAlert);
               }
             }
           }
@@ -1944,11 +2324,281 @@ export default function App() {
       audioSpikeAutoScan,
       desktopNotifications,
       facilityMode,
+      operationMode,
       persistIncidentAsync,
       sealEvidenceCaseForCamera,
       soundAlertsEnabled,
+      triggerAutoPaForAlert,
     ]
   );
+
+  // Phase 2 Zero-Delay Edge AI: Fallen / Collapsed Victim Alerts & Peak Trail Velocity Telemetry
+  const handleSubjectTelemetry = useCallback(
+    (
+      cameraId: string,
+      telemetry: { peakTrailVelocity: number; fallenSubjects: TrackedSubject[] }
+    ) => {
+      subjectTelemetryByCamRef.current[cameraId] = {
+        peakTrailVelocity: telemetry.peakTrailVelocity,
+        fallenCount: telemetry.fallenSubjects.length,
+      };
+      let maxVel = 0;
+      let totalFallen = 0;
+      for (const entry of Object.values(subjectTelemetryByCamRef.current)) {
+        if (entry.peakTrailVelocity > maxVel) maxVel = entry.peakTrailVelocity;
+        totalFallen += entry.fallenCount;
+      }
+      setPeakTrailVelocity((prev) => (Math.abs(prev - maxVel) >= 8 || maxVel === 0 ? maxVel : prev));
+      setFallenVictimCount((prev) => (prev !== totalFallen ? totalFallen : prev));
+
+      if (operationMode !== 'disaster' || telemetry.fallenSubjects.length === 0) return;
+      const target = camerasRef.current.find((c) => c.id === cameraId);
+      if (!target) return;
+
+      const nowMs = Date.now();
+      for (const subj of telemetry.fallenSubjects) {
+        const key = `${cameraId}:${subj.id}`;
+        const lastMs = lastFallenAlertAtRef.current[key] ?? 0;
+        const fallenAlert = evaluateFallenVictimAlert(target, subj, {
+          nowMs,
+          lastAlertAtMs: lastMs,
+          cooldownMs: 15_000,
+        });
+        if (!fallenAlert) continue;
+        lastFallenAlertAtRef.current[key] = nowMs;
+
+        const capture = frameCapturersRef.current[cameraId]?.() ?? null;
+        const enriched: IncidentAlert = capture?.previewDataUrl
+          ? { ...fallenAlert, evidenceSnapshotUrl: capture.previewDataUrl }
+          : fallenAlert;
+
+        setAlerts((prev) => [enriched, ...prev]);
+        setPopupAlerts((prev) =>
+          [enriched, ...prev.filter((item) => item.id !== enriched.id)].slice(0, 6)
+        );
+        void persistIncidentAsync(enriched);
+        void sealEvidenceCaseForCamera({
+          camera: target,
+          triggerType: 'threat',
+          threatCategory: 'disturbance',
+          severity: 'critical',
+          headline: enriched.headline,
+          summary: enriched.details,
+          fallbackSnapshotUrl: capture?.previewDataUrl,
+        });
+        if (soundAlertsEnabled) {
+          playAlertChime();
+        }
+        if (desktopNotifications) {
+          sendBrowserNotification(enriched);
+        }
+        triggerAutoPaForAlert(enriched);
+      }
+    },
+    [
+      desktopNotifications,
+      operationMode,
+      persistIncidentAsync,
+      sealEvidenceCaseForCamera,
+      soundAlertsEnabled,
+      triggerAutoPaForAlert,
+    ]
+  );
+
+  // Non-blocking Gemini 2.5 Flash-Lite Disaster Situation Report (6s cooldown + graceful Edge fallback, zero 429 popups)
+  const requestDisasterSituationReport = useCallback(
+    async (force = false) => {
+      if (operationMode !== 'disaster') return;
+      const nowMs = Date.now();
+      if (!force && nowMs - lastSituationReportAtRef.current < 6000) return;
+
+      const activeCam =
+        camerasRef.current.find((c) => c.id === focusedCameraId) ??
+        peakCrowdCamera ??
+        camerasRef.current[0];
+      if (!activeCam) return;
+
+      const capture = frameCapturersRef.current[activeCam.id]?.() ?? null;
+      lastSituationReportAtRef.current = nowMs;
+      setSituationReportLoading(true);
+      try {
+        const res = await fetch('/api/disaster-situation-report', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            cameraId: activeCam.id,
+            zoneName: activeCam.classroomName,
+            imageBase64: capture?.frameBase64,
+            imageMimeType: 'image/jpeg',
+            personCount: liveCrowdCount,
+            stampedeRisk: crowdRisk.disasterRiskLabel,
+            audioLevel: activeCam.audioLevel,
+            voiceTranscript: activeCam.liveTranscript,
+            fallenCount: fallenVictimCount,
+            roomAreaSqm,
+          }),
+        });
+        const rawText = await res.text();
+        const parsed = parseSafeJsonText<DisasterSituationReport>(rawText);
+        if (parsed.ok && parsed.data?.summary) {
+          setSituationReport(parsed.data);
+        }
+      } catch {
+        // Offline or network drop: synthesize instant local Edge AI situation report with zero error popups
+        setSituationReport({
+          cameraId: activeCam.id,
+          cameraCode: activeCam.cameraCode,
+          zoneName: activeCam.classroomName,
+          summary: `Offline Edge AI Assessment (${activeCam.classroomName}): ${liveCrowdCount} ${
+            liveCrowdCount === 1 ? 'person' : 'people'
+          } tracked · Stampede Risk: ${crowdRisk.disasterRiskLabel}${
+            fallenVictimCount > 0 ? ` · ${fallenVictimCount} fallen victim(s)` : ''
+          }.`,
+          crowdPanicDetected: crowdRisk.status === 'CRITICAL CRUSH RISK',
+          blockedExitsDetected: crowdRisk.status !== 'SAFE',
+          fireOrSmokeDetected: false,
+          structuralDamageDetected: activeCam.audioLevel > SOUND_ALERT_THRESHOLD_DB,
+          recommendedAction:
+            fallenVictimCount > 0
+              ? 'Dispatch rescue team immediately to fallen victim.'
+              : crowdRisk.exceeded
+                ? 'Trigger PA evacuation broadcast and open secondary exits.'
+                : 'Continue 100% local Edge AI monitoring.',
+          modelUsed: 'edge-local-offline',
+          generatedAt: new Date().toISOString(),
+          source: 'local-edge-fallback',
+        });
+      } finally {
+        setSituationReportLoading(false);
+      }
+    },
+    [
+      crowdRisk.disasterRiskLabel,
+      crowdRisk.exceeded,
+      crowdRisk.status,
+      fallenVictimCount,
+      focusedCameraId,
+      liveCrowdCount,
+      operationMode,
+      peakCrowdCamera,
+      roomAreaSqm,
+    ]
+  );
+
+  useEffect(() => {
+    if (operationMode !== 'disaster' || cameras.length === 0) return;
+    const timer = window.setInterval(() => {
+      void requestDisasterSituationReport(false);
+    }, 9000);
+    return () => window.clearInterval(timer);
+  }, [cameras.length, operationMode, requestDisasterSituationReport]);
+
+  // Phase 1 Stampede & Crowd Crush Early-Warning Engine: auto-alert & seal DVR evidence in Disaster Mode when threshold or panic velocity exceeded
+  useEffect(() => {
+    if (operationMode !== 'disaster' || !crowdRisk.exceeded || !peakCrowdCamera) return;
+    const nowMs = Date.now();
+    const lastMs = lastStampedeAlertAtRef.current[peakCrowdCamera.id] ?? 0;
+    if (lastMs > 0 && nowMs - lastMs < 30_000) return;
+
+    lastStampedeAlertAtRef.current[peakCrowdCamera.id] = nowMs;
+    const stampedeAlert = evaluateStampedeRiskAlert(
+      peakCrowdCamera,
+      liveCrowdCount,
+      crowdRisk.effectiveCapacity ?? crowdDensityThreshold,
+      {
+        dispatcherEmail: teacherEmailRef.current || undefined,
+        nowMs,
+        panicVelocitySpike: crowdRisk.panicVelocitySpike,
+        peakTrailVelocity: crowdRisk.peakTrailVelocity,
+      }
+    );
+    const capture = frameCapturersRef.current[peakCrowdCamera.id]?.() ?? null;
+    const enriched: IncidentAlert = capture?.previewDataUrl
+      ? { ...stampedeAlert, evidenceSnapshotUrl: capture.previewDataUrl }
+      : stampedeAlert;
+
+    setAlerts((prev) => [enriched, ...prev]);
+    setPopupAlerts((prev) =>
+      [enriched, ...prev.filter((item) => item.id !== enriched.id)].slice(0, 6)
+    );
+    void persistIncidentAsync(enriched);
+    void sealEvidenceCaseForCamera({
+      camera: peakCrowdCamera,
+      triggerType: 'threat',
+      threatCategory: 'disturbance',
+      severity: 'critical',
+      headline: enriched.headline,
+      summary: enriched.details,
+      fallbackSnapshotUrl: capture?.previewDataUrl,
+    });
+    if (soundAlertsEnabled) {
+      playAlertChime();
+    }
+    if (desktopNotifications) {
+      sendBrowserNotification(enriched);
+    }
+    triggerAutoPaForAlert(enriched);
+  }, [
+    crowdDensityThreshold,
+    crowdRisk.effectiveCapacity,
+    crowdRisk.exceeded,
+    crowdRisk.panicVelocitySpike,
+    crowdRisk.peakTrailVelocity,
+    desktopNotifications,
+    liveCrowdCount,
+    operationMode,
+    peakCrowdCamera,
+    persistIncidentAsync,
+    sealEvidenceCaseForCamera,
+    soundAlertsEnabled,
+    triggerAutoPaForAlert,
+  ]);
+
+  const handleTriggerEvacuationDispatch = useCallback(() => {
+    const targetCam = peakCrowdCamera ?? {
+      id: 'site-command',
+      cameraCode: 'CMD',
+      classroomName: 'All Monitored Disaster Zones',
+      studentCount: liveCrowdCount,
+    };
+    const evacAlert = evaluateStampedeRiskAlert(
+      targetCam,
+      liveCrowdCount,
+      crowdRisk.effectiveCapacity ?? crowdDensityThreshold,
+      {
+        dispatcherEmail: teacherEmailRef.current || undefined,
+        panicVelocitySpike: crowdRisk.panicVelocitySpike,
+        peakTrailVelocity: crowdRisk.peakTrailVelocity,
+      }
+    );
+    const capture = peakCrowdCamera
+      ? frameCapturersRef.current[peakCrowdCamera.id]?.() ?? null
+      : null;
+    const enriched: IncidentAlert = capture?.previewDataUrl
+      ? { ...evacAlert, evidenceSnapshotUrl: capture.previewDataUrl }
+      : evacAlert;
+
+    setAlerts((prev) => [enriched, ...prev]);
+    void persistIncidentAsync(enriched);
+    if (peakCrowdCamera) {
+      void sealEvidenceCaseForCamera({
+        camera: peakCrowdCamera,
+        triggerType: 'threat',
+        threatCategory: 'disturbance',
+        severity: 'critical',
+        headline: enriched.headline,
+        summary: enriched.details,
+        fallbackSnapshotUrl: capture?.previewDataUrl,
+      });
+    }
+    setDispatchAlert(enriched);
+  }, [
+    crowdDensityThreshold,
+    liveCrowdCount,
+    peakCrowdCamera,
+    persistIncidentAsync,
+    sealEvidenceCaseForCamera,
+  ]);
 
   const isStreamAlive = useCallback(
     (stream: MediaStream | undefined | null, requireVideo: boolean): boolean => {
@@ -2727,6 +3377,9 @@ export default function App() {
           setActiveView(view);
           setMobileDrawerOpen(false);
         }}
+        operationMode={operationMode}
+        onChangeOperationMode={handleChangeOperationMode}
+        isOnline={isOnline}
         unreadAlertsCount={summary.activeAlertsCount}
         evidenceCount={evidenceCases.length}
         onOpenScanner={() =>
@@ -2740,13 +3393,23 @@ export default function App() {
         manualLandscape={manualLandscape}
         onToggleLandscapeMode={handleToggleLandscapeMode}
         onOpenMobileDrawer={() => setMobileDrawerOpen(true)}
+        paIsOnAir={paIsOnAir}
+        autoPaEnabled={autoPaEnabled}
+        onStopPaAudio={handleStopPaAudio}
       />
-      <OfflineBanner />
+      <OfflineBanner isOnlineOverride={isOnline} />
 
       <div className="flex flex-1 min-w-0">
         <Sidebar
           cameras={cameras}
           summary={summary}
+          operationMode={operationMode}
+          crowdDensityThreshold={crowdDensityThreshold}
+          onChangeCrowdDensityThreshold={setCrowdDensityThreshold}
+          roomAreaSqm={roomAreaSqm}
+          onChangeRoomAreaSqm={setRoomAreaSqm}
+          watchlistLabelMode={watchlistLabelMode}
+          onChangeWatchlistLabelMode={setWatchlistLabelMode}
           facilityMode={facilityMode}
           onChangeFacilityMode={setFacilityMode}
           threatSensitivity={threatSensitivity}
@@ -2942,8 +3605,373 @@ export default function App() {
                   </div>
                 ) : null}
 
+                {operationMode === 'disaster' ? (
+                  <section
+                    aria-label="Three-Phase Disaster Management Engine"
+                    data-testid="three-phase-disaster-dashboard"
+                    className="space-y-3"
+                  >
+                    {/* Phase 1 — Live Stampede Risk Meter (Elevated/Critical Banner OR Compact Meter) */}
+                    {crowdRisk.status !== 'SAFE' ? (
+                      <div
+                        role="alert"
+                        data-testid="stampede-risk-banner"
+                        className={`rounded-xl border px-4 py-3.5 space-y-3 ${
+                          crowdRisk.status === 'CRITICAL CRUSH RISK'
+                            ? 'bg-red-50 border-red-300 text-red-900 animate-alert-critical-pulse'
+                            : 'bg-amber-50 border-amber-300 text-amber-950'
+                        }`}
+                      >
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div className="flex items-start gap-2.5 min-w-0">
+                            {crowdRisk.status === 'CRITICAL CRUSH RISK' ? (
+                              <Siren
+                                className="w-5 h-5 text-red-600 shrink-0 mt-0.5"
+                                aria-hidden="true"
+                              />
+                            ) : (
+                              <AlertTriangle
+                                className="w-5 h-5 text-amber-600 shrink-0 mt-0.5"
+                                aria-hidden="true"
+                              />
+                            )}
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-slate-900 text-white font-mono text-[10px] font-bold uppercase tracking-wider">
+                                  Phase 1 · Prevention
+                                </span>
+                                <h2 className="text-sm font-bold tracking-tight">
+                                  Stampede Risk Meter
+                                </h2>
+                                <span
+                                  data-testid="stampede-density-status"
+                                  className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono font-bold uppercase tracking-wider ${
+                                    crowdRisk.status === 'CRITICAL CRUSH RISK'
+                                      ? 'bg-red-600 text-white'
+                                      : 'bg-amber-600 text-white'
+                                  }`}
+                                >
+                                  {crowdRisk.disasterRiskLabel}
+                                </span>
+                              </div>
+                              <p className="text-xs mt-1 leading-relaxed">
+                                Multi-Scale Crowd AI:{' '}
+                                <strong className="font-mono tabular-nums">
+                                  {crowdRisk.personCount}
+                                </strong>{' '}
+                                people in{' '}
+                                <strong className="font-mono tabular-nums">{roomAreaSqm} m²</strong> (
+                                <strong className="font-mono tabular-nums">
+                                  {(crowdRisk.densityPerSqm ?? 0).toFixed(2)} p/m²
+                                </strong>
+                                {' · '}safe cap{' '}
+                                <strong className="font-mono tabular-nums">
+                                  {crowdRisk.threshold}
+                                </strong>
+                                {peakTrailVelocity > 0 ? ` · Trail Velocity ${peakTrailVelocity} u/s` : ''}
+                                )
+                                {crowdRisk.panicVelocitySpike ? ' · PANIC VELOCITY SPIKE' : ''}
+                                {crowdRisk.isLocalizedBottleneck
+                                  ? ` · Tight bottleneck pocket (${crowdRisk.bottleneckClusterCount} people)`
+                                  : ''}
+                                {peakCrowdCamera
+                                  ? ` · Peak zone: ${peakCrowdCamera.classroomName} (${peakCrowdCamera.cameraCode})`
+                                  : ''}
+                              </p>
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-2 shrink-0">
+                            {paIsOnAir ? (
+                              <button
+                                type="button"
+                                onClick={handleStopPaAudio}
+                                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-bold rounded-lg bg-slate-900 hover:bg-slate-800 text-white transition-colors cursor-pointer shrink-0"
+                              >
+                                <Square className="w-3.5 h-3.5 fill-current" aria-hidden="true" />
+                                <span>STOP PA</span>
+                              </button>
+                            ) : null}
+                            <button
+                              type="button"
+                              data-testid="trigger-evacuation-dispatch"
+                              onClick={handleTriggerEvacuationDispatch}
+                              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-lg bg-red-600 hover:bg-red-700 text-white transition-colors cursor-pointer shrink-0"
+                            >
+                              <Volume2 className="w-3.5 h-3.5" aria-hidden="true" />
+                              <span>PA Evacuation Broadcast</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-3 pt-1 border-t border-red-200/70">
+                          <label
+                            htmlFor="inline-room-area"
+                            className="text-[11px] font-medium whitespace-nowrap"
+                          >
+                            Room Area ({roomAreaSqm} m²):
+                          </label>
+                          <input
+                            id="inline-room-area"
+                            type="range"
+                            min={MIN_ROOM_AREA_SQM}
+                            max={MAX_ROOM_AREA_SQM}
+                            step={5}
+                            value={roomAreaSqm}
+                            onChange={(e) => setRoomAreaSqm(Number(e.target.value))}
+                            className="flex-1 min-w-[120px] max-w-[200px] accent-red-600 cursor-pointer"
+                          />
+                          <div className="inline-flex flex-wrap items-center gap-1.5">
+                            {ROOM_SIZE_PRESETS.map((preset) => (
+                              <button
+                                key={preset.id}
+                                type="button"
+                                onClick={() => setRoomAreaSqm(preset.areaSqm)}
+                                className={`px-2 py-0.5 text-[10px] font-mono rounded border cursor-pointer ${
+                                  roomAreaSqm === preset.areaSqm
+                                    ? 'border-red-600 bg-red-600 text-white'
+                                    : 'border-red-200 bg-white text-slate-800 hover:bg-slate-50'
+                                }`}
+                              >
+                                {preset.shortLabel}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {/* 3-Phase Disaster Management Engine Cards */}
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+                      {/* Phase 1 — Prevention & Early Warning */}
+                      <div
+                        data-testid="disaster-phase-1-card"
+                        className="bg-white border border-slate-200 rounded-xl p-3.5 space-y-2.5 flex flex-col justify-between"
+                      >
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-200 font-mono text-[10px] font-bold uppercase tracking-wider">
+                              <Activity className="w-3 h-3" aria-hidden="true" />
+                              <span>Phase 1 · Prevention</span>
+                            </span>
+                            <span
+                              data-testid={
+                                crowdRisk.status === 'SAFE'
+                                  ? 'stampede-density-status'
+                                  : 'stampede-meter-pill'
+                              }
+                              className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono font-bold uppercase ${
+                                crowdRisk.status === 'CRITICAL CRUSH RISK'
+                                  ? 'bg-red-600 text-white'
+                                  : crowdRisk.status === 'ELEVATED'
+                                    ? 'bg-amber-500 text-white'
+                                    : 'bg-emerald-50 border border-emerald-200 text-emerald-800'
+                              }`}
+                            >
+                              {crowdRisk.disasterRiskLabel}
+                            </span>
+                          </div>
+                          <div>
+                            <h3 className="text-xs font-semibold text-slate-900">
+                              Stampede Risk Meter &amp; Hazard Zones
+                            </h3>
+                            <p
+                              data-testid="disaster-bar-density-readout"
+                              className="text-[11px] font-mono text-slate-600 tabular-nums mt-0.5"
+                            >
+                              {crowdRisk.personCount} / {crowdRisk.threshold} cap ·{' '}
+                              {(crowdRisk.densityPerSqm ?? 0).toFixed(2)} p/m² ({roomAreaSqm} m²) ·{' '}
+                              Vel {peakTrailVelocity} u/s
+                            </p>
+                          </div>
+                          <div className="h-1.5 w-full rounded-full bg-slate-100 overflow-hidden">
+                            <div
+                              className={`h-full transition-all duration-300 ${
+                                crowdRisk.status === 'CRITICAL CRUSH RISK'
+                                  ? 'bg-red-600'
+                                  : crowdRisk.status === 'ELEVATED'
+                                    ? 'bg-amber-500'
+                                    : 'bg-emerald-500'
+                              }`}
+                              style={{
+                                width: `${Math.min(100, Math.max(6, crowdRisk.percentOfThreshold))}%`,
+                              }}
+                            />
+                          </div>
+                        </div>
+
+                        <div className="flex flex-wrap items-center justify-between gap-1.5 pt-1 border-t border-slate-100">
+                          <select
+                            id="disaster-bar-room-size"
+                            aria-label="Room area preset"
+                            data-testid="disaster-bar-room-size"
+                            value={
+                              ROOM_SIZE_PRESETS.some((p) => p.areaSqm === roomAreaSqm)
+                                ? String(roomAreaSqm)
+                                : 'custom'
+                            }
+                            onChange={(e) => {
+                              const val = Number(e.target.value);
+                              if (Number.isFinite(val)) setRoomAreaSqm(val);
+                            }}
+                            className="text-[11px] font-mono bg-slate-50 border border-slate-200 rounded px-2 py-1 text-slate-800 cursor-pointer"
+                          >
+                            {ROOM_SIZE_PRESETS.map((preset) => (
+                              <option key={preset.id} value={preset.areaSqm}>
+                                {preset.shortLabel}
+                              </option>
+                            ))}
+                            {!ROOM_SIZE_PRESETS.some((p) => p.areaSqm === roomAreaSqm) ? (
+                              <option value="custom">{roomAreaSqm} m² (Custom)</option>
+                            ) : null}
+                          </select>
+
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              data-testid="inline-auto-pa-toggle"
+                              aria-pressed={autoPaEnabled}
+                              onClick={() => setAutoPaEnabled((prev) => !prev)}
+                              className={`px-2 py-1 text-[10px] font-mono font-semibold rounded border cursor-pointer ${
+                                autoPaEnabled
+                                  ? 'border-emerald-600 bg-emerald-600 text-white'
+                                  : 'border-slate-300 bg-white text-slate-600'
+                              }`}
+                            >
+                              Auto-PA: {autoPaEnabled ? 'ON' : 'OFF'}
+                            </button>
+                            <button
+                              type="button"
+                              data-testid="trigger-evacuation-dispatch"
+                              onClick={handleTriggerEvacuationDispatch}
+                              className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold rounded bg-red-600 text-white hover:bg-red-700 cursor-pointer"
+                            >
+                              <Volume2 className="w-3 h-3" aria-hidden="true" />
+                              <span>Evacuate PA</span>
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Phase 2 — Emergency Response & Victim Detection + Gemini Situation Report */}
+                      <div
+                        data-testid="disaster-phase-2-card"
+                        className="bg-white border border-slate-200 rounded-xl p-3.5 space-y-2.5 flex flex-col justify-between"
+                      >
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-red-100 text-red-900 border border-red-200 font-mono text-[10px] font-bold uppercase tracking-wider">
+                              <HeartPulse className="w-3 h-3" aria-hidden="true" />
+                              <span>Phase 2 · Response</span>
+                            </span>
+                            <span
+                              className={`font-mono text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                                fallenVictimCount > 0
+                                  ? 'bg-red-600 text-white animate-pulse'
+                                  : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                              }`}
+                            >
+                              {fallenVictimCount > 0
+                                ? `${fallenVictimCount} FALLEN VICTIM`
+                                : 'EDGE AI <100ms'}
+                            </span>
+                          </div>
+                          <h3 className="text-xs font-semibold text-slate-900">
+                            Fallen Victim, Collapse Audio &amp; AI Situation Report
+                          </h3>
+                          <p
+                            data-testid="disaster-situation-report-text"
+                            className="text-[11px] text-slate-600 leading-snug line-clamp-2"
+                          >
+                            {situationReport
+                              ? situationReport.summary
+                              : 'Zero-delay Edge AI monitors horizontal fallen victims (>1.5s), >90.1 dB structural collapse spikes, and disaster distress speech ("help", "trapped", "fire", "collapse").'}
+                          </p>
+                        </div>
+
+                        <div className="flex flex-wrap items-center justify-between gap-1.5 pt-1 border-t border-slate-100">
+                          <span className="inline-flex items-center gap-1 text-[10px] font-mono text-slate-500">
+                            <Sparkles className="w-3 h-3 text-red-600" aria-hidden="true" />
+                            <span>
+                              {situationReport?.source === 'gemini-vision'
+                                ? 'Gemini 2.5 Flash-Lite'
+                                : 'Local Edge + Gemini Ready'}
+                            </span>
+                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              data-testid="refresh-situation-report-btn"
+                              disabled={situationReportLoading || cameras.length === 0}
+                              onClick={() => {
+                                void requestDisasterSituationReport(true);
+                              }}
+                              className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold rounded border border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100 disabled:opacity-40 cursor-pointer"
+                            >
+                              <RefreshCw
+                                className={`w-3 h-3 ${situationReportLoading ? 'animate-spin' : ''}`}
+                                aria-hidden="true"
+                              />
+                              <span>SitRep</span>
+                            </button>
+                            <button
+                              type="button"
+                              data-testid="open-pa-console-inline"
+                              onClick={() => setActiveView('workspace')}
+                              className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold rounded border border-slate-300 bg-white text-slate-800 hover:bg-slate-50 cursor-pointer"
+                            >
+                              <Megaphone className="w-3 h-3" aria-hidden="true" />
+                              <span>PA Console</span>
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Phase 3 — Post-Disaster Relief & Missing Person Re-ID */}
+                      <div
+                        data-testid="disaster-phase-3-card"
+                        className="bg-white border border-slate-200 rounded-xl p-3.5 space-y-2.5 flex flex-col justify-between"
+                      >
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-blue-100 text-blue-900 border border-blue-200 font-mono text-[10px] font-bold uppercase tracking-wider">
+                              <Users className="w-3 h-3" aria-hidden="true" />
+                              <span>Phase 3 · Relief &amp; Re-ID</span>
+                            </span>
+                            <span className="font-mono text-[10px] font-semibold text-slate-500 tabular-nums">
+                              {watchlist.length} Re-ID · {evidenceCases.length} SHA-256
+                            </span>
+                          </div>
+                          <h3 className="text-xs font-semibold text-slate-900">
+                            Missing Person / Evacuee Re-Identification
+                          </h3>
+                          <p className="text-[11px] text-slate-600 leading-snug line-clamp-2">
+                            Cross-camera HSV clothing Re-ID locates separated children or elderly without facial visibility; all incidents seal as Tamper-Proof Disaster &amp; Rescue Incident Logs.
+                          </p>
+                        </div>
+
+                        <div className="flex flex-wrap items-center justify-between gap-1.5 pt-1 border-t border-slate-100">
+                          <span className="text-[10px] font-mono text-slate-500">
+                            SHA-256 Tamper-Proof Vault
+                          </span>
+                          <button
+                            type="button"
+                            data-testid="open-rescue-logs-inline"
+                            onClick={() => setActiveView('evidence')}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 text-[10px] font-semibold rounded border border-blue-200 bg-blue-50 text-blue-800 hover:bg-blue-100 cursor-pointer"
+                          >
+                            <FileLock2 className="w-3 h-3" aria-hidden="true" />
+                            <span>Rescue Logs ({evidenceCases.length})</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </section>
+                ) : null}
+
                 <NotificationBanner
                   alert={latestUnacknowledgedAlert}
+                  operationMode={operationMode}
                   onInspectCamera={handleFocusFromAlert}
                   onNotifyTeacher={(alert) => setDispatchAlert(alert)}
                   onAcknowledge={handleAcknowledgeAlert}
@@ -3119,10 +4147,10 @@ export default function App() {
                       } my-auto py-6 max-w-2xl mx-auto text-center space-y-3`}
                     >
                       <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-slate-900 text-balance">
-                        {labels.monitorTitle}
+                        {operationBranding.standbyTitle}
                       </h1>
                       <p className="text-sm text-slate-500 leading-relaxed max-w-lg mx-auto">
-                        Choose a camera or microphone source to start live on-device human detection and safety monitoring.
+                        {operationBranding.standbySubtitle}
                       </p>
 
                       <div className="pt-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 text-left">
@@ -3204,6 +4232,8 @@ export default function App() {
                       key={focusedCamera.id}
                       camera={focusedCamera}
                       facilityMode={facilityMode}
+                      operationMode={operationMode}
+                      watchlistLabelMode={watchlistLabelMode}
                       threatSensitivity={threatSensitivity}
                       defaultAiModel={selectedAiModel}
                       dbCalibrationOffset={dbCalibrationOffset}
@@ -3220,6 +4250,7 @@ export default function App() {
                       onManualLockEvidence={handleManualLockEvidence}
                       onEnrollLiveSubject={handleEnrollLiveSubject}
                       onWatchlistMatch={handleWatchlistMatch}
+                      onSubjectTelemetry={handleSubjectTelemetry}
                       onReconnectStream={handleReconnectStreamCard}
                       onAnalyzeCamera={handleAnalyzeCameraCard}
                       onToggleVoiceListening={handleToggleVoiceListening}
@@ -3247,6 +4278,8 @@ export default function App() {
                               key={cam.id}
                               camera={cam}
                               facilityMode={facilityMode}
+                              operationMode={operationMode}
+                              watchlistLabelMode={watchlistLabelMode}
                               threatSensitivity={threatSensitivity}
                               defaultAiModel={selectedAiModel}
                               dbCalibrationOffset={dbCalibrationOffset}
@@ -3263,6 +4296,7 @@ export default function App() {
                               onManualLockEvidence={handleManualLockEvidence}
                               onEnrollLiveSubject={handleEnrollLiveSubject}
                               onWatchlistMatch={handleWatchlistMatch}
+                              onSubjectTelemetry={handleSubjectTelemetry}
                               onReconnectStream={handleReconnectStreamCard}
                               onAnalyzeCamera={handleAnalyzeCameraCard}
                               onToggleVoiceListening={handleToggleVoiceListening}
@@ -3405,6 +4439,8 @@ export default function App() {
                             key={cam.id}
                             camera={cam}
                             facilityMode={facilityMode}
+                            operationMode={operationMode}
+                            watchlistLabelMode={watchlistLabelMode}
                             threatSensitivity={threatSensitivity}
                             defaultAiModel={selectedAiModel}
                             dbCalibrationOffset={dbCalibrationOffset}
@@ -3421,6 +4457,7 @@ export default function App() {
                             onManualLockEvidence={handleManualLockEvidence}
                             onEnrollLiveSubject={handleEnrollLiveSubject}
                             onWatchlistMatch={handleWatchlistMatch}
+                            onSubjectTelemetry={handleSubjectTelemetry}
                             onReconnectStream={handleReconnectStreamCard}
                             onAnalyzeCamera={handleAnalyzeCameraCard}
                             onToggleVoiceListening={handleToggleVoiceListening}
@@ -3459,6 +4496,7 @@ export default function App() {
               <LiveIncidentRail
                 alerts={alerts}
                 facilityMode={facilityMode}
+                operationMode={operationMode}
                 onAcknowledgeAlert={handleAcknowledgeAlert}
                 onAcknowledgeAll={handleAcknowledgeAll}
                 onFocusCamera={handleFocusFromAlert}
@@ -3472,6 +4510,7 @@ export default function App() {
           <main className="flex-1 min-w-0 p-4 sm:p-6 space-y-5 max-w-[1360px]">
             <NotificationBanner
               alert={latestUnacknowledgedAlert}
+              operationMode={operationMode}
               onInspectCamera={handleFocusFromAlert}
               onNotifyTeacher={(alert) => setDispatchAlert(alert)}
               onAcknowledge={handleAcknowledgeAlert}
@@ -3533,6 +4572,7 @@ export default function App() {
                   alerts={alerts}
                   cameras={cameras}
                   facilityMode={facilityMode}
+                  operationMode={operationMode}
                   onAcknowledgeAlert={handleAcknowledgeAlert}
                   onAcknowledgeAll={handleAcknowledgeAll}
                   onClearAcknowledged={handleClearAcknowledged}
@@ -3546,6 +4586,7 @@ export default function App() {
               <EvidenceVaultView
                 cases={evidenceCases}
                 selectedCaseId={selectedEvidenceId}
+                operationMode={operationMode}
                 onSelectCase={setSelectedEvidenceId}
                 onDeleteCase={handleDeleteEvidenceCase}
                 onReturnToWall={() => setActiveView('grid')}
@@ -3553,35 +4594,60 @@ export default function App() {
             ) : null}
 
             {activeView === 'workspace' ? (
-              <WorkspaceTeacherHub
-                userEmail={currentUser?.email ?? null}
-                userName={currentUser?.displayName ?? null}
-                hasAccessToken={hasAccessToken}
-                isSigningIn={isSigningIn}
-                onGoogleSignIn={handleGoogleSignIn}
-                onSignOut={handleSignOut}
-                defaultTeacherEmail={defaultTeacherEmail}
-                onSaveTeacherEmail={handleSaveTeacherEmail}
-                courses={courses}
-                linkedCourseId={linkedCourseId}
-                onSelectCourse={(c) => {
-                  void handleSelectCourse(c);
-                }}
-                courseTeachers={courseTeachers}
-                courseStudentCount={courseStudentCount}
-                gmailMessages={gmailMessages}
-                loadingWorkspace={loadingWorkspace}
-                workspaceError={workspaceError}
-                onRefreshWorkspace={async () => {
-                  const token = await getAccessToken();
-                  await syncWorkspaceFromGoogle(token);
-                }}
-                cameras={cameras}
-                soundAlerts={soundThresholdAlerts}
-                dbCalibrationOffset={dbCalibrationOffset}
-                onChangeDbCalibrationOffset={setDbCalibrationOffset}
-                onOpenDispatchModal={(alert) => setDispatchAlert(alert)}
-              />
+              operationMode === 'disaster' ? (
+                <DisasterCommandCenter
+                  cameras={cameras}
+                  alerts={alerts}
+                  crowdDensityThreshold={crowdDensityThreshold}
+                  onChangeCrowdDensityThreshold={setCrowdDensityThreshold}
+                  roomAreaSqm={roomAreaSqm}
+                  onChangeRoomAreaSqm={setRoomAreaSqm}
+                  autoPaEnabled={autoPaEnabled}
+                  onToggleAutoPa={() => setAutoPaEnabled((prev) => !prev)}
+                  paVolume={paVolume}
+                  onChangePaVolume={setPaVolume}
+                  paIsOnAir={paIsOnAir}
+                  paActiveText={paActiveText}
+                  paLogs={paLogs}
+                  onBroadcastPa={handleBroadcastPa}
+                  onStopPaAudio={handleStopPaAudio}
+                  onOpenPaModalForAlert={(alert) => setDispatchAlert(alert)}
+                  peakTrailVelocity={peakTrailVelocity}
+                  fallenVictimCount={fallenVictimCount}
+                />
+              ) : (
+                <WorkspaceTeacherHub
+                  operationMode={operationMode}
+                  userEmail={currentUser?.email ?? null}
+                  userName={currentUser?.displayName ?? null}
+                  hasAccessToken={hasAccessToken}
+                  isSigningIn={isSigningIn}
+                  onGoogleSignIn={handleGoogleSignIn}
+                  onConnectGoogleWorkspace={handleConnectGoogleWorkspace}
+                  onSignOut={handleSignOut}
+                  defaultTeacherEmail={defaultTeacherEmail}
+                  onSaveTeacherEmail={handleSaveTeacherEmail}
+                  courses={courses}
+                  linkedCourseId={linkedCourseId}
+                  onSelectCourse={(c) => {
+                    void handleSelectCourse(c);
+                  }}
+                  courseTeachers={courseTeachers}
+                  courseStudentCount={courseStudentCount}
+                  gmailMessages={gmailMessages}
+                  loadingWorkspace={loadingWorkspace}
+                  workspaceError={workspaceError}
+                  onRefreshWorkspace={async () => {
+                    const token = await getAccessToken();
+                    await syncWorkspaceFromGoogle(token);
+                  }}
+                  cameras={cameras}
+                  soundAlerts={soundThresholdAlerts}
+                  dbCalibrationOffset={dbCalibrationOffset}
+                  onChangeDbCalibrationOffset={setDbCalibrationOffset}
+                  onOpenDispatchModal={(alert) => setDispatchAlert(alert)}
+                />
+              )
             ) : null}
           </main>
         ) : null}
@@ -3589,6 +4655,7 @@ export default function App() {
 
       <AlertPopupOverlay
         popups={popupAlerts}
+        operationMode={operationMode}
         onDismissPopup={(alertId) =>
           setPopupAlerts((prev) => prev.filter((item) => item.id !== alertId))
         }
@@ -3613,17 +4680,30 @@ export default function App() {
         onAddUploadedCamera={handleAddUploadedCamera}
       />
 
-      <TeacherAlertDispatchModal
-        alert={dispatchAlert}
-        defaultTeacherEmail={defaultTeacherEmail}
-        courses={courses}
-        linkedCourseId={linkedCourseId}
-        hasAccessToken={hasAccessToken}
-        onGoogleSignIn={handleGoogleSignIn}
-        onConfirmSendGmail={handleConfirmSendGmail}
-        onConfirmPostClassroom={handleConfirmPostClassroom}
-        onClose={() => setDispatchAlert(null)}
-      />
+      {operationMode === 'disaster' ? (
+        <PaEvacuationDispatchModal
+          alert={dispatchAlert}
+          paIsOnAir={paIsOnAir}
+          onBroadcastPa={(params) =>
+            handleBroadcastPa({ ...params, triggeredBy: 'manual' })
+          }
+          onStopPaAudio={handleStopPaAudio}
+          onClose={() => setDispatchAlert(null)}
+        />
+      ) : (
+        <TeacherAlertDispatchModal
+          operationMode={operationMode}
+          alert={dispatchAlert}
+          defaultTeacherEmail={defaultTeacherEmail}
+          courses={courses}
+          linkedCourseId={linkedCourseId}
+          hasAccessToken={hasAccessToken}
+          onGoogleSignIn={handleConnectGoogleWorkspace}
+          onConfirmSendGmail={handleConfirmSendGmail}
+          onConfirmPostClassroom={handleConfirmPostClassroom}
+          onClose={() => setDispatchAlert(null)}
+        />
+      )}
       <MobileBottomNav
         activeView={activeView}
         onSelectView={(view) => {
